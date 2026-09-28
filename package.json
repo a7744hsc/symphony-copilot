@@ -1,0 +1,25 @@
+{
+  "name": "symphony-copilot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Polls a GitHub Project board and runs GitHub Copilot SDK agents in per-issue workspaces (a Symphony-style orchestrator).",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/cli.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p ."
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@github/copilot-sdk": "^1.0.14",
+    "liquidjs": "^10.29.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
+  }
+}
