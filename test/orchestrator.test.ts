@@ -503,3 +503,62 @@ test("a slow poll never applies a stale card state to a worker that started afte
   assert.ok(s.calls.slice(1).every((c) => !c.aborted), `workers started after the stale read were killed: ${s.calls.map((c) => c.aborted).join(",")}`);
   assert.equal(s.orchestrator.snapshot().running.length, 1);
 });
+
+function reviewSetup(t: TestContext, promptExists = true) {
+  const dir = mkdtempSync(join(tmpdir(), "review-"));
+  if (promptExists) writeFileSync(join(dir, "REVIEW.md"), "Review {{ issue.identifier }}");
+  return setup(t, {
+    tracker: { active_states: ["Todo", "In Progress", "AI Review", "Rework"] },
+    review: { states: ["AI Review"], prompt_file: join(dir, "REVIEW.md"), model: "gpt-6-sol", pass_state: "Human Review", fail_state: "Rework" },
+  });
+}
+
+test("review states go to the reviewer with the round number, and each verdict advances the round", async (t) => {
+  const s = reviewSetup(t);
+  s.tracker.add(issue("A"));
+  await s.tick();
+  assert.equal(s.calls[0]!.params.role, "implement");
+  s.calls[0]!.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: "s1" });
+  s.tracker.set("A", { state: "AI Review" });
+  s.calls[0]!.resolve();
+  await flush();
+  await s.advance(1_000);
+  assert.equal(s.calls[1]!.params.role, "review");
+  assert.equal(s.calls[1]!.params.reviewRound, 1);
+
+  s.calls[1]!.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: "s2" });
+  s.calls[1]!.params.onUpdate({ event: "review_verdict", timestamp: new Date(), message: "request_changes" });
+  s.tracker.set("A", { state: "Rework" });
+  s.calls[1]!.resolve();
+  await flush();
+  await s.advance(1_000);
+  assert.equal(s.calls[2]!.params.role, "implement");
+
+  s.calls[2]!.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: "s3" });
+  s.tracker.set("A", { state: "AI Review" });
+  s.calls[2]!.resolve();
+  await flush();
+  await s.advance(1_000);
+  assert.equal(s.calls[3]!.params.role, "review");
+  assert.equal(s.calls[3]!.params.reviewRound, 2);
+  assert.equal(s.orchestrator.snapshot().running[0]!.run.sessions, 3, "the implement-review loop is one run until a human gets the card");
+});
+
+test("a card that moves to the other role mid-session is handed to a fresh session", async (t) => {
+  const s = reviewSetup(t);
+  s.tracker.add(issue("A"));
+  await s.tick();
+  s.tracker.set("A", { state: "AI Review" });
+  await s.tick();
+  assert.equal(s.calls[0]!.aborted, true, "the implementer's session must not go on to review its own work");
+  await s.tick();
+  assert.equal(s.calls[1]!.params.role, "review");
+});
+
+test("a missing review prompt blocks dispatch", async (t) => {
+  const s = reviewSetup(t, false);
+  s.tracker.add(issue("A"));
+  await s.tick();
+  assert.equal(s.calls.length, 0);
+  assert.ok(s.lines.some((l) => l.includes("preflight failed") && l.includes("review.prompt_file")));
+});

@@ -65,6 +65,8 @@ function main(): Promise<number> | number {
       await runAgentAttempt({
         issue: p.issue,
         attempt: p.attempt,
+        role: p.role,
+        reviewRound: p.reviewRound,
         config: p.workflow.config,
         promptTemplate: p.workflow.definition.promptTemplate,
         tracker: p.tracker,

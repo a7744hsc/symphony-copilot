@@ -119,7 +119,7 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 | `turn_timeout_ms` | 3600000 | 一轮内两次会话事件之间的最长静默 |
 | `stall_timeout_ms` | 300000 | agent 静默超过这个时长，调度器就重启它；`<= 0` 关闭 |
 
-hook 用 `bash -lc` 在工作区里执行，环境变量里去掉了 tracker 令牌，并加上 `SYMPHONY_ISSUE_ID`、`SYMPHONY_ISSUE_IDENTIFIER`、`SYMPHONY_ISSUE_BRANCH`、`SYMPHONY_WORKSPACE`、`SYMPHONY_WORKSPACE_KEY`。
+hook 用 `bash -lc` 在工作区里执行，环境变量里去掉了 tracker 令牌，并加上 `SYMPHONY_ISSUE_ID`、`SYMPHONY_ISSUE_IDENTIFIER`、`SYMPHONY_ISSUE_BRANCH`、`SYMPHONY_WORKSPACE`、`SYMPHONY_WORKSPACE_KEY`、`SYMPHONY_ROLE`（`implement` 或 `review`），审核者还有 `SYMPHONY_IMPLEMENTER_WORKSPACE`。
 
 GitHub Project 适配器的设置、agent 工具、错误分类，以及规范如何对应到 Copilot SDK，见 [docs/reference.md](docs/reference.md)（英文）。
 
@@ -135,6 +135,28 @@ GitHub Project 适配器的设置、agent 工具、错误分类，以及规范�
 碰到上限时，调度器停下 agent，在 Issue 下留言说明这次运行用了多少，如果设了 `tracker.provider.blocked_state` 就把卡片移过去。工作区保留。把卡片拖回活跃列就开始新的一次运行，上限重新计算；交接后返工也一样。
 
 模型永远看不到这两个上限。用量保存在 `workspace.root` 下的 `.symphony-ledger.json`，重启调度器不会清零。无人值守运行时，请两个上限和 `blocked_state` 都设上。
+
+## 独立审核
+
+可以让每次提交先经过第二个 agent 审核，再交给人。在看板上加一列（比如“AI 审查”），写进 `tracker.active_states`，设为 `handoff_state`，再加：
+
+```yaml
+review:
+  states: [AI 审查]
+  prompt_file: REVIEW.md      # Liquid 模板；变量 issue、attempt、review_round、max_review_rounds、implementer_workspace
+  model: gpt-6-sol            # 最好和实现者不是同一家模型
+  pass_state: 待验证
+  fail_state: 返工
+  max_rounds: 3               # 最后一轮仍不通过，卡片进 pass_state，由人决定
+```
+
+审核者：
+
+- 每次都是新会话，看不到实现者的思考过程；
+- 在自己的工作区（`<issue>-review`）里工作。`SYMPHONY_ROLE` 为 `review` 时，由你的 `before_run` hook 把它重置到已推送的分支；可以读实现者的工作区，但不能改；
+- 不能推送、不能开 PR，只能用 `tracker_submit_review` 结束：在 PR 和 Issue 上发出结论，并移动卡片。
+
+卡片在实现和审核之间切换时，正在跑的会话会结束，另一个角色在新会话里开始。整个“实现—审核”来回算一次运行，[运行上限](#运行上限)同样管得住。GitHub 不允许 PR 的作者批准或要求修改自己的 PR，所以结论体现在卡片状态和评论式审核里。
 
 ## 安全模型
 

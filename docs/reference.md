@@ -102,6 +102,12 @@ Screenshots are linked by commit, so they render for anyone with access to the r
 
 If a tool fails, it returns a failure result and the session continues.
 
+The reviewer (see [Independent review](../README.md#independent-review)) gets `tracker_get_issue`, `tracker_comment` and one more tool instead of `tracker_submit_for_review` and `tracker_set_status`:
+
+| Tool | Changes the board | What it does |
+|---|---|---|
+| `tracker_submit_review` | Yes | `verdict` (`approve` or `request_changes`), `summary`, `blocking_issues` (required when requesting changes) and optional `attachments`. Posts a comment review on the open PR and the same text on the issue, then moves the card to `review.pass_state` or `review.fail_state`. On the last round, requesting changes moves the card to `pass_state` so a human decides |
+
 ## Scheduling guarantees
 
 - **One worker per issue.** An issue is claimed from dispatch until its run is released: handed off, blocked, halted, terminal, or no longer visible. Polls and retries skip claimed issues.
@@ -109,6 +115,7 @@ If a tool fails, it returns a failure result and the session continues.
 - **No stale stops.** Reconciliation only acts on the workers that existed when it read the tracker, so a slow read never stops a worker that started after it.
 - **Halts hold.** A halted issue records its live tracker state, so a poll never mistakes the agent's own status change for a person moving the card.
 - **No overlap in a workspace.** The next session for an issue starts only after the previous one, including its `after_run` hook, has finished.
+- **One role per session.** When a card moves between an implementation state and a review state, the running session is stopped and the other role starts in a new session, in its own workspace.
 - **One orchestrator per `workspace.root`.** A second instance is not detected and would claim the same issues.
 
 ## Differences from the spec

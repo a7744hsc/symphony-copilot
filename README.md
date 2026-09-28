@@ -122,7 +122,7 @@ The `copilot` block is specific to this implementation:
 | `turn_timeout_ms` | 3600000 | Longest silence between session events within a turn |
 | `stall_timeout_ms` | 300000 | The orchestrator restarts an agent that has been silent this long; `<= 0` disables it |
 
-Hooks run with `bash -lc` inside the workspace. Tracker tokens are removed from their environment, and these variables are added: `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_ISSUE_BRANCH`, `SYMPHONY_WORKSPACE`, `SYMPHONY_WORKSPACE_KEY`.
+Hooks run with `bash -lc` inside the workspace. Tracker tokens are removed from their environment, and these variables are added: `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_ISSUE_BRANCH`, `SYMPHONY_WORKSPACE`, `SYMPHONY_WORKSPACE_KEY`, `SYMPHONY_ROLE` (`implement` or `review`), and for the reviewer `SYMPHONY_IMPLEMENTER_WORKSPACE`.
 
 See [docs/reference.md](docs/reference.md) for the GitHub Project adapter settings, the agent tools, error categories and how the spec maps onto the Copilot SDK.
 
@@ -138,6 +138,28 @@ A *run* is one stretch of work on a card. It starts when the card is dispatched 
 When a run reaches a limit, the orchestrator stops the agent, comments on the issue with what the run used, and moves the card to `tracker.provider.blocked_state` if you set one. The workspace is kept. Moving the card back to an active column starts a new run with fresh limits, and so does rework after a handoff.
 
 The model is never told about these limits. Usage is saved in `.symphony-ledger.json` under `workspace.root`, so restarting the orchestrator does not reset it. For unattended use, set both limits and a `blocked_state`.
+
+## Independent review
+
+Optionally, every submission goes through a second agent before a human sees it. Add a column such as "AI Review" to the board, list it in `tracker.active_states`, make it the `handoff_state`, and add:
+
+```yaml
+review:
+  states: [AI Review]
+  prompt_file: REVIEW.md      # Liquid; variables: issue, attempt, review_round, max_review_rounds, implementer_workspace
+  model: gpt-6-sol            # ideally a different model family from the implementer
+  pass_state: Human Review
+  fail_state: Rework
+  max_rounds: 3               # after the last round, a failing card goes to pass_state for a human to decide
+```
+
+The reviewer:
+
+- starts in a new session, so it never sees the implementer's reasoning;
+- works in its own workspace (`<issue>-review`), which your `before_run` hook resets to the pushed branch when `SYMPHONY_ROLE` is `review`; it may read the implementer's workspace but not change it;
+- cannot push or open pull requests. Its only way to finish is `tracker_submit_review`, which posts the verdict on the PR and the issue and moves the card.
+
+When a card moves between implementation and review, the running session ends and the other role starts in a new one. The whole implement-and-review loop counts as one run, so the [run limits](#run-limits) cap it too. GitHub does not let a PR's author approve or request changes on it, so the verdict is the card's state plus a comment review.
 
 ## Safety model
 

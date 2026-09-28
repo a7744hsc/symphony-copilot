@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { isActiveState, isRoutable, isTerminalState, type ServiceConfig } from "./config.ts";
+import { isActiveState, isRoutable, isTerminalState, roleFor, type Role, type ServiceConfig } from "./config.ts";
 import { RunLedger, type RunCycle } from "./ledger.ts";
 import { truncate, type Logger } from "./log.ts";
 import type { AgentUpdate, SessionSummary, TokenTotals } from "./runner.ts";
@@ -10,6 +10,10 @@ import type { EffectiveWorkflow } from "./workflow.ts";
 export interface WorkerParams {
   issue: Issue;
   attempt: number | null;
+  /** Decided by the card's state at dispatch; the worker ends when the card moves to the other role. */
+  role: Role;
+  /** 1-based review round for the reviewer. */
+  reviewRound: number;
   workflow: EffectiveWorkflow;
   tracker: TrackerAdapter;
   signal: AbortSignal;
@@ -35,6 +39,7 @@ export interface OrchestratorDeps {
 
 interface RunningEntry {
   issue: Issue;
+  role: Role;
   abort: AbortController;
   startedAt: number;
   attempt: number | null;
@@ -96,14 +101,14 @@ export function formatDuration(ms: number): string {
 }
 
 /** Markdown usage report for one session, posted on the issue. */
-export function formatUsageReport(s: SessionSummary, cycle: RunCycle | null, config: ServiceConfig, headline: string, elapsedMs: number): string {
+export function formatUsageReport(s: SessionSummary, cycle: RunCycle | null, config: ServiceConfig, headline: string, elapsedMs: number, role: Role = "implement"): string {
   const models = s.models.length > 0 ? s.models.map((m) => `${m.model} (${m.requests} calls)`).join(", ") : "unknown";
   const budget = config.copilot.maxAiCreditsPerIssue;
   const run = cycle ? ` · ${credits(cycle.aiCredits)}${budget !== null ? ` of ${budget}` : ""} this run` : "";
   const code = s.code ? ` · Code: +${s.code.linesAdded} −${s.code.linesRemoved} in ${s.code.files} files` : "";
   const premium = s.premiumRequests !== null ? ` · Premium requests: ${s.premiumRequests}` : "";
   return [
-    `**symphony-copilot · session ${cycle?.sessions ?? "?"} of ${config.agent.maxSessions} · ${headline}**`,
+    `**symphony-copilot · ${role === "review" ? "review" : "implementation"} · session ${cycle?.sessions ?? "?"} of ${config.agent.maxSessions} · ${headline}**`,
     "",
     `- Model: ${models}`,
     `- Turns: ${s.turns} of ${config.agent.maxTurns} · Time: ${formatDuration(elapsedMs)}${code}`,
@@ -313,6 +318,8 @@ export class Orchestrator {
     if (reloadError) return `workflow reload failed: ${reloadError}`;
     const cli = workflow.config.copilot.cliPath;
     if (cli && !existsSync(cli)) return `copilot.cli_path ${cli} does not exist`;
+    const review = workflow.config.review;
+    if (review && !existsSync(review.promptFile)) return `review.prompt_file ${review.promptFile} does not exist`;
     return null;
   }
 
@@ -423,8 +430,9 @@ export class Orchestrator {
   private dispatch(issue: Issue, attempt: number | null, workflow: EffectiveWorkflow, tracker: TrackerAdapter): void {
     const log = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
     const abort = new AbortController();
+    const role = roleFor(workflow.config, issue.state);
     const entry: RunningEntry = {
-      issue, abort, attempt, startedAt: this.now(), threadId: null, turnCount: 0, lastEvent: null, lastEventAt: null, lastMessage: null,
+      issue, role, abort, attempt, startedAt: this.now(), threadId: null, turnCount: 0, lastEvent: null, lastEventAt: null, lastMessage: null,
       tokens: { input: 0, output: 0, total: 0 }, lastReported: { input: 0, output: 0, total: 0 },
       cycle: this.ledger.open(issue.id, issue.identifier, new Date(this.now())), lastReportedCredits: 0, summary: null, halt: null,
       termination: null, stalled: false,
@@ -436,9 +444,10 @@ export class Orchestrator {
     this.retries.delete(issue.id);
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
-    log.info("dispatching", { attempt, state: issue.state });
+    log.info("dispatching", { attempt, state: issue.state, role });
+    const reviewRound = (entry.cycle?.reviewRounds ?? 0) + 1;
     entry.done = Promise.resolve()
-      .then(() => this.deps.runWorker({ issue, attempt, workflow, tracker, signal: abort.signal, log, onUpdate: (u) => this.onUpdate(entry, u) }))
+      .then(() => this.deps.runWorker({ issue, attempt, role, reviewRound, workflow, tracker, signal: abort.signal, log, onUpdate: (u) => this.onUpdate(entry, u) }))
       .then(() => this.serial(() => this.onWorkerExit(entry, null)), (error: Error) => this.serial(() => this.onWorkerExit(entry, error)))
       .catch((error: Error) => log.error("worker exit handling failed", { error: error.message }));
   }
@@ -478,6 +487,10 @@ export class Orchestrator {
     if (update.event === "session_started") {
       cycle.sessions++;
       entry.lastReportedCredits = 0;
+      changed = true;
+    }
+    if (update.event === "review_verdict") {
+      cycle.reviewRounds++;
       changed = true;
     }
     if (update.aiCredits !== undefined && update.aiCredits > entry.lastReportedCredits) {
@@ -552,7 +565,7 @@ export class Orchestrator {
       run_sessions: entry.cycle?.sessions ?? 0, run_ai_credits: credits(entry.cycle?.aiCredits ?? 0),
       input_tokens: s.inputTokens, output_tokens: s.outputTokens, premium_requests: s.premiumRequests, seconds: Math.round(elapsed / 1000),
     });
-    return formatUsageReport(s, entry.cycle, config, headline, elapsed);
+    return formatUsageReport(s, entry.cycle, config, headline, elapsed, entry.role);
   }
 
   private async reportSession(entry: RunningEntry, headline: string): Promise<void> {
@@ -659,8 +672,11 @@ export class Orchestrator {
       // Only act on the worker this read was made for, never on one started since.
       if (!entry || !checked.includes(entry)) continue;
       if (isTerminalState(config, issue.state)) this.terminate(entry, true, `issue moved to ${issue.state}`, issue.state);
-      else if (isActiveState(config, issue.state) && isRoutable(config, issue)) entry.issue = issue;
-      else this.terminate(entry, false, `issue is ${issue.state}${isRoutable(config, issue) ? "" : " and not routable"}`, issue.state);
+      else if (isActiveState(config, issue.state) && isRoutable(config, issue)) {
+        // Moving between implementation and review hands the card to a fresh session in the other role.
+        if (roleFor(config, issue.state) !== entry.role) this.terminate(entry, false, `issue moved to ${issue.state}`, issue.state);
+        else entry.issue = issue;
+      } else this.terminate(entry, false, `issue is ${issue.state}${isRoutable(config, issue) ? "" : " and not routable"}`, issue.state);
     }
     for (const entry of checked) {
       if (this.running.get(entry.issue.id) === entry && !seen.has(entry.issue.id)) this.terminate(entry, false, "issue no longer visible");

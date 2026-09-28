@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
-import type { ServiceConfig } from "./config.ts";
+import type { Role, ServiceConfig } from "./config.ts";
 import { issueEnvironment } from "./env.ts";
 import { truncate, type Logger } from "./log.ts";
 import type { Issue } from "./types.ts";
@@ -19,6 +19,7 @@ export interface Workspace {
   path: string;
   key: string;
   createdNow: boolean;
+  role: Role;
 }
 
 /** Spec §4.2: only [A-Za-z0-9._-]; a changed identifier gets a 64-bit hash suffix. */
@@ -36,10 +37,16 @@ export function assertInsideRoot(root: string, path: string): void {
   }
 }
 
-export function workspacePath(root: string, identifier: string): string {
-  const path = resolve(root, workspaceKey(identifier));
+export function workspacePath(root: string, identifier: string, role: Role = "implement"): string {
+  const path = resolve(root, roleKey(identifier, role));
   assertInsideRoot(root, path);
   return path;
+}
+
+/** The reviewer works in a sibling directory so it never touches the implementer's files. */
+function roleKey(identifier: string, role: Role): string {
+  const key = workspaceKey(identifier);
+  return role === "review" ? `${key}-review` : key;
 }
 
 export interface HookResult {
@@ -104,10 +111,10 @@ export class WorkspaceManager {
     this.baseEnv = baseEnv;
   }
 
-  async prepare(config: ServiceConfig, issue: Issue): Promise<Workspace> {
+  async prepare(config: ServiceConfig, issue: Issue, role: Role = "implement"): Promise<Workspace> {
     const root = config.workspace.root;
-    const key = workspaceKey(issue.identifier);
-    const path = workspacePath(root, issue.identifier);
+    const key = roleKey(issue.identifier, role);
+    const path = workspacePath(root, issue.identifier, role);
     mkdirSync(root, { recursive: true });
     let createdNow = false;
     const existing = lstatSync(path, { throwIfNoEntry: false });
@@ -122,7 +129,7 @@ export class WorkspaceManager {
       createdNow = true;
     }
     assertInsideRoot(realpathSync(root), realpathSync(path));
-    const workspace = { path, key, createdNow };
+    const workspace = { path, key, createdNow, role };
     if (createdNow) {
       try {
         await this.hook(config, "after_create", workspace, issue, true);
@@ -140,7 +147,12 @@ export class WorkspaceManager {
     if (!script) return;
     const log = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier, hook: name });
     log.info("hook started");
-    const env = { ...this.baseEnv, ...issueEnvironment(issue, workspace.path, workspace.key) };
+    const env = {
+      ...this.baseEnv,
+      ...issueEnvironment(issue, workspace.path, workspace.key),
+      SYMPHONY_ROLE: workspace.role,
+      ...(workspace.role === "review" ? { SYMPHONY_IMPLEMENTER_WORKSPACE: workspacePath(config.workspace.root, issue.identifier) } : {}),
+    };
     const result = await runHook(script, workspace.path, config.hooks.timeoutMs, env);
     if (result.ok) {
       log.info("hook completed");
@@ -152,13 +164,15 @@ export class WorkspaceManager {
   }
 
   async remove(config: ServiceConfig, issue: Issue): Promise<void> {
-    const path = workspacePath(config.workspace.root, issue.identifier);
-    const existing = lstatSync(path, { throwIfNoEntry: false });
-    if (!existing) return;
-    if (existing.isDirectory()) {
-      await this.hook(config, "before_remove", { path, key: workspaceKey(issue.identifier), createdNow: false }, issue, false);
+    for (const role of ["implement", "review"] as const) {
+      const path = workspacePath(config.workspace.root, issue.identifier, role);
+      const existing = lstatSync(path, { throwIfNoEntry: false });
+      if (!existing) continue;
+      if (existing.isDirectory()) {
+        await this.hook(config, "before_remove", { path, key: roleKey(issue.identifier, role), createdNow: false, role }, issue, false);
+      }
+      rmSync(path, { recursive: true, force: true });
+      this.log.info("workspace removed", { issue_id: issue.id, issue_identifier: issue.identifier, path });
     }
-    rmSync(path, { recursive: true, force: true });
-    this.log.info("workspace removed", { issue_id: issue.id, issue_identifier: issue.identifier, path });
   }
 }

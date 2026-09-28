@@ -1,11 +1,12 @@
+import { readFileSync } from "node:fs";
 import { CopilotClient, RuntimeConnection, type CopilotSession, type SessionEvent } from "@github/copilot-sdk";
-import { isActiveState, isRoutable, type ServiceConfig } from "./config.ts";
+import { isActiveState, isRoutable, roleFor, type Role, type ServiceConfig } from "./config.ts";
 import { truncate, type Logger } from "./log.ts";
 import { createPermissionHandler } from "./policy.ts";
-import { renderContinuationPrompt, renderIssuePrompt } from "./template.ts";
+import { renderContinuationPrompt, renderIssuePrompt, renderTemplate } from "./template.ts";
 import type { TrackerAdapter } from "./tracker/index.ts";
-import type { Issue } from "./types.ts";
-import { assertInsideRoot, type WorkspaceManager } from "./workspace.ts";
+import { issueForTemplate, type Issue } from "./types.ts";
+import { assertInsideRoot, workspacePath, type WorkspaceManager } from "./workspace.ts";
 
 export type RunErrorCode =
   | "startup_failed"
@@ -63,6 +64,8 @@ export interface AgentUpdate {
 export interface AttemptParams {
   issue: Issue;
   attempt: number | null;
+  role?: Role;
+  reviewRound?: number;
   config: ServiceConfig;
   promptTemplate: string;
   tracker: TrackerAdapter;
@@ -72,6 +75,15 @@ export interface AttemptParams {
   signal: AbortSignal;
   log: Logger;
   onUpdate(update: AgentUpdate): void;
+}
+
+/** Read at every dispatch so edits apply without a restart, like WORKFLOW.md. */
+function readReviewPrompt(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    throw new RunError("startup_failed", `cannot read review.prompt_file ${path}: ${(error as Error).message}`);
+  }
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
@@ -158,7 +170,10 @@ function runTurn(o: TurnOptions): Promise<void> {
 /** Spec §16.5: workspace -> hooks -> Copilot session -> turn loop -> after_run. Throws on any failure. */
 export async function runAgentAttempt(p: AttemptParams): Promise<void> {
   const { config } = p;
-  const workspace = await p.workspaces.prepare(config, p.issue);
+  const role = p.role ?? "implement";
+  const review = role === "review" ? config.review : null;
+  if (role === "review" && !review) throw new RunError("startup_failed", "dispatched as reviewer but the workflow has no review block");
+  const workspace = await p.workspaces.prepare(config, p.issue, role);
   await p.workspaces.hook(config, "before_run", workspace, p.issue, true);
   let client: CopilotClient | null = null;
   let session: CopilotSession | null = null;
@@ -178,17 +193,30 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
     });
     try {
       await withTimeout(client.start(), config.copilot.startupTimeoutMs, "copilot runtime start");
+      const implementerWorkspace = workspacePath(config.workspace.root, p.issue.identifier);
       session = await withTimeout(client.createSession({
         workingDirectory: workspace.path,
-        model: config.copilot.model ?? undefined,
-        reasoningEffort: (config.copilot.reasoningEffort ?? undefined) as "low" | "medium" | "high" | "xhigh" | "max" | undefined,
+        model: (review?.model ?? config.copilot.model) ?? undefined,
+        reasoningEffort: ((review?.reasoningEffort ?? config.copilot.reasoningEffort) ?? undefined) as "low" | "medium" | "high" | "xhigh" | "max" | undefined,
         sessionLimits: config.copilot.maxAiCredits ? { maxAiCredits: config.copilot.maxAiCredits } : undefined,
-        tools: p.tracker.agentTools({ issue: p.issue, workspacePath: workspace.path, log: p.log }),
+        tools: p.tracker.agentTools({
+          issue: p.issue,
+          workspacePath: workspace.path,
+          log: p.log,
+          review: review ? {
+            round: p.reviewRound ?? 1,
+            maxRounds: review.maxRounds,
+            passState: review.passState,
+            failState: review.failState,
+            onVerdict: (verdict) => p.onUpdate({ event: "review_verdict", timestamp: new Date(), message: verdict }),
+          } : undefined,
+        }),
         onPermissionRequest: createPermissionHandler({
           workspace: workspace.path,
           shellAllow: config.copilot.shellAllow,
           shellDeny: config.copilot.shellDeny,
-          readAllow: config.copilot.readAllow,
+          // The reviewer may read the implementer's evidence but never change it.
+          readAllow: review ? [...config.copilot.readAllow, implementerWorkspace] : config.copilot.readAllow,
           urlAllow: config.copilot.urlAllow,
         }, p.log),
         // Unattended: answer questions with a fixed instruction instead of stalling (spec §10.5).
@@ -207,8 +235,16 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
 
     for (let turn = 1; ; turn++) {
       const prompt = turn === 1
-        ? renderIssuePrompt(p.promptTemplate, issue, p.attempt)
-        : renderContinuationPrompt(config.agent.continuationPrompt, issue, turn, config.agent.maxTurns);
+        ? review
+          ? renderTemplate(readReviewPrompt(review.promptFile), {
+            issue: issueForTemplate(issue),
+            attempt: p.attempt,
+            review_round: p.reviewRound ?? 1,
+            max_review_rounds: review.maxRounds,
+            implementer_workspace: workspacePath(config.workspace.root, issue.identifier),
+          })
+          : renderIssuePrompt(p.promptTemplate, issue, p.attempt)
+        : renderContinuationPrompt(review ? review.continuationPrompt : config.agent.continuationPrompt, issue, turn, config.agent.maxTurns);
       p.onUpdate({ event: "turn_started", timestamp: new Date(), sessionId, turn });
       turns = turn;
       await runTurn({
@@ -245,6 +281,7 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
       if (refreshed.length === 0) break;
       issue = refreshed[0]!;
       if (!isActiveState(config, issue.state) || !isRoutable(config, issue)) break;
+      if (roleFor(config, issue.state) !== role) break;
       if (turn >= config.agent.maxTurns) break;
     }
   } finally {

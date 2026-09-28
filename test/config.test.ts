@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { buildConfig, ConfigError, DEFAULT_SHELL_ALLOW, DEFAULT_SHELL_DENY, expandPath, isActiveState, isRoutable, isTerminalState, resolveEnvRef } from "../src/config.ts";
+import { buildConfig, ConfigError, DEFAULT_SHELL_ALLOW, DEFAULT_SHELL_DENY, expandPath, roleFor, isActiveState, isRoutable, isTerminalState, resolveEnvRef } from "../src/config.ts";
 import { makeConfig, makeIssue } from "./helpers.ts";
 
 const minimal = { tracker: { kind: "github_project", active_states: ["Todo"], terminal_states: ["Done"] } };
@@ -79,4 +79,18 @@ test("routing needs dispatchable plus every required label; a blank label matche
   assert.ok(!isRoutable(c, makeIssue({ labels: ["bug"] })));
   assert.ok(!isRoutable(c, makeIssue({ dispatchable: false })));
   assert.ok(!isRoutable(makeConfig({ tracker: { required_labels: [" "] } }), makeIssue()));
+});
+
+test("review config needs its states among the active states, a prompt file and both outcome states", () => {
+  const base = { tracker: { kind: "github_project", active_states: ["Todo", "AI Review", "Rework"], terminal_states: ["Done"] } };
+  const c = buildConfig({ ...base, review: { states: ["AI Review"], prompt_file: "REVIEW.md", model: "gpt-6-sol", pass_state: "Human Review", fail_state: "Rework" } }, "/repo/WORKFLOW.md", {});
+  assert.equal(c.review?.promptFile, "/repo/REVIEW.md");
+  assert.equal(c.review?.maxRounds, 3);
+  assert.equal(roleFor(c, "ai review"), "review");
+  assert.equal(roleFor(c, "Rework"), "implement");
+  assert.equal(buildConfig(minimal, "/repo/WORKFLOW.md", {}).review, null);
+  assert.throws(
+    () => buildConfig({ ...base, review: { states: ["Checking"], prompt_file: "R.md", pass_state: "Human Review" } }, "/repo/WORKFLOW.md", {}),
+    (e: ConfigError) => e.problems.some((p) => p.includes("must also be in tracker.active_states")) && e.problems.includes("review.fail_state is required"),
+  );
 });

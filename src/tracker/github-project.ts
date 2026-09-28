@@ -6,7 +6,14 @@ import { ExecError, run } from "../exec.ts";
 import { truncate, type Logger } from "../log.ts";
 import { isInside } from "../policy.ts";
 import { normalizeState, type BlockerRef, type Issue } from "../types.ts";
-import { TrackerError, type AgentToolContext, type TrackerAdapter } from "./types.ts";
+import { TrackerError, type AgentToolContext, type ReviewToolContext, type TrackerAdapter } from "./types.ts";
+
+interface ReviewArgs {
+  verdict: string;
+  summary: string;
+  blocking_issues?: string[];
+  attachments?: string[];
+}
 
 export interface GitHubProjectSettings {
   endpoint: string;
@@ -345,6 +352,28 @@ export class GitHubProjectTracker implements TrackerAdapter {
           return { comment_url: await this.addComment(this.issueNodeId(context.issue), body) };
         }),
       }),
+    ];
+    const review = context.review;
+    if (review) {
+      tools.push(defineTool("tracker_submit_review", {
+        description: `Finish your review (round ${review.round} of ${review.maxRounds}). Posts the review on the pull request and the issue, then moves the card to "${review.passState}" if you approve or "${review.failState}" if you request changes${review.round >= review.maxRounds ? ` (this is the last round: requesting changes hands the card to a human in "${review.passState}" instead)` : ""}. You cannot change code or push.`,
+        parameters: {
+          type: "object",
+          properties: {
+            verdict: { type: "string", enum: ["approve", "request_changes"] },
+            summary: { type: "string", description: "Markdown: what you checked (acceptance criteria one by one, commands you ran and their results) and non-blocking suggestions" },
+            blocking_issues: { type: "array", items: { type: "string" }, description: "Required when requesting changes: each problem that must be fixed before a human reviews, with file and line where possible" },
+            attachments: { type: "array", items: { type: "string" }, description: `Optional: images in your workspace (at most ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each) that show a visible problem or confirm a visible change. One per scenario; leave out when nothing visible is involved.` },
+          },
+          required: ["verdict", "summary"],
+          additionalProperties: false,
+        },
+        skipPermission: true,
+        handler: wrap("tracker_submit_review", (args: ReviewArgs) => this.submitReview(context, review, args)),
+      }));
+      return tools;
+    }
+    tools.push(
       defineTool("tracker_submit_for_review", {
         description: `Hand the work to a human: requires all changes committed in the workspace. Pushes HEAD to branch ${context.issue.branchName}, opens (or updates) the pull request that closes this issue, posts the summary on the issue${this.settings.handoffState ? `, and moves the card to "${this.settings.handoffState}"` : ""}. Do not push yourself.`,
         parameters: {
@@ -364,7 +393,7 @@ export class GitHubProjectTracker implements TrackerAdapter {
         skipPermission: true,
         handler: wrap("tracker_submit_for_review", (args: { title: string; summary: string; attachments?: string[] }) => this.submitForReview(context, args)),
       }),
-    ];
+    );
     if (this.settings.agentStates.length > 0) {
       tools.push(defineTool("tracker_set_status", {
         description: `Move the current issue's card to another status. Allowed: ${this.settings.agentStates.join(", ")}. Comment with the reason before setting a blocked status.`,
@@ -382,6 +411,57 @@ export class GitHubProjectTracker implements TrackerAdapter {
   }
 
   // ---- tool implementations ----
+
+  private async submitReview(context: AgentToolContext, review: ReviewToolContext, args: ReviewArgs): Promise<unknown> {
+    const { issue } = context;
+    if (args.verdict !== "approve" && args.verdict !== "request_changes") return { failure: 'verdict must be "approve" or "request_changes"' };
+    if (typeof args.summary !== "string" || args.summary.trim() === "") return { failure: "summary must be a non-empty string" };
+    const blocking = args.blocking_issues ?? [];
+    if (!Array.isArray(blocking) || !blocking.every((b) => typeof b === "string" && b.trim() !== "")) return { failure: "blocking_issues must be a list of non-empty strings" };
+    if (args.verdict === "request_changes" && blocking.length === 0) return { failure: "list the blocking issues when requesting changes" };
+    if (args.verdict === "approve" && blocking.length > 0) return { failure: "an approval cannot have blocking issues; request changes, or move them to the summary as suggestions" };
+    const attachments = readAttachments(context.workspacePath, args.attachments);
+    if ("failure" in attachments) return attachments;
+    const branch = issue.branchName ?? "";
+    const found: any = await this.graphql(
+      `query($owner: String!, $name: String!, $branch: String!) { repository(owner: $owner, name: $name) {
+        pullRequests(headRefName: $branch, states: [OPEN], first: 1) { nodes { id number url } } } }`,
+      { owner: this.settings.repoOwner, name: this.settings.repoName, branch },
+    );
+    const pr = found?.repository?.pullRequests?.nodes?.[0];
+    if (!pr) return { failure: `there is no open pull request for ${branch} to review` };
+
+    let images = "";
+    if (attachments.files.length > 0) {
+      try {
+        images = (await this.uploadEvidence(issue, attachments.files)).map((u) => `![${u.name}](${u.url})`).join("\n");
+      } catch (error) {
+        images = `_Screenshots could not be attached: ${truncate((error as Error).message, 300)}_`;
+      }
+    }
+    const lastRound = review.round >= review.maxRounds;
+    const escalate = args.verdict === "request_changes" && lastRound;
+    const next = args.verdict === "approve" || escalate ? review.passState : review.failState;
+    const outcome = args.verdict === "approve" ? "approved"
+      : escalate ? `changes requested; that was the last round, so a human decides` : "changes requested";
+    const body = [
+      `**AI review · round ${review.round} of ${review.maxRounds} · ${outcome}**`,
+      args.summary,
+      blocking.length > 0 ? `**Blocking issues**\n\n${blocking.map((b, i) => `${i + 1}. ${b}`).join("\n")}` : "",
+      images,
+    ].filter(Boolean).join("\n\n");
+    // GitHub does not let the PR's author approve or request changes, so the verdict lives in the card state.
+    const posted: any = await this.graphql(
+      `mutation($pr: ID!, $body: String!) { addPullRequestReview(input: { pullRequestId: $pr, event: COMMENT, body: $body }) { pullRequestReview { url } } }`,
+      { pr: pr.id, body },
+    );
+    const reviewUrl = posted?.addPullRequestReview?.pullRequestReview?.url ?? pr.url;
+    await this.addComment(this.issueNodeId(issue), `${body}\n\n[Review on PR #${pr.number}](${reviewUrl})`);
+    await this.setStatus(issue, next);
+    review.onVerdict(args.verdict);
+    context.log.info("review submitted", { verdict: args.verdict, round: review.round, status: next, pull_request: pr.url });
+    return { verdict: args.verdict, status: next, pull_request: pr.url, round: review.round };
+  }
 
   private issueNodeId(issue: Issue): string {
     const id = issue.nativeRef?.issue_id;

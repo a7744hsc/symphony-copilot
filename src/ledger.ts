@@ -11,6 +11,8 @@ export interface RunCycle {
   /** Copilot sessions that actually started in this run. */
   sessions: number;
   aiCredits: number;
+  /** Review verdicts given in this run. */
+  reviewRounds: number;
   halted: { reason: string; state: string; at: string } | null;
 }
 
@@ -39,7 +41,7 @@ export class RunLedger {
   open(issueId: string, identifier: string, now: Date): RunCycle {
     let cycle = this.cycles.get(issueId);
     if (!cycle) {
-      cycle = { identifier, startedAt: now.toISOString(), sessions: 0, aiCredits: 0, halted: null };
+      cycle = { identifier, startedAt: now.toISOString(), sessions: 0, aiCredits: 0, reviewRounds: 0, halted: null };
       this.cycles.set(issueId, cycle);
     }
     return cycle;
@@ -85,6 +87,7 @@ function load(path: string): Array<[string, RunCycle]> {
       startedAt: typeof raw.startedAt === "string" ? raw.startedAt : new Date(0).toISOString(),
       sessions: raw.sessions,
       aiCredits: raw.aiCredits,
+      reviewRounds: Number.isFinite(raw.reviewRounds) ? raw.reviewRounds : 0,
       halted: raw.halted && typeof raw.halted.reason === "string" && typeof raw.halted.state === "string"
         ? { reason: raw.halted.reason, state: raw.halted.state, at: String(raw.halted.at ?? "") }
         : null,

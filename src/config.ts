@@ -56,7 +56,22 @@ export interface ServiceConfig {
   hooks: HooksConfig;
   agent: AgentConfig;
   copilot: CopilotConfig;
+  review: ReviewConfig | null;
 }
+
+/** An independent reviewer agent that works the review states in its own session and workspace. */
+export interface ReviewConfig {
+  states: string[];
+  promptFile: string;
+  model: string | null;
+  reasoningEffort: string | null;
+  passState: string;
+  failState: string;
+  maxRounds: number;
+  continuationPrompt: string;
+}
+
+export type Role = "implement" | "review";
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -155,6 +170,7 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
   const hooks = section(raw, "hooks", problems);
   const agent = section(raw, "agent", problems);
   const copilot = section(raw, "copilot", problems);
+  const review = raw.review === undefined || raw.review === null ? null : section(raw, "review", problems);
 
   const kind = text(tracker.kind, "tracker.kind", problems);
   if (!kind) problems.push("tracker.kind is required");
@@ -223,9 +239,44 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
       urlAllow: stringList(copilot.url_allow, [], "copilot.url_allow", problems),
       userInputReply: text(copilot.user_input_reply, "copilot.user_input_reply", problems) ?? DEFAULT_USER_INPUT_REPLY,
     },
+    review: review ? buildReview(review, activeStates, workflowDir, env, problems) : null,
   };
   if (problems.length > 0) throw new ConfigError(problems);
   return config;
+}
+
+function buildReview(raw: Record<string, unknown>, activeStates: string[], workflowDir: string, env: NodeJS.ProcessEnv, problems: string[]): ReviewConfig {
+  const states = stringList(raw.states, [], "review.states", problems);
+  if (states.length === 0) problems.push("review.states is required");
+  const active = new Set(activeStates.map(normalizeState));
+  for (const state of states) {
+    if (!active.has(normalizeState(state))) problems.push(`review state "${state}" must also be in tracker.active_states`);
+  }
+  const required = (key: string) => {
+    const value = text(raw[key], `review.${key}`, problems);
+    if (!value) problems.push(`review.${key} is required`);
+    return value ?? "";
+  };
+  const promptFile = required("prompt_file");
+  return {
+    states,
+    promptFile: promptFile ? expandPath(promptFile, workflowDir, env) : "",
+    model: text(raw.model, "review.model", problems),
+    reasoningEffort: text(raw.reasoning_effort, "review.reasoning_effort", problems),
+    passState: required("pass_state"),
+    failState: required("fail_state"),
+    maxRounds: integer(raw.max_rounds, 3, "review.max_rounds", problems, 1),
+    continuationPrompt: text(raw.continuation_prompt, "review.continuation_prompt", problems) ?? DEFAULT_REVIEW_CONTINUATION,
+  };
+}
+
+const DEFAULT_REVIEW_CONTINUATION =
+  "Continue reviewing {{ issue.identifier }} (turn {{ turn }} of {{ max_turns }}). Do not repeat checks you already ran. When you have a verdict, call tracker_submit_review.";
+
+/** Review states are worked by the reviewer; every other active state by the implementer. */
+export function roleFor(config: ServiceConfig, state: string): Role {
+  const s = normalizeState(state);
+  return config.review?.states.some((r) => normalizeState(r) === s) ? "review" : "implement";
 }
 
 export function isActiveState(config: ServiceConfig, state: string): boolean {

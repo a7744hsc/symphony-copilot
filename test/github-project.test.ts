@@ -222,3 +222,62 @@ test("evidence goes to its own branch and links point at the exact commit", asyn
   assert.equal(next.calls.find((c) => c.path.endsWith("/git/trees"))!.body.base_tree, "pt");
   assert.deepEqual(next.calls.find((c) => c.method === "PATCH")!.body, { sha: "c2", force: false });
 });
+
+function reviewFetch(prNodes: unknown[] = [{ id: "PR_1", number: 10, url: "https://github.com/me/app/pull/10" }]) {
+  return fakeFetch([
+    { data: { repository: { pullRequests: { nodes: prNodes } } } },
+    { data: { addPullRequestReview: { pullRequestReview: { url: "https://github.com/me/app/pull/10#pullrequestreview-1" } } } },
+    { data: { addComment: { commentEdge: { node: { url: "https://github.com/me/app/issues/12#issuecomment-1" } } } } },
+    { data: { owner: { projectV2: { id: "PVT_1", field: { id: "F", options: [{ id: "o-rework", name: "返工" }, { id: "o-human", name: "待验证" }] } } } } },
+    { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_1" } } } },
+  ]);
+}
+
+async function submitReview(round: number, args: Record<string, unknown>, prNodes?: unknown[]) {
+  const { impl, calls } = reviewFetch(prNodes);
+  const verdicts: string[] = [];
+  const tracker = new GitHubProjectTracker({ ...provider, agent_states: ["进行中", "受阻"] }, env, quietLog, impl);
+  const issue = (normalizeItem(item(), settings) as { issue: any }).issue;
+  const tools = tracker.agentTools({
+    issue, workspacePath: mkdtempSync(join(tmpdir(), "review-ws-")), log: quietLog,
+    review: { round, maxRounds: 3, passState: "待验证", failState: "返工", onVerdict: (v) => verdicts.push(v) },
+  });
+  const tool = tools.find((t) => t.name === "tracker_submit_review")!;
+  const result: any = await tool.handler!(args as any, {} as any);
+  return { result, calls, verdicts, names: tools.map((t) => t.name).sort() };
+}
+
+test("the reviewer gets review tools only; requesting changes sends the card back with the blocking issues", async () => {
+  const { result, calls, verdicts, names } = await submitReview(1, { verdict: "request_changes", summary: "Checked A01-A03.", blocking_issues: ["Bubble arrow points at the wrong guest (ElevatorSceneView.swift:210)"] });
+  assert.deepEqual(names, ["tracker_comment", "tracker_get_issue", "tracker_submit_review"]);
+  assert.equal(result.status, "返工");
+  assert.match(calls[1]!.query, /addPullRequestReview.*event: COMMENT/s);
+  assert.match(String(calls[1]!.variables.body), /AI review · round 1 of 3 · changes requested[\s\S]*1\. Bubble arrow points at the wrong guest/);
+  assert.match(String(calls[2]!.variables.body), /\[Review on PR #10\]/);
+  assert.equal(calls[4]!.variables.option, "o-rework");
+  assert.deepEqual(verdicts, ["request_changes"]);
+});
+
+test("the last round hands a still-failing card to a human instead of looping", async () => {
+  const { result, calls } = await submitReview(3, { verdict: "request_changes", summary: "Still broken.", blocking_issues: ["x"] });
+  assert.equal(result.status, "待验证");
+  assert.match(String(calls[1]!.variables.body), /round 3 of 3 · changes requested; that was the last round, so a human decides/);
+  assert.equal(calls[4]!.variables.option, "o-human");
+});
+
+test("review verdicts are validated before anything is posted", async () => {
+  const failure = async (args: Record<string, unknown>, prNodes?: unknown[]) => {
+    const { result, calls, verdicts } = await submitReview(1, args, prNodes);
+    assert.deepEqual(verdicts, []);
+    return { text: String(result?.textResultForLlm ?? ""), posted: calls.length };
+  };
+  assert.match((await failure({ verdict: "approve", summary: "ok", blocking_issues: ["x"] })).text, /cannot have blocking issues/);
+  assert.match((await failure({ verdict: "request_changes", summary: "no" })).text, /list the blocking issues/);
+  assert.match((await failure({ verdict: "maybe", summary: "?" })).text, /verdict must be/);
+  const noPr = await failure({ verdict: "approve", summary: "ok" }, []);
+  assert.match(noPr.text, /no open pull request/);
+  assert.equal(noPr.posted, 1, "only the lookup ran");
+  const approved = await submitReview(2, { verdict: "approve", summary: "All acceptance criteria met." });
+  assert.equal(approved.result.status, "待验证");
+  assert.match(String(approved.calls[1]!.variables.body), /round 2 of 3 · approved/);
+});

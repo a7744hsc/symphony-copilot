@@ -95,3 +95,16 @@ test("scrubbed environments drop secret names", () => {
   const env = scrubEnvironment({ PATH: "/bin", GH_TOKEN: "x", SYMPHONY_GITHUB_TOKEN: "y" }, ["GH_TOKEN", "SYMPHONY_GITHUB_TOKEN"]);
   assert.deepEqual(env, { PATH: "/bin" });
 });
+
+test("the reviewer gets its own workspace, knows its role, and cleanup removes both", async () => {
+  const { root, config, manager } = setup({ after_create: "echo \"$SYMPHONY_ROLE ${SYMPHONY_IMPLEMENTER_WORKSPACE:-none}\" > role.txt" });
+  const issue = makeIssue({ identifier: "GH-7", branchName: "agent/7" });
+  assert.equal(workspacePath(root, "GH-7", "review"), join(root, "GH-7-review"));
+  const implement = await manager.prepare(config, issue);
+  const review = await manager.prepare(config, issue, "review");
+  assert.equal(review.path, join(root, "GH-7-review"));
+  assert.equal(readFileSync(join(implement.path, "role.txt"), "utf8").trim(), "implement none");
+  assert.equal(readFileSync(join(review.path, "role.txt"), "utf8").trim(), `review ${implement.path}`);
+  await manager.remove(config, issue);
+  assert.ok(!existsSync(implement.path) && !existsSync(review.path));
+});

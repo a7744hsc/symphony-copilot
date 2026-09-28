@@ -24,6 +24,16 @@ export interface AgentToolContext {
   issue: Issue;
   workspacePath: string;
   log: Logger;
+  /** Present when the agent is the reviewer; it then gets review tools instead of submit/status tools. */
+  review?: ReviewToolContext;
+}
+
+export interface ReviewToolContext {
+  round: number;
+  maxRounds: number;
+  passState: string;
+  failState: string;
+  onVerdict(verdict: "approve" | "request_changes"): void;
 }
 
 /** Spec §11: a small read kernel plus optional provider-native agent tools. */
