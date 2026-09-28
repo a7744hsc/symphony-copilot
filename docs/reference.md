@@ -102,6 +102,15 @@ Screenshots are linked by commit, so they render for anyone with access to the r
 
 If a tool fails, it returns a failure result and the session continues.
 
+## Scheduling guarantees
+
+- **One worker per issue.** An issue is claimed from dispatch until its run is released: handed off, blocked, halted, terminal, or no longer visible. Polls and retries skip claimed issues.
+- **One scheduling decision at a time.** Polls, retry firings and worker-exit handling go through a single queue. Workers run in parallel, but no decision interleaves with another one that is still waiting on the tracker.
+- **No stale stops.** Reconciliation only acts on the workers that existed when it read the tracker, so a slow read never stops a worker that started after it.
+- **Halts hold.** A halted issue records its live tracker state, so a poll never mistakes the agent's own status change for a person moving the card.
+- **No overlap in a workspace.** The next session for an issue starts only after the previous one, including its `after_run` hook, has finished.
+- **One orchestrator per `workspace.root`.** A second instance is not detected and would claim the same issues.
+
 ## Differences from the spec
 
 - Run limits (`agent.max_sessions`, `copilot.max_ai_credits_per_issue`) are an addition. The spec keeps dispatching an active issue indefinitely; here a run that reaches a limit is halted until the issue leaves the active states. The per-run counts are the only state kept across restarts (`.symphony-ledger.json` under `workspace.root`); a corrupt ledger fails startup rather than silently resetting the limits.

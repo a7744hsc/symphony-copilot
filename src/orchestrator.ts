@@ -140,6 +140,7 @@ export class Orchestrator {
   private tickTimer: NodeJS.Timeout | null = null;
   private ticking = false;
   private stopped = false;
+  private queue: Promise<void> = Promise.resolve();
 
   constructor(deps: OrchestratorDeps) {
     this.deps = deps;
@@ -172,10 +173,24 @@ export class Orchestrator {
     await this.startupCleanup(workflow.config, tracker);
   }
 
+  /**
+   * Polls, retry firings and worker exits change scheduling state one at a time. Workers keep running in
+   * parallel, but no decision is made while another one is waiting on the tracker with older data.
+   */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn);
+    this.queue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
   /** One poll-and-dispatch cycle; exposed for `--once` and tests. */
   async tick(): Promise<void> {
     if (this.ticking || this.stopped) return;
     this.ticking = true;
+    return this.serial(() => this.pollOnce());
+  }
+
+  private async pollOnce(): Promise<void> {
     let interval = 30_000;
     try {
       const workflow = this.deps.refreshWorkflow();
@@ -358,8 +373,12 @@ export class Orchestrator {
     }
     if (moved && cycle.halted) {
       cycle.halted.state = moved;
-      this.saveLedger();
+    } else if (cycle.halted) {
+      // The agent may have moved the card since the last poll; compare later polls against the live state.
+      const fresh = await tracker?.fetchIssuesByIds([issue.id]).catch(() => []);
+      if (fresh?.[0]) cycle.halted.state = fresh[0].state;
     }
+    this.saveLedger();
     const next = moved
       ? `The card was moved to "${moved}". Move it back to an active column to start a new run with fresh limits.`
       : "Move the card to a different column (for example out of the active columns and back) to start a new run with fresh limits.";
@@ -420,7 +439,8 @@ export class Orchestrator {
     log.info("dispatching", { attempt, state: issue.state });
     entry.done = Promise.resolve()
       .then(() => this.deps.runWorker({ issue, attempt, workflow, tracker, signal: abort.signal, log, onUpdate: (u) => this.onUpdate(entry, u) }))
-      .then(() => this.onWorkerExit(entry, null), (error: Error) => this.onWorkerExit(entry, error));
+      .then(() => this.serial(() => this.onWorkerExit(entry, null)), (error: Error) => this.serial(() => this.onWorkerExit(entry, error)))
+      .catch((error: Error) => log.error("worker exit handling failed", { error: error.message }));
   }
 
   private onUpdate(entry: RunningEntry, update: AgentUpdate): void {
@@ -553,7 +573,10 @@ export class Orchestrator {
     if (existing) clearTimeout(existing.timer);
     const maxBackoff = this.trackerConfig?.agent.maxRetryBackoffMs ?? 300_000;
     const delay = delayMs ?? retryDelayMs(attempt, maxBackoff);
-    const timer = setTimeout(() => void this.onRetryTimer(issue.id), delay);
+    const timer = setTimeout(() => {
+      void this.serial(() => this.onRetryTimer(issue.id))
+        .catch((error: Error) => this.log.error("retry handling failed", { issue_id: issue.id, issue_identifier: issue.identifier, error: error.message }));
+    }, delay);
     this.retries.set(issue.id, { issueId: issue.id, identifier: issue.identifier, url: issue.url, attempt, dueAt: this.now() + delay, timer, error });
     this.claimed.add(issue.id);
   }
@@ -620,11 +643,11 @@ export class Orchestrator {
         }
       }
     }
-    const ids = [...this.running.values()].filter((e) => !e.termination && !e.stalled).map((e) => e.issue.id);
-    if (ids.length === 0) return;
+    const checked = [...this.running.values()].filter((e) => !e.termination && !e.stalled);
+    if (checked.length === 0) return;
     let refreshed: Issue[];
     try {
-      refreshed = await tracker.fetchIssuesByIds(ids);
+      refreshed = await tracker.fetchIssuesByIds(checked.map((e) => e.issue.id));
     } catch (error) {
       this.log.warn("state refresh failed; keeping workers", { error: (error as Error).message });
       return;
@@ -633,14 +656,14 @@ export class Orchestrator {
     for (const issue of refreshed) {
       seen.add(issue.id);
       const entry = this.running.get(issue.id);
-      if (!entry) continue;
+      // Only act on the worker this read was made for, never on one started since.
+      if (!entry || !checked.includes(entry)) continue;
       if (isTerminalState(config, issue.state)) this.terminate(entry, true, `issue moved to ${issue.state}`, issue.state);
       else if (isActiveState(config, issue.state) && isRoutable(config, issue)) entry.issue = issue;
       else this.terminate(entry, false, `issue is ${issue.state}${isRoutable(config, issue) ? "" : " and not routable"}`, issue.state);
     }
-    for (const id of ids) {
-      const entry = this.running.get(id);
-      if (entry && !seen.has(id)) this.terminate(entry, false, "issue no longer visible");
+    for (const entry of checked) {
+      if (this.running.get(entry.issue.id) === entry && !seen.has(entry.issue.id)) this.terminate(entry, false, "issue no longer visible");
     }
   }
 

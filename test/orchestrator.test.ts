@@ -15,6 +15,8 @@ class FakeTracker implements TrackerAdapter {
   readonly comments: string[] = [];
   blockedState: string | null = "Blocked";
   refreshFails = false;
+  /** When set, the next id fetch returns the states as they were when it was called, after this resolves. */
+  gate: Promise<void> | null = null;
   add(...issues: Issue[]) {
     for (const issue of issues) this.issues.set(issue.id, issue);
   }
@@ -27,7 +29,11 @@ class FakeTracker implements TrackerAdapter {
   }
   async fetchIssuesByIds(ids: string[]) {
     if (this.refreshFails) throw new Error("tracker down");
-    return ids.map((id) => this.issues.get(id)).filter((i): i is Issue => i !== undefined);
+    const snapshot = ids.map((id) => this.issues.get(id)).filter((i): i is Issue => i !== undefined);
+    const gate = this.gate;
+    this.gate = null;
+    if (gate) await gate;
+    return snapshot;
   }
   agentTools() {
     return [];
@@ -446,4 +452,54 @@ test("usage comments can be turned off; a budget halt folds the usage into its n
   await flush();
   assert.equal(s.tracker.comments.length, 1);
   assert.match(s.tracker.comments[0]!, /stopped working.*session 1 of 5 · stopped: run limit reached/s);
+});
+
+test("a retry firing while a poll is in flight never exceeds the concurrency limit", async (t) => {
+  const s = setup(t, { agent: { max_concurrent_agents: 1 } });
+  s.tracker.add(issue("B", { priority: 1 }), issue("A", { priority: 2 }));
+  await s.tick();
+  assert.deepEqual(s.ids(), ["B"]);
+  s.calls[0]!.reject(new Error("boom"));
+  await flush();
+  t.mock.timers.tick(10_000);
+  const poll = s.orchestrator.tick();
+  await poll;
+  await flush();
+  const running = s.orchestrator.snapshot().running.length;
+  assert.ok(running <= 1, `running=${running}, dispatched ${s.ids().join(",")}`);
+});
+
+test("a budget halt holds even if the agent changed the card's state since the last poll", async (t) => {
+  const s = setup(t, { copilot: { max_ai_credits_per_issue: 10 } });
+  s.tracker.blockedState = null;
+  s.tracker.add(issue("A"));
+  await s.tick();
+  s.tracker.set("A", { state: "In Progress" });
+  const update = s.calls[0]!.params.onUpdate;
+  update({ event: "session_started", timestamp: new Date(), sessionId: "sess" });
+  update({ event: "assistant.usage", timestamp: new Date(), aiCredits: 11 });
+  await flush();
+  await s.tick();
+  assert.equal(s.calls.length, 1, "the halted card must not be dispatched again");
+});
+
+test("a slow poll never applies a stale card state to a worker that started after it", async (t) => {
+  const s = setup(t);
+  s.tracker.add(issue("A"));
+  await s.tick();
+  s.tracker.set("A", { state: "Human Review" });
+  let release!: () => void;
+  s.tracker.gate = new Promise<void>((resolve) => { release = resolve; });
+  const poll = s.orchestrator.tick();
+  await flush();
+  s.tracker.set("A", { state: "Todo" });
+  s.calls[0]!.resolve();
+  await flush();
+  await s.advance(1_000);
+  release();
+  await poll;
+  await flush();
+  await s.tick();
+  assert.ok(s.calls.slice(1).every((c) => !c.aborted), `workers started after the stale read were killed: ${s.calls.map((c) => c.aborted).join(",")}`);
+  assert.equal(s.orchestrator.snapshot().running.length, 1);
 });
