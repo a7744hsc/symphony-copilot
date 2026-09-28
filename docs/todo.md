@@ -19,11 +19,14 @@
 | # | 待办 | 起因 | 状态 |
 |---|---|---|---|
 | 6 | `doctor` 命令：Node 版本、gh 登录和 `project` 权限、Copilot 认证与额度、看板状态和标签、git 能否推送、`WORKFLOW.md` 能否解析和渲染，逐项给修复提示 | 这些都手动排查过；detent 有同类命令 | 未开始 |
-| 7 | `init` 命令：建好或改名看板状态选项（GraphQL 可用 `id` 原地改名），建 `agent` 标签和优先级字段，生成 `WORKFLOW.md` | 建看板时手动做了很多步 | 未开始 |
+| 7 | 按 `WORKFLOW.md` 一键配置看板：先生成 `WORKFLOW.md`（待办 38），再由脚本读它的 `tracker`、`review`、`merge_conflicts` 段，建或复用看板，补齐状态选项、优先级字段和标签。项目自动化（Auto-add、Pull request linked）先确认 API 能不能改，不能就打印网页上要改的步骤 | 建看板时手动做了很多步；状态名写错不报错，dry-run 只显示 0 张卡；Issue 不在看板上就不会被派发，文档没提 Auto-add | 未开始 |
 | 8 | 发布 npm 包，支持 `npx`：加编译步骤，发布 JS | Node 不剥离 `node_modules` 里 `.ts` 的类型，直接发源码跑不起来 | 未开始 |
 | 9 | README 开头放演示 GIF：卡片 → PR → Human Review | 受欢迎的项目开头都有画面 | 未开始 |
 | 10 | 终端实时状态：每个 agent 的轮次、最近动作、已用高级请求 | 现在只能翻日志 | 未开始 |
 | 11 | 社区文件：CONTRIBUTING、SECURITY.md、Issue 模板、Dependabot | 公开仓库的基本配置 | 未开始 |
+| 38 | `WORKFLOW.md` 契约：front matter 的 JSON Schema（每个键的类型、默认值、说明），和检查工具 `symphony check`：解析、按 schema 报未知键、跑 `buildConfig` 的跨字段校验、用示例 Issue 渲染提示词模板。再加一个交互式生成 `WORKFLOW.md` 的 skill：读仓库定构建命令、hooks 和允许列表，按契约填写，跑 check 直到通过 | 各列该写进 `active_states`、`agent_states`、`handoff_state`、`review.states`、`merge_conflicts` 哪一项，分散在 README 三节和 reference 里；拼错的键现在被静默忽略。契约管“填得对不对”，skill 管“按这个项目该填什么” | 未开始 |
+| 39 | 通用的 `AGENTS.md`、`REVIEW.md` 模板（放 `examples/`），和按仓库生成它们的 skill；示例 `WORKFLOW.md` 补上 `review` 段和审核者的 `before_run` 重置 | 示例提示词让 agent 先读 AGENTS.md，但没有写法和示例；REVIEW.md 和重置分支的 hook 只在试点仓库里有 | 未开始 |
+| 40 | 卡片契约：Issue 表单模板（目标、验收条件、怎么验证、范围外），和写卡片的 skill（写好后建 Issue、加到看板、打 `agent` 标签） | 卡片怎么写没有任何文档，而验收条件和验证方式直接决定 agent 做得对不对 | 未开始 |
 
 ### P1：运行质量
 
@@ -58,6 +61,19 @@
 | 23 | 固定 SDK 版本，升级时跑端到端 | SDK 自带运行时 1.0.85，CLI 已到 1.0.89，更新频繁 | 未开始 |
 | 24 | 更多 tracker，如只用 GitHub Issues 标签的无看板模式 | 同类项目都有，门槛更低 | 未开始 |
 | 33 | 打开 SDK 的沙盒（`SandboxConfig`，macOS 用 seatbelt，实验性），由系统把 shell 限制在工作区；先验证 `xcodebuild`、模拟器和 DerivedData 在沙盒里能用 | 待办 32 的文本检查挡不住用变量拼出来的路径；运行时现在报告 `sandboxApplied: false` | 未开始 |
+| 41 | 一台机器同时跑多个项目（每个项目一个调度器）：`bin/symphony` 按 `SYMPHONY_STATE_DIR` 区分实例 | `bin/symphony` 用 pgrep 找所有 `src/cli.ts` 进程，第二个直接拒绝，换 `SYMPHONY_STATE_DIR` 也没用；游戏和 symphony 自己的看板没法同时跑 | 暂不考虑 |
+
+### 自举：用 symphony 开发 symphony（待办 25 的前提）
+
+| # | 待办 | 起因 | 状态 |
+|---|---|---|---|
+| 42 | 调度器从固定版本的副本运行（如 `git worktree add ~/symphony-stable <tag>`），`WORKFLOW.md` 也用这份副本里的路径；写清升级步骤 | 跑调度器的代码和 agent 改的是同一个仓库：合并一个坏 PR，修它的工具先坏了；`WORKFLOW.md` 按传入路径热加载，在开发副本里 `git pull` 就立刻改掉 agent 的权限和提示词 | 未开始 |
+| 43 | 改到 agent 自身权限的 PR 必须由人把关：`REVIEW.md` 把改 `src/policy.ts`、`DEFAULT_SHELL_ALLOW/DENY`、`WORKFLOW.md`、`bin/symphony` 列为必须人看，加 CODEOWNERS | agent 能通过 PR 放宽自己的限制，合并并升级后就生效 | 未开始 |
+| 44 | 允许列表只放 `npm test`、`npm run typecheck`；改到 runner、tracker 真实行为的卡，PR 说明标明“需要人工跑端到端” | 端到端要 token、网络和 Copilot，agent 跑不了；待办 4 的优先级随之提高 | 未开始 |
+| 45 | 公开仓库的派发防线：只派发可信作者的 Issue（如作者要有写权限，或配置允许的作者），文档写明 Issue、agent 评论、用量评论和截图分支都是公开的 | 外人提的 Issue 正文可能含提示词注入，现在只靠人不给它打 `agent` 标签 | 未开始 |
+| 46 | 给 symphony-copilot 写 `AGENTS.md`：Node 直接跑 TS 的限制（相对导入带 `.ts`、`import type`、不用 enum 和参数属性）、测试写法（`t.mock.timers`）、README 中英文同步、todo 记录规则、提交信息格式 | 仓库里没有 AGENTS.md，这些约定没写下来 | 未开始 |
+
+两个项目同时跑的问题见待办 41。
 
 ### 推广（P0 做完再开始）
 
