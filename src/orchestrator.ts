@@ -50,7 +50,7 @@ interface RunningEntry {
   summary: SessionSummary | null;
   /** Set when the orchestrator stops the worker because the run hit a limit. */
   halt: string | null;
-  termination: { cleanup: boolean; reason: string } | null;
+  termination: { cleanup: boolean; reason: string; state?: string } | null;
   stalled: boolean;
   done: Promise<void>;
 }
@@ -512,6 +512,7 @@ export class Orchestrator {
 
   private sessionHeadline(entry: RunningEntry, error: Error | null): string {
     if (entry.halt) return "stopped: run limit reached";
+    if (entry.termination?.state) return `card now "${entry.termination.state}"`;
     if (entry.termination) return `stopped: ${entry.termination.reason}`;
     if (error || entry.stalled) return `failed: ${entry.stalled ? "stalled" : truncate(error!.message, 200)}`;
     const state = entry.summary?.finalState ?? entry.issue.state;
@@ -633,9 +634,9 @@ export class Orchestrator {
       seen.add(issue.id);
       const entry = this.running.get(issue.id);
       if (!entry) continue;
-      if (isTerminalState(config, issue.state)) this.terminate(entry, true, `issue moved to ${issue.state}`);
+      if (isTerminalState(config, issue.state)) this.terminate(entry, true, `issue moved to ${issue.state}`, issue.state);
       else if (isActiveState(config, issue.state) && isRoutable(config, issue)) entry.issue = issue;
-      else this.terminate(entry, false, `issue is ${issue.state}${isRoutable(config, issue) ? "" : " and not routable"}`);
+      else this.terminate(entry, false, `issue is ${issue.state}${isRoutable(config, issue) ? "" : " and not routable"}`, issue.state);
     }
     for (const id of ids) {
       const entry = this.running.get(id);
@@ -643,9 +644,9 @@ export class Orchestrator {
     }
   }
 
-  private terminate(entry: RunningEntry, cleanup: boolean, reason: string): void {
+  private terminate(entry: RunningEntry, cleanup: boolean, reason: string, state?: string): void {
     if (entry.termination) return;
-    entry.termination = { cleanup, reason };
+    entry.termination = { cleanup, reason, state };
     this.log.info("stopping worker", { issue_id: entry.issue.id, issue_identifier: entry.issue.identifier, reason, cleanup });
     entry.abort.abort(reason);
   }

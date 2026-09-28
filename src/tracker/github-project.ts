@@ -1,7 +1,10 @@
+import { readFileSync, statSync } from "node:fs";
+import { basename, extname, isAbsolute, resolve } from "node:path";
 import { defineTool, type Tool, type ToolResultObject } from "@github/copilot-sdk";
 import { resolveEnvRef } from "../config.ts";
 import { ExecError, run } from "../exec.ts";
 import { truncate, type Logger } from "../log.ts";
+import { isInside } from "../policy.ts";
 import { normalizeState, type BlockerRef, type Issue } from "../types.ts";
 import { TrackerError, type AgentToolContext, type TrackerAdapter } from "./types.ts";
 
@@ -21,9 +24,41 @@ export interface GitHubProjectSettings {
   agentStates: string[];
   handoffState: string | null;
   blockedState: string | null;
+  /** Branch that holds screenshots attached to submissions; never merged. */
+  evidenceBranch: string;
 }
 
 const NO_STATUS = "No Status";
+export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const IMAGE_TYPES = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+
+export interface Attachment {
+  name: string;
+  data: Buffer;
+}
+
+/** Checks agent-supplied image paths: inside the workspace, an image type, and within the size limit. */
+export function readAttachments(workspacePath: string, paths: unknown): { files: Attachment[] } | { failure: string } {
+  if (paths === undefined || paths === null) return { files: [] };
+  if (!Array.isArray(paths) || !paths.every((p) => typeof p === "string" && p.trim() !== "")) return { failure: "attachments must be a list of file paths" };
+  const files: Attachment[] = [];
+  for (const raw of paths as string[]) {
+    const path = isAbsolute(raw) ? raw : resolve(workspacePath, raw);
+    if (!isInside(path, [workspacePath], workspacePath)) return { failure: `${raw} is outside the workspace` };
+    if (!IMAGE_TYPES.has(extname(path).toLowerCase())) return { failure: `${raw} is not a PNG, JPEG, GIF or WebP image` };
+    let size: number;
+    try {
+      const stat = statSync(path);
+      if (!stat.isFile()) return { failure: `${raw} is not a file` };
+      size = stat.size;
+    } catch {
+      return { failure: `${raw} does not exist` };
+    }
+    if (size > MAX_ATTACHMENT_BYTES) return { failure: `${raw} is larger than ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB; attach a smaller image` };
+    files.push({ name: basename(path), data: readFileSync(path) });
+  }
+  return { files };
+}
 
 export function parseSettings(provider: Record<string, unknown>, env: NodeJS.ProcessEnv): GitHubProjectSettings {
   const str = (key: string, fallback?: string): string => {
@@ -67,6 +102,7 @@ export function parseSettings(provider: Record<string, unknown>, env: NodeJS.Pro
     agentStates: agentStates as string[],
     handoffState: typeof handoff === "string" && handoff.trim() !== "" ? handoff.trim() : null,
     blockedState: typeof blocked === "string" && blocked.trim() !== "" ? blocked.trim() : null,
+    evidenceBranch: str("evidence_branch", "symphony-evidence"),
   };
 }
 
@@ -310,18 +346,23 @@ export class GitHubProjectTracker implements TrackerAdapter {
         }),
       }),
       defineTool("tracker_submit_for_review", {
-        description: `Hand the work to a human: requires all changes committed in the workspace. Pushes HEAD to branch ${context.issue.branchName}, opens (or updates) the pull request that closes this issue${this.settings.handoffState ? `, and moves the card to "${this.settings.handoffState}"` : ""}. Do not push yourself.`,
+        description: `Hand the work to a human: requires all changes committed in the workspace. Pushes HEAD to branch ${context.issue.branchName}, opens (or updates) the pull request that closes this issue, posts the summary on the issue${this.settings.handoffState ? `, and moves the card to "${this.settings.handoffState}"` : ""}. Do not push yourself.`,
         parameters: {
           type: "object",
           properties: {
             title: { type: "string", description: "Pull request title" },
             summary: { type: "string", description: "Markdown: what changed, how it was verified (commands and results), and what still needs human or device verification" },
+            attachments: {
+              type: "array",
+              items: { type: "string" },
+              description: `Optional: images in the workspace (PNG, JPEG, GIF or WebP, at most ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each) that show a visible change, such as a before/after comparison. They are shown on the issue and the pull request. Pick one image per scenario that matters; do not attach many near-identical images (for example the same screen at every size). Leave this out when the change has no visible effect.`,
+            },
           },
           required: ["title", "summary"],
           additionalProperties: false,
         },
         skipPermission: true,
-        handler: wrap("tracker_submit_for_review", (args: { title: string; summary: string }) => this.submitForReview(context, args)),
+        handler: wrap("tracker_submit_for_review", (args: { title: string; summary: string; attachments?: string[] }) => this.submitForReview(context, args)),
       }),
     ];
     if (this.settings.agentStates.length > 0) {
@@ -407,12 +448,14 @@ export class GitHubProjectTracker implements TrackerAdapter {
     );
   }
 
-  private async submitForReview(context: AgentToolContext, args: { title: string; summary: string }): Promise<unknown> {
+  private async submitForReview(context: AgentToolContext, args: { title: string; summary: string; attachments?: string[] }): Promise<unknown> {
     const { issue, workspacePath } = context;
     if (typeof args.title !== "string" || args.title.trim() === "") return { failure: "title must be a non-empty string" };
     if (typeof args.summary !== "string" || args.summary.trim() === "") return { failure: "summary must be a non-empty string" };
     const branch = issue.branchName;
     if (!branch) return { failure: "issue has no branch name" };
+    const attachments = readAttachments(workspacePath, args.attachments);
+    if ("failure" in attachments) return attachments;
     const git = (gitArgs: string[]) => run("git", gitArgs, { cwd: workspacePath, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).then((r) => r.stdout.trim());
 
     const dirty = await git(["status", "--porcelain"]);
@@ -429,27 +472,78 @@ export class GitHubProjectTracker implements TrackerAdapter {
     }
 
     const number = issue.nativeRef?.issue_number;
+    let images = "";
+    let imageNote = "";
+    if (attachments.files.length > 0) {
+      try {
+        const uploaded = await this.uploadEvidence(issue, attachments.files);
+        images = uploaded.map((u) => `![${u.name}](${u.url})`).join("\n");
+      } catch (error) {
+        imageNote = `_Screenshots could not be attached: ${truncate((error as Error).message, 300)}_`;
+        context.log.warn("attachment upload failed", { error: (error as Error).message });
+      }
+    }
+    const body = [args.summary, images, imageNote].filter(Boolean).join("\n\n");
     const found: any = await this.graphql(
       `query($owner: String!, $name: String!, $branch: String!) { repository(owner: $owner, name: $name) {
-        pullRequests(headRefName: $branch, states: [OPEN], first: 1) { nodes { id url } } } }`,
+        pullRequests(headRefName: $branch, states: [OPEN], first: 1) { nodes { id number url } } } }`,
       { owner: this.settings.repoOwner, name: this.settings.repoName, branch },
     );
     let prUrl: string | null;
+    let prNumber: number | null;
     const existing = found?.repository?.pullRequests?.nodes?.[0];
     if (existing) {
-      await this.addComment(existing.id, `**Updated for review**\n\n${args.summary}`);
+      await this.addComment(existing.id, `**Updated for review**\n\n${body}`);
       prUrl = existing.url;
+      prNumber = existing.number ?? null;
     } else {
       const created: any = await this.graphql(
         `mutation($repo: ID!, $base: String!, $head: String!, $title: String!, $body: String!) {
-          createPullRequest(input: { repositoryId: $repo, baseRefName: $base, headRefName: $head, title: $title, body: $body }) { pullRequest { url } } }`,
-        { repo: repo.id, base: repo.defaultBranch, head: branch, title: args.title, body: `${args.summary}\n\nCloses #${number}` },
+          createPullRequest(input: { repositoryId: $repo, baseRefName: $base, headRefName: $head, title: $title, body: $body }) { pullRequest { number url } } }`,
+        { repo: repo.id, base: repo.defaultBranch, head: branch, title: args.title, body: `${body}\n\nCloses #${number}` },
       );
       prUrl = created?.createPullRequest?.pullRequest?.url ?? null;
+      prNumber = created?.createPullRequest?.pullRequest?.number ?? null;
     }
+    const link = prUrl ? `[PR #${prNumber ?? "?"}](${prUrl})` : "the pull request";
+    await this.addComment(this.issueNodeId(issue), `**Submitted for review** (${existing ? "updated" : "new"} ${link})\n\n${body}`);
     if (this.settings.handoffState) await this.setStatus(issue, this.settings.handoffState);
-    context.log.info("submitted for review", { pull_request: prUrl, branch, commits: ahead });
-    return { pull_request: prUrl, branch, commits_ahead_of_base: ahead, status: this.settings.handoffState ?? issue.state };
+    context.log.info("submitted for review", { pull_request: prUrl, branch, commits: ahead, attachments: attachments.files.length });
+    return { pull_request: prUrl, branch, commits_ahead_of_base: ahead, attachments: attachments.files.length, status: this.settings.handoffState ?? issue.state };
+  }
+
+  /** Commits images to the evidence branch and returns links that render for people with repository access. */
+  async uploadEvidence(issue: Issue, files: Attachment[]): Promise<Array<{ name: string; url: string }>> {
+    const repoPath = `/repos/${this.settings.repoOwner}/${this.settings.repoName}`;
+    const ref = `heads/${this.settings.evidenceBranch}`;
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+    const paths = files.map((f, i) => `${issue.identifier}/${stamp}-${i + 1}-${f.name}`);
+    const blobs: string[] = [];
+    for (const file of files) {
+      const blob: any = await this.rest("POST", `${repoPath}/git/blobs`, { content: file.data.toString("base64"), encoding: "base64" });
+      blobs.push(blob.sha);
+    }
+    for (let attempt = 0; ; attempt++) {
+      const head: any = await this.rest("GET", `${repoPath}/git/ref/${ref}`, undefined, true);
+      const parent: string | null = head?.object?.sha ?? null;
+      const baseTree: string | undefined = parent ? (await this.rest("GET", `${repoPath}/git/commits/${parent}`) as any).tree.sha : undefined;
+      const tree: any = await this.rest("POST", `${repoPath}/git/trees`, {
+        ...(baseTree ? { base_tree: baseTree } : {}),
+        tree: paths.map((path, i) => ({ path, mode: "100644", type: "blob", sha: blobs[i] })),
+      });
+      const commit: any = await this.rest("POST", `${repoPath}/git/commits`, {
+        message: `evidence: ${issue.identifier}`, tree: tree.sha, parents: parent ? [parent] : [],
+      });
+      try {
+        if (parent) await this.rest("PATCH", `${repoPath}/git/refs/${ref}`, { sha: commit.sha, force: false });
+        else await this.rest("POST", `${repoPath}/git/refs`, { ref: `refs/${ref}`, sha: commit.sha });
+      } catch (error) {
+        if (attempt < 2) continue;
+        throw error;
+      }
+      const web = `https://github.com/${this.settings.repoOwner}/${this.settings.repoName}`;
+      return paths.map((path, i) => ({ name: files[i]!.name, url: `${web}/blob/${commit.sha}/${path.split("/").map(encodeURIComponent).join("/")}?raw=true` }));
+    }
   }
 
   // ---- plumbing ----
@@ -491,6 +585,32 @@ export class GitHubProjectTracker implements TrackerAdapter {
       throw error;
     });
     return this.repoMeta;
+  }
+
+  /** GitHub REST call with the tracker token; `allowMissing` turns a 404 into null. */
+  private async rest(method: string, path: string, body?: unknown, allowMissing = false): Promise<unknown> {
+    const base = this.settings.endpoint.replace(/\/api\/graphql$/, "/api/v3").replace(/\/graphql$/, "");
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${base}${path}`, {
+        method,
+        headers: { authorization: `bearer ${this.settings.token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "symphony-copilot" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(60_000),
+      });
+    } catch (error) {
+      throw new TrackerError("tracker_request", (error as Error).message);
+    }
+    if (allowMissing && response.status === 404) return null;
+    if (response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) {
+      throw new TrackerError("tracker_rate_limited", `HTTP ${response.status}`);
+    }
+    if (!response.ok) throw new TrackerError("tracker_status", `HTTP ${response.status} for ${method} ${path}`);
+    try {
+      return await response.json();
+    } catch (error) {
+      throw new TrackerError("tracker_response", `invalid JSON: ${(error as Error).message}`);
+    }
   }
 
   private async graphql(query: string, variables: Record<string, unknown>): Promise<unknown> {

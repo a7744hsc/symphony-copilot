@@ -411,6 +411,19 @@ test("every session posts a usage summary on the issue and in the log", async (t
   assert.ok(s.lines.some((l) => l.includes("session summary") && l.includes("models=claude-opus-5.5:21")));
 });
 
+test("a worker stopped because its card was handed off reports the new state, not a stop", async (t) => {
+  const s = setup(t);
+  s.tracker.add(issue("A"));
+  await s.tick();
+  const call = s.calls[0]!;
+  call.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: "sess" });
+  call.params.onUpdate({ event: "session_usage", timestamp: new Date(), summary: { ...summary, finalState: "Todo" } });
+  s.tracker.set("A", { state: "Human Review" });
+  await s.tick();
+  assert.equal(call.aborted, true);
+  assert.match(s.tracker.comments[0] ?? "", /session 1 of 5 · card now "Human Review"/);
+});
+
 test("usage comments can be turned off; a budget halt folds the usage into its notice", async (t) => {
   const quiet = setup(t, { agent: { usage_comments: false } });
   quiet.tracker.add(issue("A"));

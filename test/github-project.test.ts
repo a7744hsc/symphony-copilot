@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { GitHubProjectTracker, normalizeItem, parseSettings, type RawItem } from "../src/tracker/github-project.ts";
+import { GitHubProjectTracker, MAX_ATTACHMENT_BYTES, normalizeItem, parseSettings, readAttachments, type RawItem } from "../src/tracker/github-project.ts";
 import { TrackerError } from "../src/tracker/index.ts";
 import { quietLog } from "./helpers.ts";
 
@@ -151,4 +154,71 @@ test("agent tools are scoped to one issue and status changes are limited", () =>
   const ctx = { issue: (normalizeItem(item(), settings) as { issue: any }).issue, workspacePath: "/tmp", log: quietLog };
   assert.deepEqual(withStates.agentTools(ctx).map((t) => t.name).sort(), ["tracker_comment", "tracker_get_issue", "tracker_set_status", "tracker_submit_for_review"]);
   assert.ok(!without.agentTools(ctx).some((t) => t.name === "tracker_set_status"));
+});
+
+test("attachments must be images inside the workspace and under the size limit", () => {
+  const ws = mkdtempSync(join(tmpdir(), "attach-ws-"));
+  const outside = mkdtempSync(join(tmpdir(), "attach-out-"));
+  writeFileSync(join(ws, "a.png"), "png");
+  writeFileSync(join(ws, "notes.txt"), "text");
+  writeFileSync(join(ws, "big.png"), Buffer.alloc(MAX_ATTACHMENT_BYTES + 1));
+  writeFileSync(join(outside, "secret.png"), "png");
+  symlinkSync(join(outside, "secret.png"), join(ws, "link.png"));
+
+  assert.deepEqual(readAttachments(ws, undefined), { files: [] });
+  const ok = readAttachments(ws, ["a.png", join(ws, "a.png")]);
+  assert.ok("files" in ok && ok.files.length === 2 && ok.files[0]!.name === "a.png" && ok.files[0]!.data.toString() === "png");
+  const failure = (paths: unknown) => { const r = readAttachments(ws, paths); return "failure" in r ? r.failure : null; };
+  assert.match(failure([join(outside, "secret.png")]) ?? "", /outside the workspace/);
+  assert.match(failure(["link.png"]) ?? "", /outside the workspace/);
+  assert.match(failure(["notes.txt"]) ?? "", /not a PNG/);
+  assert.match(failure(["missing.png"]) ?? "", /does not exist/);
+  assert.match(failure(["big.png"]) ?? "", /larger than 5 MB/);
+  assert.match(failure("a.png") ?? "", /list of file paths/);
+});
+
+function restFetch(handler: (method: string, path: string, body: any) => unknown) {
+  const calls: Array<{ method: string; path: string; body: any }> = [];
+  const impl = async (url: string, init: RequestInit) => {
+    const method = init.method ?? "GET";
+    const path = new URL(url).pathname;
+    const body = init.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ method, path, body });
+    const result = handler(method, path, body);
+    if (result instanceof Response) return result;
+    return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  return { impl, calls };
+}
+
+test("evidence goes to its own branch and links point at the exact commit", async () => {
+  const issue = (normalizeItem(item(), settings) as { issue: any }).issue;
+  const files = [{ name: "before after.png", data: Buffer.from("img") }];
+
+  const first = restFetch((method, path) => {
+    if (path.endsWith("/git/blobs")) return { sha: "b1" };
+    if (method === "GET" && path.endsWith("/git/ref/heads/symphony-evidence")) return new Response("", { status: 404 });
+    if (path.endsWith("/git/trees")) return { sha: "t1" };
+    if (path.endsWith("/git/commits")) return { sha: "c1" };
+    if (method === "POST" && path.endsWith("/git/refs")) return { ref: "refs/heads/symphony-evidence" };
+    throw new Error(`unexpected ${method} ${path}`);
+  });
+  const [link] = await new GitHubProjectTracker(provider, env, quietLog, first.impl).uploadEvidence(issue, files);
+  assert.equal(first.calls[0]!.body.content, Buffer.from("img").toString("base64"));
+  assert.equal(first.calls.find((c) => c.path.endsWith("/git/trees"))!.body.base_tree, undefined);
+  assert.deepEqual(first.calls.find((c) => c.path.endsWith("/git/commits"))!.body.parents, []);
+  assert.match(link!.url, /^https:\/\/github\.com\/me\/app\/blob\/c1\/GH-12\/\d{8}T\d{6}-1-before%20after\.png\?raw=true$/);
+
+  const next = restFetch((method, path) => {
+    if (path.endsWith("/git/blobs")) return { sha: "b2" };
+    if (method === "GET" && path.endsWith("/git/ref/heads/symphony-evidence")) return { object: { sha: "p1" } };
+    if (method === "GET" && path.endsWith("/git/commits/p1")) return { tree: { sha: "pt" } };
+    if (path.endsWith("/git/trees")) return { sha: "t2" };
+    if (path.endsWith("/git/commits")) return { sha: "c2" };
+    if (method === "PATCH" && path.endsWith("/git/refs/heads/symphony-evidence")) return { object: { sha: "c2" } };
+    throw new Error(`unexpected ${method} ${path}`);
+  });
+  await new GitHubProjectTracker(provider, env, quietLog, next.impl).uploadEvidence(issue, files);
+  assert.equal(next.calls.find((c) => c.path.endsWith("/git/trees"))!.body.base_tree, "pt");
+  assert.deepEqual(next.calls.find((c) => c.method === "PATCH")!.body, { sha: "c2", force: false });
 });

@@ -23,7 +23,10 @@ workspace:
   root: ~/symphony-workspaces/your-repo
 hooks:
   after_create: |
-    git clone --quiet https://github.com/your-login/your-repo.git .
+    # Only main and agent branches, so screenshots on the evidence branch are never downloaded.
+    git clone --quiet --single-branch --branch main https://github.com/your-login/your-repo.git .
+    git config --add remote.origin.fetch '+refs/heads/agent/*:refs/remotes/origin/agent/*'
+    git fetch --quiet origin
     git switch --quiet "$SYMPHONY_ISSUE_BRANCH" 2>/dev/null || git switch --quiet -c "$SYMPHONY_ISSUE_BRANCH"
     npm ci
   before_run: |
@@ -50,7 +53,7 @@ How to work:
 2. Read AGENTS.md or README.md first, then implement the issue's acceptance criteria. Change only files in this workspace.
 3. Run `npm test` and fix any failures.
 4. Commit in small steps with clear messages.
-5. When the checks pass, call tracker_submit_for_review. In the summary, say what changed, how you verified it (commands and results), and what still needs a human to check.
+5. When the checks pass, call tracker_submit_for_review. In the summary, say what changed, how you verified it (commands and results), and what still needs a human to check. If the change is visible, attach screenshots that show it (for example a before/after comparison): one per scenario that matters, not many similar ones. Attach nothing for changes with no visible effect.
 6. If you are blocked (unclear requirements, missing access), use tracker_comment to explain what is done and what is missing, move the card to "Blocked", and stop.
 
 Rules:
