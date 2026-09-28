@@ -15,6 +15,9 @@ class FakeTracker implements TrackerAdapter {
   readonly comments: string[] = [];
   blockedState: string | null = "Blocked";
   refreshFails = false;
+  /** Issue id -> number of its open pull request that conflicts with main. */
+  readonly conflicts = new Map<string, number>();
+  readonly conflictChecks: string[][] = [];
   /** When set, the next id fetch returns the states as they were when it was called, after this resolves. */
   gate: Promise<void> | null = null;
   add(...issues: Issue[]) {
@@ -47,6 +50,16 @@ class FakeTracker implements TrackerAdapter {
   async blockIssue(issue: Issue) {
     if (this.blockedState) this.set(issue.id, { state: this.blockedState });
     return this.blockedState;
+  }
+  async findMergeConflicts(issues: Issue[]) {
+    this.conflictChecks.push(issues.map((i) => i.id));
+    return issues.flatMap((issue) => {
+      const number = this.conflicts.get(issue.id);
+      return number === undefined ? [] : [{ issue, pullRequest: { number, url: `https://example.test/pull/${number}`, baseBranch: "main" } }];
+    });
+  }
+  async moveIssue(issue: Issue, state: string) {
+    this.set(issue.id, { state });
   }
 }
 
@@ -108,6 +121,7 @@ test("dispatch order is priority, then oldest, then identifier", () => {
     issue("F", { priority: 1, createdAt: new Date("2026-04-01") }),
   ]);
   assert.deepEqual(sorted.map((i) => i.id), ["D", "F", "C", "B", "E", "A"]);
+  assert.deepEqual(sortForDispatch(sorted, (i) => i.id === "A").map((i) => i.id), ["A", "D", "F", "C", "B", "E"], "urgent issues jump the queue");
 });
 
 test("retry backoff doubles from 10 s and respects the cap", () => {
@@ -561,4 +575,65 @@ test("a missing review prompt blocks dispatch", async (t) => {
   await s.tick();
   assert.equal(s.calls.length, 0);
   assert.ok(s.lines.some((l) => l.includes("preflight failed") && l.includes("review.prompt_file")));
+});
+
+const conflictConfig = {
+  agent: { max_concurrent_agents: 1 },
+  tracker: { active_states: ["Todo", "In Progress", "Rework"], required_labels: ["agent"] },
+  merge_conflicts: { states: ["Human Review"], return_state: "Rework" },
+};
+
+test("a waiting card whose pull request conflicts goes back to rework ahead of all other work", async (t) => {
+  const ledger = new RunLedger();
+  const s = setup(t, conflictConfig, false, ledger);
+  s.tracker.add(
+    issue("A", { priority: 1, createdAt: new Date("2025-01-01") }),
+    issue("B", { priority: 4, state: "Human Review" }),
+    issue("C", { state: "Human Review" }),
+    issue("D", { state: "Human Review", labels: [] }),
+  );
+  s.tracker.conflicts.set("B", 22).set("D", 23);
+  await s.tick();
+  assert.deepEqual(s.tracker.conflictChecks, [["B", "C"]], "only routable waiting cards are checked");
+  assert.deepEqual(s.ids(), ["B"], "the returned card runs before a P1 card");
+  assert.equal(s.tracker.issues.get("B")!.state, "Rework");
+  assert.equal(s.tracker.issues.get("D")!.state, "Human Review", "without the agent label a person handles it");
+  assert.equal(ledger.get("B")?.returnedFor, "merge conflict in PR #22");
+  assert.match(s.tracker.comments.join("\n"), /B: \*\*symphony-copilot: \[PR #22\]\(https:\/\/example\.test\/pull\/22\) has merge conflicts with `main`\.\*\* The card was moved from "Human Review" to "Rework"/);
+
+  s.tracker.conflicts.delete("B");
+  s.tracker.set("B", { state: "Human Review" });
+  s.calls[0]!.resolve();
+  await flush();
+  await s.advance(1_000);
+  await s.tick();
+  assert.equal(ledger.get("B"), undefined, "handing off again ends the urgent run");
+  assert.deepEqual(s.ids(), ["B", "A"]);
+});
+
+test("a dry run only reports a merge conflict", async (t) => {
+  const s = setup(t, conflictConfig, true);
+  s.tracker.add(issue("B", { state: "Human Review" }));
+  s.tracker.conflicts.set("B", 22);
+  await s.tick();
+  assert.equal(s.tracker.issues.get("B")!.state, "Human Review");
+  assert.equal(s.tracker.comments.length, 0);
+  assert.ok(s.lines.some((l) => l.includes("dry run: would return for merge conflict")));
+});
+
+test("without merge_conflicts, waiting cards are not checked", async (t) => {
+  const s = setup(t, { tracker: { active_states: ["Todo", "Rework"] } });
+  s.tracker.add(issue("B", { state: "Human Review" }));
+  s.tracker.conflicts.set("B", 22);
+  await s.tick();
+  assert.deepEqual(s.tracker.conflictChecks, []);
+  assert.equal(s.calls.length, 0);
+});
+
+test("why a card was returned survives a restart", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.json");
+  const ledger = new RunLedger(path);
+  ledger.open("B", "GH-B", new Date()).returnedFor = "merge conflict in PR #22";
+  ledger.save();
+  assert.equal(new RunLedger(path).get("B")?.returnedFor, "merge conflict in PR #22");
 });

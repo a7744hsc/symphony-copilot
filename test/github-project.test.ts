@@ -3,7 +3,8 @@ import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { GitHubProjectTracker, MAX_ATTACHMENT_BYTES, normalizeItem, parseSettings, readAttachments, type RawItem } from "../src/tracker/github-project.ts";
+import { run } from "../src/exec.ts";
+import { GitHubProjectTracker, MAX_ATTACHMENT_BYTES, conflictingFiles, normalizeItem, parseSettings, readAttachments, type RawItem } from "../src/tracker/github-project.ts";
 import { TrackerError } from "../src/tracker/index.ts";
 import { quietLog } from "./helpers.ts";
 
@@ -352,4 +353,38 @@ test("the follow-up tool is offered to both roles only when configured", () => {
   const { tools } = followupTool(async () => new Response(), {}, true);
   assert.deepEqual(tools.map((t) => t.name).sort(), ["tracker_comment", "tracker_create_followup", "tracker_get_issue", "tracker_submit_review"]);
   assert.throws(() => parseSettings({ ...provider, followups: { labels: "tech-debt" } }, env), (e: TrackerError) => e.category === "invalid_tracker_config");
+});
+
+test("merge conflicts come from one aliased query; undecided and clean pull requests are left out", async () => {
+  const pr = (number: number, mergeable: string) => ({ nodes: [{ number, url: `https://github.com/me/app/pull/${number}`, mergeable, baseRefName: "main" }] });
+  const { impl, calls } = fakeFetch([{ data: { repository: { pr0: pr(22, "CONFLICTING"), pr1: pr(25, "UNKNOWN"), pr2: pr(26, "MERGEABLE"), pr3: { nodes: [] } } } }]);
+  const tracker = new GitHubProjectTracker(provider, env, quietLog, impl);
+  const issues = [12, 18, 19, 20].map((number) => (normalizeItem(item({ id: `PVTI_${number}` }, { number }), settings) as { issue: any }).issue);
+  const conflicts = await tracker.findMergeConflicts(issues);
+  assert.deepEqual(conflicts.map((c) => [c.issue.identifier, c.pullRequest]), [["GH-12", { number: 22, url: "https://github.com/me/app/pull/22", baseBranch: "main" }]]);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!.query, /pr3: pullRequests\(headRefName: \$b3, states: \[OPEN\]/);
+  assert.deepEqual([calls[0]!.variables.b0, calls[0]!.variables.b3], ["agent/12", "agent/20"]);
+});
+
+test("the pre-submission check names the files that would conflict with the base branch", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "conflict-"));
+  const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.test", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.test" };
+  const git = (...args: string[]) => run("git", args, { cwd: dir, env: gitEnv });
+  const commit = async (file: string, text: string) => {
+    writeFileSync(join(dir, file), text);
+    await git("add", file);
+    await git("commit", "-q", "-m", file);
+  };
+  await git("init", "-q", "-b", "main");
+  await commit("VERIFICATION.md", "base\n");
+  await git("switch", "-q", "-c", "agent/13");
+  await commit("VERIFICATION.md", "base\nicon record\n");
+  await git("switch", "-q", "main");
+  await commit("VERIFICATION.md", "base\nci record\n");
+  await git("switch", "-q", "agent/13");
+  assert.deepEqual(await conflictingFiles(dir, "main", gitEnv), ["VERIFICATION.md"]);
+  await git("merge", "-q", "-X", "ours", "-m", "merge main", "main");
+  assert.deepEqual(await conflictingFiles(dir, "main", gitEnv), [], "resolved after merging main");
+  assert.deepEqual(await conflictingFiles(dir, "no-such-branch", gitEnv), [], "git errors do not block submission");
 });

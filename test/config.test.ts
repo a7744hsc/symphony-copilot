@@ -94,3 +94,25 @@ test("review config needs its states among the active states, a prompt file and 
     (e: ConfigError) => e.problems.some((p) => p.includes("must also be in tracker.active_states")) && e.problems.includes("review.fail_state is required"),
   );
 });
+
+test("merge_conflicts watches waiting states and returns cards to an implementation state", () => {
+  const base = {
+    tracker: { kind: "github_project", active_states: ["Todo", "AI Review", "Rework"], terminal_states: ["Done"] },
+    review: { states: ["AI Review"], prompt_file: "REVIEW.md", pass_state: "Human Review", fail_state: "Rework" },
+  };
+  const c = buildConfig({ ...base, merge_conflicts: { states: ["Human Review"], return_state: "Rework" } }, "/repo/WORKFLOW.md", {});
+  assert.deepEqual(c.mergeConflicts, { states: ["Human Review"], returnState: "Rework" });
+  assert.equal(buildConfig(minimal, "/repo/WORKFLOW.md", {}).mergeConflicts, null);
+  const problems = (mc: unknown) => {
+    try {
+      buildConfig({ ...base, merge_conflicts: mc }, "/repo/WORKFLOW.md", {});
+      return [];
+    } catch (error) {
+      return (error as ConfigError).problems;
+    }
+  };
+  assert.ok(problems({ states: ["Rework"], return_state: "Rework" }).some((p) => p.includes('"Rework" must be a waiting state')));
+  assert.ok(problems({ states: ["Human Review"], return_state: "AI Review" }).some((p) => p.includes("must be an active state worked by the implementer")));
+  assert.ok(problems({ states: ["Human Review"], return_state: "Parked" }).some((p) => p.includes("must be an active state")));
+  assert.deepEqual(problems({}), ["merge_conflicts.states is required", "merge_conflicts.return_state is required"]);
+});

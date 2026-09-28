@@ -57,6 +57,15 @@ export interface ServiceConfig {
   agent: AgentConfig;
   copilot: CopilotConfig;
   review: ReviewConfig | null;
+  mergeConflicts: MergeConflictConfig | null;
+}
+
+/** Cards waiting for people whose pull request stops merging go back to the implementer, ahead of other work. */
+export interface MergeConflictConfig {
+  /** Waiting (not active) states whose open pull requests are checked on every poll. */
+  states: string[];
+  /** Implementation state the card is moved to. */
+  returnState: string;
 }
 
 /** An independent reviewer agent that works the review states in its own session and workspace. */
@@ -171,6 +180,7 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
   const agent = section(raw, "agent", problems);
   const copilot = section(raw, "copilot", problems);
   const review = raw.review === undefined || raw.review === null ? null : section(raw, "review", problems);
+  const conflicts = raw.merge_conflicts === undefined || raw.merge_conflicts === null ? null : section(raw, "merge_conflicts", problems);
 
   const kind = text(tracker.kind, "tracker.kind", problems);
   if (!kind) problems.push("tracker.kind is required");
@@ -195,6 +205,7 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
     : join(tmpdir(), "symphony_workspaces");
 
   const cliPathValue = text(copilot.cli_path, "copilot.cli_path", problems);
+  const reviewConfig = review ? buildReview(review, activeStates, workflowDir, env, problems) : null;
 
   const config: ServiceConfig = {
     workflowPath: resolve(workflowPath),
@@ -239,7 +250,8 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
       urlAllow: stringList(copilot.url_allow, [], "copilot.url_allow", problems),
       userInputReply: text(copilot.user_input_reply, "copilot.user_input_reply", problems) ?? DEFAULT_USER_INPUT_REPLY,
     },
-    review: review ? buildReview(review, activeStates, workflowDir, env, problems) : null,
+    review: reviewConfig,
+    mergeConflicts: conflicts ? buildMergeConflicts(conflicts, activeStates, terminalStates, reviewConfig, problems) : null,
   };
   if (problems.length > 0) throw new ConfigError(problems);
   return config;
@@ -268,6 +280,21 @@ function buildReview(raw: Record<string, unknown>, activeStates: string[], workf
     maxRounds: integer(raw.max_rounds, 3, "review.max_rounds", problems, 1),
     continuationPrompt: text(raw.continuation_prompt, "review.continuation_prompt", problems) ?? DEFAULT_REVIEW_CONTINUATION,
   };
+}
+
+function buildMergeConflicts(raw: Record<string, unknown>, activeStates: string[], terminalStates: string[], review: ReviewConfig | null, problems: string[]): MergeConflictConfig {
+  const has = (list: string[], state: string) => list.some((s) => normalizeState(s) === normalizeState(state));
+  const states = stringList(raw.states, [], "merge_conflicts.states", problems);
+  if (states.length === 0) problems.push("merge_conflicts.states is required");
+  for (const state of states) {
+    if (has(activeStates, state) || has(terminalStates, state)) problems.push(`merge_conflicts state "${state}" must be a waiting state, not in tracker.active_states or tracker.terminal_states`);
+  }
+  const returnState = text(raw.return_state, "merge_conflicts.return_state", problems);
+  if (!returnState) problems.push("merge_conflicts.return_state is required");
+  else if (!has(activeStates, returnState) || has(terminalStates, returnState) || has(review?.states ?? [], returnState)) {
+    problems.push(`merge_conflicts.return_state "${returnState}" must be an active state worked by the implementer`);
+  }
+  return { states, returnState: returnState ?? "" };
 }
 
 const DEFAULT_REVIEW_CONTINUATION =

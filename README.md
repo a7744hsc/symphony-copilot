@@ -175,6 +175,18 @@ The reviewer:
 
 When a card moves between implementation and review, the running session ends and the other role starts in a new one. The whole implement-and-review loop counts as one run, so the [run limits](#run-limits) cap it too. GitHub does not let a PR's author approve or request changes on it, so the verdict is the card's state plus a comment review.
 
+## Merge conflicts
+
+A pull request that waits for you can stop merging when another one lands first. Add:
+
+```yaml
+merge_conflicts:
+  states: [Human Review]      # waiting columns (not active); their open pull requests are checked on every poll
+  return_state: Rework        # an active column worked by the implementer
+```
+
+When GitHub reports the pull request of a routable card in `states` as conflicting, the orchestrator moves the card to `return_state`, comments why, and dispatches it before every other card (running agents are not interrupted). The agent merges the base branch, resolves the conflicts, reruns the checks and submits again, and the result goes through review like any other change. `tracker_submit_for_review` refuses a HEAD that would conflict with the base branch, so a card cannot bounce between columns without progress. To resolve a conflict yourself, remove the `agent` label while the card waits.
+
 ## Safety model
 
 symphony-copilot is meant for **one trusted user on their own machine**. It is not a sandbox.

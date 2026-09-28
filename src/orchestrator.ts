@@ -3,7 +3,7 @@ import { isActiveState, isRoutable, isTerminalState, roleFor, type Role, type Se
 import { RunLedger, type RunCycle } from "./ledger.ts";
 import { truncate, type Logger } from "./log.ts";
 import type { AgentUpdate, SessionSummary, TokenTotals } from "./runner.ts";
-import type { TrackerAdapter } from "./tracker/index.ts";
+import type { MergeConflict, TrackerAdapter } from "./tracker/index.ts";
 import { normalizeState, type Issue } from "./types.ts";
 import type { EffectiveWorkflow } from "./workflow.ts";
 
@@ -72,10 +72,12 @@ interface RetryEntry {
 
 const CONTINUATION_DELAY_MS = 1_000;
 
-export function sortForDispatch(issues: Issue[]): Issue[] {
+/** Urgent issues first, then priority, oldest, identifier. */
+export function sortForDispatch(issues: Issue[], urgent: (issue: Issue) => boolean = () => false): Issue[] {
   const bucket = (p: number | null) => (p !== null && p >= 1 && p <= 4 ? p : 5);
   return [...issues].sort((a, b) =>
-    bucket(a.priority) - bucket(b.priority)
+    Number(urgent(b)) - Number(urgent(a))
+    || bucket(a.priority) - bucket(b.priority)
     || (a.createdAt?.getTime() ?? Infinity) - (b.createdAt?.getTime() ?? Infinity)
     || a.identifier.localeCompare(b.identifier));
 }
@@ -217,15 +219,20 @@ export class Orchestrator {
         return;
       }
       let candidates: Issue[];
+      let waiting: Issue[];
       try {
-        candidates = await tracker.fetchIssuesByStates(config.tracker.activeStates);
+        const fetched = await tracker.fetchIssuesByStates([...config.tracker.activeStates, ...(config.mergeConflicts?.states ?? [])]);
+        candidates = fetched.filter((issue) => isActiveState(config, issue.state));
+        waiting = fetched.filter((issue) => !isActiveState(config, issue.state));
       } catch (error) {
         this.log.error("candidate fetch failed", { error: (error as Error).message });
         return;
       }
       let dispatched = 0;
       if (!this.deps.dryRun) this.closeFinishedRuns(candidates);
-      for (const issue of sortForDispatch(candidates)) {
+      candidates.push(...await this.returnConflicted(waiting, config, tracker));
+      const urgent = (issue: Issue) => Boolean(this.ledger.get(issue.id)?.returnedFor);
+      for (const issue of sortForDispatch(candidates, urgent)) {
         if (this.availableSlots(config) - (this.deps.dryRun ? dispatched : 0) <= 0) break;
         if (!this.shouldDispatch(issue, config)) continue;
         if (this.deps.dryRun) {
@@ -417,6 +424,50 @@ export class Orchestrator {
       });
     }
     if (changed) this.saveLedger();
+  }
+
+  /** Moves waiting cards whose pull request no longer merges back to the implementer; returns them in their new state. */
+  private async returnConflicted(waiting: Issue[], config: ServiceConfig, tracker: TrackerAdapter): Promise<Issue[]> {
+    const settings = config.mergeConflicts;
+    const eligible = waiting.filter((issue) => isRoutable(config, issue) && !this.claimed.has(issue.id));
+    if (!settings || eligible.length === 0 || !tracker.findMergeConflicts || !tracker.moveIssue) return [];
+    let conflicts: MergeConflict[];
+    try {
+      conflicts = await tracker.findMergeConflicts(eligible);
+    } catch (error) {
+      this.log.warn("merge conflict check failed", { error: (error as Error).message });
+      return [];
+    }
+    const returned: Issue[] = [];
+    for (const { issue, pullRequest: pr } of conflicts) {
+      const log = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
+      const fields = { pull_request: pr.url, from: issue.state, to: settings.returnState };
+      if (this.deps.dryRun) {
+        log.info("dry run: would return for merge conflict", fields);
+        continue;
+      }
+      try {
+        await tracker.moveIssue(issue, settings.returnState);
+      } catch (error) {
+        log.warn("could not return issue with merge conflict", { ...fields, error: (error as Error).message });
+        continue;
+      }
+      const cycle = this.ledger.open(issue.id, issue.identifier, new Date(this.now()));
+      cycle.returnedFor = `merge conflict in PR #${pr.number}`;
+      this.saveLedger();
+      log.info("returned for merge conflict", fields);
+      const label = config.tracker.requiredLabels[0];
+      const body = `**symphony-copilot: [PR #${pr.number}](${pr.url}) has merge conflicts with \`${pr.baseBranch}\`.** `
+        + `The card was moved from "${issue.state}" to "${settings.returnState}" ahead of other work. The agent will merge \`${pr.baseBranch}\` into the branch, resolve the conflicts, rerun the checks and submit it for review again.`
+        + (label ? ` To resolve conflicts yourself instead, remove the "${label}" label while the card waits for you.` : "");
+      try {
+        await tracker.commentOnIssue?.(issue, body);
+      } catch (error) {
+        log.warn("could not comment on returned issue", { error: (error as Error).message });
+      }
+      returned.push({ ...issue, state: settings.returnState });
+    }
+    return returned;
   }
 
   private saveLedger(): void {

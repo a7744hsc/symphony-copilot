@@ -36,6 +36,11 @@ export interface ReviewToolContext {
   onVerdict(verdict: "approve" | "request_changes"): void;
 }
 
+export interface MergeConflict {
+  issue: Issue;
+  pullRequest: { number: number; url: string; baseBranch: string };
+}
+
 /** Spec §11: a small read kernel plus optional provider-native agent tools. */
 export interface TrackerAdapter {
   readonly kind: string;
@@ -49,4 +54,7 @@ export interface TrackerAdapter {
   commentOnIssue?(issue: Issue, body: string): Promise<void>;
   /** Moves the issue to the configured blocked state; returns that state, or null if none is configured. */
   blockIssue?(issue: Issue): Promise<string | null>;
+  /** Issues whose open pull request the host reports as conflicting with its base branch; undecided ones are left out. */
+  findMergeConflicts?(issues: Issue[]): Promise<MergeConflict[]>;
+  moveIssue?(issue: Issue, state: string): Promise<void>;
 }

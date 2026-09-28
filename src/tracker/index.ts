@@ -3,7 +3,7 @@ import type { Logger } from "../log.ts";
 import { GitHubProjectTracker } from "./github-project.ts";
 import { TrackerError, type TrackerAdapter } from "./types.ts";
 
-export { TrackerError, type AgentToolContext, type TrackerAdapter, type TrackerErrorCategory } from "./types.ts";
+export { TrackerError, type AgentToolContext, type MergeConflict, type TrackerAdapter, type TrackerErrorCategory } from "./types.ts";
 
 export function createTracker(config: ServiceConfig, env: NodeJS.ProcessEnv, log: Logger): TrackerAdapter {
   switch (config.tracker.kind) {

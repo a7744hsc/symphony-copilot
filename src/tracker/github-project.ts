@@ -6,7 +6,7 @@ import { ExecError, run } from "../exec.ts";
 import { truncate, type Logger } from "../log.ts";
 import { isInside } from "../policy.ts";
 import { normalizeState, type BlockerRef, type Issue } from "../types.ts";
-import { TrackerError, type AgentToolContext, type ReviewToolContext, type TrackerAdapter } from "./types.ts";
+import { TrackerError, type AgentToolContext, type MergeConflict, type ReviewToolContext, type TrackerAdapter } from "./types.ts";
 
 interface ReviewArgs {
   verdict: string;
@@ -74,6 +74,18 @@ export function readAttachments(workspacePath: string, paths: unknown): { files:
     files.push({ name: basename(path), data: readFileSync(path) });
   }
   return { files };
+}
+
+/** Files that would conflict when merging `base` into HEAD, checked without touching the working tree. Empty when git cannot tell. */
+export async function conflictingFiles(cwd: string, base: string, env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
+  try {
+    await run("git", ["merge-tree", "--write-tree", "--name-only", "--no-messages", base, "HEAD"], { cwd, env });
+    return [];
+  } catch (error) {
+    // Exit status 1 means conflicts: the first line is the tree, then one path per line. Older git (< 2.38) fails differently.
+    if (!(error instanceof ExecError) || error.exitCode !== 1) return [];
+    return error.stdout.split("\n").slice(1).map((line) => line.trim()).filter(Boolean);
+  }
 }
 
 export function parseSettings(provider: Record<string, unknown>, env: NodeJS.ProcessEnv): GitHubProjectSettings {
@@ -306,6 +318,30 @@ export class GitHubProjectTracker implements TrackerAdapter {
     return this.settings.blockedState;
   }
 
+  async moveIssue(issue: Issue, state: string): Promise<void> {
+    await this.setStatus(issue, state);
+  }
+
+  async findMergeConflicts(issues: Issue[]): Promise<MergeConflict[]> {
+    const withBranch = issues.filter((issue) => issue.branchName);
+    const conflicts: MergeConflict[] = [];
+    for (let i = 0; i < withBranch.length; i += 50) {
+      const chunk = withBranch.slice(i, i + 50);
+      const params = chunk.map((_, j) => `$b${j}: String!`).join(", ");
+      const fields = chunk.map((_, j) => `pr${j}: pullRequests(headRefName: $b${j}, states: [OPEN], first: 1, orderBy: { field: CREATED_AT, direction: DESC }) { nodes { number url mergeable baseRefName } }`).join("\n");
+      const data: any = await this.graphql(
+        `query($owner: String!, $name: String!, ${params}) { repository(owner: $owner, name: $name) { ${fields} } }`,
+        { owner: this.settings.repoOwner, name: this.settings.repoName, ...Object.fromEntries(chunk.map((issue, j) => [`b${j}`, issue.branchName])) },
+      );
+      chunk.forEach((issue, j) => {
+        // GitHub computes mergeability in the background and answers UNKNOWN until it is done; a later poll sees the result.
+        const pr = data?.repository?.[`pr${j}`]?.nodes?.[0];
+        if (pr?.mergeable === "CONFLICTING") conflicts.push({ issue, pullRequest: { number: pr.number, url: pr.url, baseBranch: pr.baseRefName } });
+      });
+    }
+    return conflicts;
+  }
+
   async fetchIssuesByStates(states: string[]): Promise<Issue[]> {
     if (states.length === 0) return [];
     const wanted = new Set(states.map(normalizeState));
@@ -369,7 +405,7 @@ export class GitHubProjectTracker implements TrackerAdapter {
     };
     const tools: Tool<any>[] = [
       defineTool("tracker_get_issue", {
-        description: "Read the current issue: live board status, body, labels, recent comments, and the open pull request for this issue's branch with its reviews and review threads. Use it at the start of a retry or rework.",
+        description: "Read the current issue: live board status, body, labels, recent comments, and the open pull request for this issue's branch with its mergeability, reviews and review threads. Use it at the start of a retry or rework.",
         parameters: { type: "object", properties: {}, additionalProperties: false },
         skipPermission: true,
         handler: wrap("tracker_get_issue", () => this.issueContext(context.issue)),
@@ -424,7 +460,7 @@ export class GitHubProjectTracker implements TrackerAdapter {
     }
     tools.push(
       defineTool("tracker_submit_for_review", {
-        description: `Hand the work to a human: requires all changes committed in the workspace. Pushes HEAD to branch ${context.issue.branchName}, opens (or updates) the pull request that closes this issue, posts the summary on the issue${this.settings.handoffState ? `, and moves the card to "${this.settings.handoffState}"` : ""}. Do not push yourself.`,
+        description: `Hand the work to a human: requires all changes committed in the workspace, and HEAD must merge into the default branch without conflicts. Pushes HEAD to branch ${context.issue.branchName}, opens (or updates) the pull request that closes this issue, posts the summary on the issue${this.settings.handoffState ? `, and moves the card to "${this.settings.handoffState}"` : ""}. Do not push yourself.`,
         parameters: {
           type: "object",
           properties: {
@@ -577,7 +613,7 @@ export class GitHubProjectTracker implements TrackerAdapter {
         comments(last: 30) { nodes { author { login } body createdAt } } } }
       repository(owner: $owner, name: $name) {
         pullRequests(headRefName: $branch, states: [OPEN], first: 1, orderBy: { field: CREATED_AT, direction: DESC }) { nodes {
-          number url title
+          number url title mergeable baseRefName
           reviews(last: 20) { nodes { author { login } state body submittedAt } }
           reviewThreads(first: 50) { nodes { isResolved path line comments(first: 20) { nodes { author { login } body } } } }
           comments(last: 20) { nodes { author { login } body createdAt } }
@@ -600,6 +636,8 @@ export class GitHubProjectTracker implements TrackerAdapter {
         number: pr.number,
         url: pr.url,
         title: pr.title,
+        mergeable: pr.mergeable ?? null,
+        base_branch: pr.baseRefName ?? null,
         reviews: (pr.reviews?.nodes ?? []).map((r: any) => ({ author: r?.author?.login ?? null, state: r?.state, body: text(r?.body, 2000) })),
         review_threads: (pr.reviewThreads?.nodes ?? []).map((t: any) => ({
           resolved: t?.isResolved, path: t?.path, line: t?.line,
@@ -650,6 +688,10 @@ export class GitHubProjectTracker implements TrackerAdapter {
     await git(["fetch", "--quiet", "origin", repo.defaultBranch]);
     const ahead = Number(await git(["rev-list", "--count", `origin/${repo.defaultBranch}..HEAD`]));
     if (!ahead) return { failure: `HEAD has no commits beyond origin/${repo.defaultBranch}; nothing to review` };
+    const conflicts = await conflictingFiles(workspacePath, `origin/${repo.defaultBranch}`, { ...process.env, GIT_TERMINAL_PROMPT: "0" });
+    if (conflicts.length > 0) {
+      return { failure: `HEAD conflicts with origin/${repo.defaultBranch} in: ${truncate(conflicts.join(", "), 1000)}. Run \`git merge origin/${repo.defaultBranch}\`, resolve the conflicts keeping the intent of both sides, rerun the checks, commit, and submit again.` };
+    }
     try {
       await git(["push", "--quiet", "origin", `HEAD:refs/heads/${branch}`]);
     } catch (error) {

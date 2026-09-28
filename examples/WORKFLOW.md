@@ -21,6 +21,9 @@ tracker:
   required_labels: [agent]           # only cards with this label are dispatched
   active_states: [Todo, In Progress, Rework]
   terminal_states: [Done, Canceled]
+merge_conflicts:                     # a PR that stops merging while it waits goes back to the agent, first in line
+  states: [Human Review]
+  return_state: Rework
 polling:
   interval_ms: 60000
 workspace:
@@ -54,6 +57,7 @@ This is attempt {{ attempt }}. You may be resuming after an interruption or rewo
 {% endif %}
 How to work:
 1. Move the card to "In Progress" with tracker_set_status. Then call tracker_get_issue to read comments and review feedback, and run `git status` and `git log` to see what is already in the workspace. Continue from existing progress; do not start over.
+   If a comment says the pull request has merge conflicts, run `git merge origin/main`, resolve the conflicts keeping the intent of both sides, rerun the checks, commit, and submit again.
 2. Read AGENTS.md or README.md first, then implement the issue's acceptance criteria. Change only files in this workspace.
 3. Run `npm test` and fix any failures.
 4. Commit in small steps with clear messages.

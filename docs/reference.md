@@ -94,11 +94,11 @@ Each tool acts only on the current issue and runs in the orchestrator process wi
 
 | Tool | Changes the board | What it does |
 |---|---|---|
-| `tracker_get_issue` | No | Board status, body, labels, recent comments, and the open PR for the issue's branch with its reviews and review threads |
+| `tracker_get_issue` | No | Board status, body, labels, recent comments, and the open PR for the issue's branch with its mergeability, reviews and review threads |
 | `tracker_comment` | Yes | Comments on the issue |
 | `tracker_set_status` | Yes | Moves the card, only to one of `agent_states` |
 | `tracker_create_followup` | Yes | Only with `followups` configured; offered to implementer and reviewer. Creates an issue with the configured labels, adds it to the board with the configured state and priority, and notes which issue it came from. An open issue with the same title is reused instead |
-| `tracker_submit_for_review` | Yes | Requires a clean working tree. Pushes HEAD to `agent/<number>` with your git credentials, opens a PR with `Closes #<number>` (or comments on the existing PR), posts the summary on the issue, then moves the card to `handoff_state`. Optional `attachments`: images in the workspace (PNG, JPEG, GIF or WebP, up to 5 MB each), committed to `evidence_branch` with the tracker token and embedded in the PR and the issue comment |
+| `tracker_submit_for_review` | Yes | Requires a clean working tree and a HEAD that merges into the default branch without conflicts (checked with `git merge-tree`; skipped on git older than 2.38). Pushes HEAD to `agent/<number>` with your git credentials, opens a PR with `Closes #<number>` (or comments on the existing PR), posts the summary on the issue, then moves the card to `handoff_state`. Optional `attachments`: images in the workspace (PNG, JPEG, GIF or WebP, up to 5 MB each), committed to `evidence_branch` with the tracker token and embedded in the PR and the issue comment |
 
 Screenshots are linked by commit, so they render for anyone with access to the repository, including private ones. Clone workspaces with only `main` and the agent branches (see [examples/WORKFLOW.md](../examples/WORKFLOW.md)); a plain `git clone` also downloads every stored screenshot.
 
@@ -118,11 +118,13 @@ The reviewer (see [Independent review](../README.md#independent-review)) gets `t
 - **Halts hold.** A halted issue records its live tracker state, so a poll never mistakes the agent's own status change for a person moving the card.
 - **No overlap in a workspace.** The next session for an issue starts only after the previous one, including its `after_run` hook, has finished.
 - **One role per session.** When a card moves between an implementation state and a review state, the running session is stopped and the other role starts in a new session, in its own workspace.
+- **Conflicts first.** A card the orchestrator returned for a [merge conflict](../README.md#merge-conflicts) is dispatched before every other card until its run ends; the reason is kept in the ledger, so a restart does not lose it. GitHub answers `UNKNOWN` while it computes mergeability, so a conflict is acted on at the first poll after GitHub has decided.
 - **One orchestrator per `workspace.root`.** A second instance is not detected and would claim the same issues.
 
 ## Differences from the spec
 
 - Run limits (`agent.max_sessions`, `copilot.max_ai_credits_per_issue`) are an addition. The spec keeps dispatching an active issue indefinitely; here a run that reaches a limit is halted until the issue leaves the active states. The per-run counts are the only state kept across restarts (`.symphony-ledger.json` under `workspace.root`); a corrupt ledger fails startup rather than silently resetting the limits.
 - The optional HTTP status API (§13.7) is not implemented yet. `Orchestrator.snapshot()` already returns the data described in §13.3.
+- Returning cards whose pull request conflicts (`merge_conflicts`) is an addition. The spec only dispatches from active states; here the orchestrator also reads the configured waiting states and may move a card out of them.
 - As in the spec, the retry queue is not persisted. After a restart, the orchestrator recovers from the board and the workspaces that are still on disk.
 - A workspace path that already exists as a file or symlink fails the attempt; it is never deleted or replaced.

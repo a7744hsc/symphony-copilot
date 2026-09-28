@@ -11,10 +11,13 @@ export interface ExecResult {
 export class ExecError extends Error {
   readonly stdout: string;
   readonly stderr: string;
-  constructor(message: string, stdout: string, stderr: string) {
+  /** Exit status, or null when the program could not start or was killed. */
+  readonly exitCode: number | null;
+  constructor(message: string, stdout: string, stderr: string, exitCode: number | null = null) {
     super(message);
     this.stdout = stdout;
     this.stderr = stderr;
+    this.exitCode = exitCode;
   }
 }
 
@@ -30,7 +33,7 @@ export async function run(file: string, args: string[], options: { cwd: string; 
     });
     return { stdout, stderr };
   } catch (error) {
-    const e = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
-    throw new ExecError(`${file} ${args.join(" ")} failed: ${e.message}`, e.stdout ?? "", e.stderr ?? "");
+    const e = error as Omit<NodeJS.ErrnoException, "code"> & { code?: unknown; stdout?: string; stderr?: string };
+    throw new ExecError(`${file} ${args.join(" ")} failed: ${e.message}`, e.stdout ?? "", e.stderr ?? "", typeof e.code === "number" ? e.code : null);
   }
 }

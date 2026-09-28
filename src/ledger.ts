@@ -14,6 +14,8 @@ export interface RunCycle {
   /** Review verdicts given in this run. */
   reviewRounds: number;
   halted: { reason: string; state: string; at: string } | null;
+  /** Set when the orchestrator sent the card back itself (a merge conflict); such runs are dispatched first. */
+  returnedFor: string | null;
 }
 
 export class LedgerError extends Error {}
@@ -41,7 +43,7 @@ export class RunLedger {
   open(issueId: string, identifier: string, now: Date): RunCycle {
     let cycle = this.cycles.get(issueId);
     if (!cycle) {
-      cycle = { identifier, startedAt: now.toISOString(), sessions: 0, aiCredits: 0, reviewRounds: 0, halted: null };
+      cycle = { identifier, startedAt: now.toISOString(), sessions: 0, aiCredits: 0, reviewRounds: 0, halted: null, returnedFor: null };
       this.cycles.set(issueId, cycle);
     }
     return cycle;
@@ -91,6 +93,7 @@ function load(path: string): Array<[string, RunCycle]> {
       halted: raw.halted && typeof raw.halted.reason === "string" && typeof raw.halted.state === "string"
         ? { reason: raw.halted.reason, state: raw.halted.state, at: String(raw.halted.at ?? "") }
         : null,
+      returnedFor: typeof raw.returnedFor === "string" ? raw.returnedFor : null,
     }]);
   }
   return entries;
