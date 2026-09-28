@@ -14,6 +14,10 @@ tracker:
     agent_states: [In Progress, Blocked]
     handoff_state: Human Review
     blocked_state: Blocked           # where the orchestrator puts cards that reach a run limit
+    followups:                       # agents file out-of-scope problems as new issues
+      labels: [tech-debt]            # no "agent" label, so a person decides when to do them
+      state: Todo
+      priority: P4
   required_labels: [agent]           # only cards with this label are dispatched
   active_states: [Todo, In Progress, Rework]
   terminal_states: [Done, Canceled]
@@ -59,4 +63,4 @@ How to work:
 Rules:
 - Do not run git push or gh. The only way to push and open a pull request is tracker_submit_for_review.
 - There is no network access.
-- If you find problems outside this issue, mention them in the pull request summary instead of fixing them.
+- If you find problems outside this issue, file each one with tracker_create_followup and list the links in your summary. Do not fix them now.

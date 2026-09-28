@@ -33,6 +33,15 @@ export interface GitHubProjectSettings {
   blockedState: string | null;
   /** Branch that holds screenshots attached to submissions; never merged. */
   evidenceBranch: string;
+  /** Where agents file out-of-scope problems; null means agents cannot create issues. */
+  followups: FollowupSettings | null;
+}
+
+export interface FollowupSettings {
+  labels: string[];
+  state: string | null;
+  priority: string | null;
+  maxPerSession: number;
 }
 
 const NO_STATUS = "No Status";
@@ -110,7 +119,27 @@ export function parseSettings(provider: Record<string, unknown>, env: NodeJS.Pro
     handoffState: typeof handoff === "string" && handoff.trim() !== "" ? handoff.trim() : null,
     blockedState: typeof blocked === "string" && blocked.trim() !== "" ? blocked.trim() : null,
     evidenceBranch: str("evidence_branch", "symphony-evidence"),
+    followups: parseFollowups(provider.followups),
   };
+}
+
+function parseFollowups(raw: unknown): FollowupSettings | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new TrackerError("invalid_tracker_config", "tracker.provider.followups must be a map");
+  const f = raw as Record<string, unknown>;
+  const labels = f.labels ?? [];
+  if (!Array.isArray(labels) || !labels.every((l) => typeof l === "string" && l.trim() !== "")) {
+    throw new TrackerError("invalid_tracker_config", "tracker.provider.followups.labels must be a list of label names");
+  }
+  const optional = (key: string) => {
+    const value = f[key];
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "string" || value.trim() === "") throw new TrackerError("invalid_tracker_config", `tracker.provider.followups.${key} must be a string`);
+    return value.trim();
+  };
+  const max = f.max_per_session ?? 3;
+  if (!Number.isInteger(max) || (max as number) < 1) throw new TrackerError("invalid_tracker_config", "tracker.provider.followups.max_per_session must be a positive integer");
+  return { labels: labels as string[], state: optional("state"), priority: optional("priority"), maxPerSession: max as number };
 }
 
 // ---- Normalization (pure; see README "Adapter profile") ----
@@ -235,6 +264,8 @@ interface ProjectMeta {
   projectId: string;
   statusFieldId: string;
   statusOptions: Array<{ id: string; name: string }>;
+  priorityFieldId: string | null;
+  priorityOptions: Array<{ id: string; name: string }>;
 }
 
 interface ToolFailure {
@@ -353,6 +384,24 @@ export class GitHubProjectTracker implements TrackerAdapter {
         }),
       }),
     ];
+    const followups = this.settings.followups;
+    if (followups) {
+      const filed = { count: 0 };
+      tools.push(defineTool("tracker_create_followup", {
+        description: `File a separate issue for a problem you found that is outside this issue's scope (tech debt, a bug elsewhere, a later improvement), instead of fixing it now or writing it into a document. It goes on the board${followups.state ? ` in "${followups.state}"` : ""}${followups.priority ? ` with priority ${followups.priority}` : ""}, and no agent works on it until a person decides to. One problem per issue, with a specific title; an open issue with the same title is reused. At most ${followups.maxPerSession} per session.`,
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Specific title, for example \"Guest bubbles cover the floor sign when three guests talk\"" },
+            body: { type: "string", description: "Markdown: what is wrong, where (file and line), the impact, and a suggested fix" },
+          },
+          required: ["title", "body"],
+          additionalProperties: false,
+        },
+        skipPermission: true,
+        handler: wrap("tracker_create_followup", (args: { title: string; body: string }) => this.createFollowup(context, followups, filed, args)),
+      }));
+    }
     const review = context.review;
     if (review) {
       tools.push(defineTool("tracker_submit_review", {
@@ -411,6 +460,58 @@ export class GitHubProjectTracker implements TrackerAdapter {
   }
 
   // ---- tool implementations ----
+
+  private async createFollowup(context: AgentToolContext, f: FollowupSettings, filed: { count: number }, args: { title: string; body: string }): Promise<unknown> {
+    const title = typeof args.title === "string" ? args.title.trim() : "";
+    if (title === "") return { failure: "title must be a non-empty string" };
+    if (typeof args.body !== "string" || args.body.trim() === "") return { failure: "body must be a non-empty string" };
+    if (filed.count >= f.maxPerSession) return { failure: `you already filed ${f.maxPerSession} issues in this session; list further problems in your summary instead` };
+    const repoName = `${this.settings.repoOwner}/${this.settings.repoName}`;
+    const found: any = await this.graphql(
+      `query($q: String!) { search(query: $q, type: ISSUE, first: 10) { nodes { ... on Issue { number title url } } } }`,
+      { q: `repo:${repoName} is:issue is:open in:title ${JSON.stringify(title)}` },
+    );
+    const duplicate = (found?.search?.nodes ?? []).find((n: any) => typeof n?.title === "string" && n.title.trim().toLowerCase() === title.toLowerCase());
+    if (duplicate) return { duplicate_of: duplicate.url, number: duplicate.number, note: "an open issue with this title already exists; nothing was created" };
+
+    const repo = await this.repository();
+    const labelData: any = await this.graphql(
+      `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { labels(first: 100) { nodes { id name } } } }`,
+      { owner: this.settings.repoOwner, name: this.settings.repoName },
+    );
+    const existing = labelData?.repository?.labels?.nodes ?? [];
+    const labelIds: string[] = [];
+    for (const name of f.labels) {
+      const label = existing.find((l: any) => normalizeState(l?.name ?? "") === normalizeState(name));
+      if (label) labelIds.push(label.id);
+      else context.log.warn("follow-up label not found in repository", { label: name });
+    }
+    const source = context.issue.nativeRef?.issue_number;
+    const role = context.review ? "reviewer" : "implementer";
+    const body = `${args.body.trim()}\n\n---\n_Filed by symphony-copilot's ${role} while working on #${source}._`;
+    const created: any = await this.graphql(
+      `mutation($repo: ID!, $title: String!, $body: String!, $labels: [ID!]) { createIssue(input: { repositoryId: $repo, title: $title, body: $body, labelIds: $labels }) { issue { id number url } } }`,
+      { repo: repo.id, title, body, labels: labelIds },
+    );
+    const issue = created?.createIssue?.issue;
+    if (!issue?.id) throw new TrackerError("tracker_response", "createIssue returned no issue");
+    filed.count++;
+    const meta = await this.projectMeta();
+    const added: any = await this.graphql(
+      `mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } } }`,
+      { project: meta.projectId, content: issue.id },
+    );
+    const itemId = added?.addProjectV2ItemById?.item?.id;
+    const warnings: string[] = [];
+    if (itemId && f.state) await this.setOption(itemId, meta.statusFieldId, meta.statusOptions, f.state).catch((e: Error) => warnings.push(e.message));
+    if (itemId && f.priority) {
+      if (meta.priorityFieldId) await this.setOption(itemId, meta.priorityFieldId, meta.priorityOptions, f.priority).catch((e: Error) => warnings.push(e.message));
+      else warnings.push(`priority field "${this.settings.priorityField}" is not a single-select field`);
+    }
+    for (const warning of warnings) context.log.warn("follow-up board update failed", { issue: issue.url, error: warning });
+    context.log.info("follow-up issue created", { issue: issue.url });
+    return { issue_url: issue.url, number: issue.number, ...(warnings.length > 0 ? { warnings } : {}) };
+  }
 
   private async submitReview(context: AgentToolContext, review: ReviewToolContext, args: ReviewArgs): Promise<unknown> {
     const { issue } = context;
@@ -519,12 +620,17 @@ export class GitHubProjectTracker implements TrackerAdapter {
 
   private async setStatus(issue: Issue, statusName: string): Promise<void> {
     const meta = await this.projectMeta();
-    const option = meta.statusOptions.find((o) => normalizeState(o.name) === normalizeState(statusName));
-    if (!option) throw new TrackerError("invalid_tracker_config", `status "${statusName}" is not an option of field ${this.settings.statusField}`);
+    await this.setOption(issue.id, meta.statusFieldId, meta.statusOptions, statusName);
+  }
+
+  private async setOption(itemId: string, fieldId: string, options: Array<{ id: string; name: string }>, optionName: string): Promise<void> {
+    const meta = await this.projectMeta();
+    const option = options.find((o) => normalizeState(o.name) === normalizeState(optionName));
+    if (!option) throw new TrackerError("invalid_tracker_config", `"${optionName}" is not an option of that project field`);
     await this.graphql(
       `mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
         updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { singleSelectOptionId: $option } }) { projectV2Item { id } } }`,
-      { project: meta.projectId, item: issue.id, field: meta.statusFieldId, option: option.id },
+      { project: meta.projectId, item: itemId, field: fieldId, option: option.id },
     );
   }
 
@@ -636,14 +742,21 @@ export class GitHubProjectTracker implements TrackerAdapter {
     this.meta ??= (async () => {
       const ownerField = this.settings.ownerType === "user" ? "user" : "organization";
       const data: any = await this.graphql(
-        `query($login: String!, $number: Int!, $statusField: String!) { owner: ${ownerField}(login: $login) { projectV2(number: $number) {
-          id field(name: $statusField) { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`,
-        { login: this.settings.owner, number: this.settings.projectNumber, statusField: this.settings.statusField },
+        `query($login: String!, $number: Int!, $statusField: String!, $priorityField: String!) { owner: ${ownerField}(login: $login) { projectV2(number: $number) {
+          id field(name: $statusField) { ... on ProjectV2SingleSelectField { id options { id name } } }
+          priority: field(name: $priorityField) { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`,
+        { login: this.settings.owner, number: this.settings.projectNumber, statusField: this.settings.statusField, priorityField: this.settings.priorityField },
       );
       const project = data?.owner?.projectV2;
       if (!project?.id) throw new TrackerError("invalid_tracker_config", `project ${this.settings.owner}#${this.settings.projectNumber} not found or not accessible`);
       if (!project.field?.id) throw new TrackerError("invalid_tracker_config", `single-select field "${this.settings.statusField}" not found`);
-      return { projectId: project.id, statusFieldId: project.field.id, statusOptions: project.field.options ?? [] };
+      return {
+        projectId: project.id,
+        statusFieldId: project.field.id,
+        statusOptions: project.field.options ?? [],
+        priorityFieldId: project.priority?.id ?? null,
+        priorityOptions: project.priority?.options ?? [],
+      };
     })().catch((error) => {
       this.meta = null;
       throw error;

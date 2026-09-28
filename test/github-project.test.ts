@@ -281,3 +281,75 @@ test("review verdicts are validated before anything is posted", async () => {
   assert.equal(approved.result.status, "待验证");
   assert.match(String(approved.calls[1]!.variables.body), /round 2 of 3 · approved/);
 });
+
+function followupFetch(openTitles: string[] = []) {
+  const calls: Array<{ query: string; variables: Record<string, any> }> = [];
+  const impl = async (_url: string, init: RequestInit) => {
+    const call = JSON.parse(String(init.body));
+    calls.push(call);
+    const q: string = call.query;
+    const data =
+      q.includes("search(") ? { search: { nodes: openTitles.map((title, i) => ({ number: 90 + i, title, url: `https://github.com/me/app/issues/${90 + i}` })) } }
+      : q.includes("defaultBranchRef") ? { repository: { id: "R_1", defaultBranchRef: { name: "main" } } }
+      : q.includes("labels(first") ? { repository: { labels: { nodes: [{ id: "L_agent", name: "agent" }, { id: "L_td", name: "tech-debt" }] } } }
+      : q.includes("createIssue") ? { createIssue: { issue: { id: "I_new", number: 13, url: "https://github.com/me/app/issues/13" } } }
+      : q.includes("projectV2(number") ? { owner: { projectV2: {
+        id: "PVT_1",
+        field: { id: "F_status", options: [{ id: "o-todo", name: "待开始" }] },
+        priority: { id: "F_prio", options: [{ id: "o-p1", name: "P1" }, { id: "o-p4", name: "P4" }] },
+      } } }
+      : q.includes("addProjectV2ItemById") ? { addProjectV2ItemById: { item: { id: "PVTI_new" } } }
+      : q.includes("updateProjectV2ItemFieldValue") ? { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_new" } } }
+      : null;
+    if (!data) throw new Error(`unexpected query: ${q.slice(0, 80)}`);
+    return new Response(JSON.stringify({ data }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  return { impl, calls };
+}
+
+const followups = { labels: ["tech-debt"], state: "待开始", priority: "P4", max_per_session: 2 };
+
+function followupTool(impl: any, extra: Record<string, unknown> = {}, review = false) {
+  const tracker = new GitHubProjectTracker({ ...provider, followups, ...extra }, env, quietLog, impl);
+  const issue = (normalizeItem(item(), settings) as { issue: any }).issue;
+  const tools = tracker.agentTools({
+    issue, workspacePath: "/tmp", log: quietLog,
+    ...(review ? { review: { round: 1, maxRounds: 3, passState: "待验证", failState: "返工", onVerdict: () => {} } } : {}),
+  });
+  return { tools, call: (args: Record<string, unknown>) => tools.find((t) => t.name === "tracker_create_followup")!.handler!(args as any, {} as any) as Promise<any> };
+}
+
+test("follow-ups become low-priority board issues without the agent label", async () => {
+  const { impl, calls } = followupFetch();
+  const { call } = followupTool(impl);
+  const result = await call({ title: "Bubbles cover the floor sign", body: "Seen at `ElevatorSceneView.swift:120` with three guests." });
+  assert.equal(result.issue_url, "https://github.com/me/app/issues/13");
+  const create = calls.find((c) => c.query.includes("createIssue"))!;
+  assert.deepEqual(create.variables.labels, ["L_td"], "only the configured labels, never agent");
+  assert.match(create.variables.body, /Filed by symphony-copilot's implementer while working on #12/);
+  const updates = calls.filter((c) => c.query.includes("updateProjectV2ItemFieldValue")).map((c) => [c.variables.field, c.variables.option]);
+  assert.deepEqual(updates, [["F_status", "o-todo"], ["F_prio", "o-p4"]]);
+});
+
+test("follow-ups reuse an open issue with the same title and are capped per session", async () => {
+  const dup = followupFetch(["bubbles cover the floor sign"]);
+  const result = await followupTool(dup.impl).call({ title: "Bubbles cover the floor sign", body: "x" });
+  assert.equal(result.duplicate_of, "https://github.com/me/app/issues/90");
+  assert.ok(!dup.calls.some((c) => c.query.includes("createIssue")));
+
+  const capped = followupFetch();
+  const { call } = followupTool(capped.impl);
+  await call({ title: "One", body: "x" });
+  await call({ title: "Two", body: "x" });
+  const third = await call({ title: "Three", body: "x" });
+  assert.match(String(third.textResultForLlm), /already filed 2 issues/);
+});
+
+test("the follow-up tool is offered to both roles only when configured", () => {
+  const none = new GitHubProjectTracker(provider, env, quietLog, async () => new Response());
+  const issue = (normalizeItem(item(), settings) as { issue: any }).issue;
+  assert.ok(!none.agentTools({ issue, workspacePath: "/tmp", log: quietLog }).some((t) => t.name === "tracker_create_followup"));
+  const { tools } = followupTool(async () => new Response(), {}, true);
+  assert.deepEqual(tools.map((t) => t.name).sort(), ["tracker_comment", "tracker_create_followup", "tracker_get_issue", "tracker_submit_review"]);
+  assert.throws(() => parseSettings({ ...provider, followups: { labels: "tech-debt" } }, env), (e: TrackerError) => e.category === "invalid_tracker_config");
+});

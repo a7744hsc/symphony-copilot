@@ -52,6 +52,7 @@ Optional, with defaults:
 | `handoff_state` | None | State set by `tracker_submit_for_review`; without it, the state is left alone |
 | `blocked_state` | None | State the orchestrator moves a card to when its run reaches a [run limit](../README.md#run-limits); without it, the card stays where it is and is skipped until someone moves it |
 | `evidence_branch` | `symphony-evidence` | Branch that stores screenshots attached with `tracker_submit_for_review`. It is never merged; keep it, or the images on issues stop loading |
+| `followups` | None | Lets agents file out-of-scope problems as new issues with `tracker_create_followup`. Keys: `labels` (never include your dispatch label), `state` and `priority` for the new card, `max_per_session` (default 3) |
 
 A bad setting is reported as `invalid_tracker_config`, and a missing token as `missing_tracker_secret`.
 
@@ -96,6 +97,7 @@ Each tool acts only on the current issue and runs in the orchestrator process wi
 | `tracker_get_issue` | No | Board status, body, labels, recent comments, and the open PR for the issue's branch with its reviews and review threads |
 | `tracker_comment` | Yes | Comments on the issue |
 | `tracker_set_status` | Yes | Moves the card, only to one of `agent_states` |
+| `tracker_create_followup` | Yes | Only with `followups` configured; offered to implementer and reviewer. Creates an issue with the configured labels, adds it to the board with the configured state and priority, and notes which issue it came from. An open issue with the same title is reused instead |
 | `tracker_submit_for_review` | Yes | Requires a clean working tree. Pushes HEAD to `agent/<number>` with your git credentials, opens a PR with `Closes #<number>` (or comments on the existing PR), posts the summary on the issue, then moves the card to `handoff_state`. Optional `attachments`: images in the workspace (PNG, JPEG, GIF or WebP, up to 5 MB each), committed to `evidence_branch` with the tracker token and embedded in the PR and the issue comment |
 
 Screenshots are linked by commit, so they render for anyone with access to the repository, including private ones. Clone workspaces with only `main` and the agent branches (see [examples/WORKFLOW.md](../examples/WORKFLOW.md)); a plain `git clone` also downloads every stored screenshot.
