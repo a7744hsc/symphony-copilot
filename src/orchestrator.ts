@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { isActiveState, isRoutable, isTerminalState, type ServiceConfig } from "./config.ts";
+import { RunLedger, type RunCycle } from "./ledger.ts";
 import type { Logger } from "./log.ts";
 import type { AgentUpdate, TokenTotals } from "./runner.ts";
 import type { TrackerAdapter } from "./tracker/index.ts";
@@ -26,6 +27,8 @@ export interface OrchestratorDeps {
   removeWorkspace(config: ServiceConfig, issue: Issue, tracker: TrackerAdapter): Promise<void>;
   log: Logger;
   now?: () => number;
+  /** Per-issue run limits; in-memory when omitted. */
+  ledger?: RunLedger;
   /** Poll and log what would be dispatched, without workspaces or agents. */
   dryRun?: boolean;
 }
@@ -42,6 +45,10 @@ interface RunningEntry {
   lastMessage: string | null;
   tokens: TokenTotals;
   lastReported: TokenTotals;
+  cycle: RunCycle | null;
+  lastReportedCredits: number;
+  /** Set when the orchestrator stops the worker because the run hit a limit. */
+  halt: string | null;
   termination: { cleanup: boolean; reason: string } | null;
   stalled: boolean;
   done: Promise<void>;
@@ -71,6 +78,20 @@ export function retryDelayMs(attempt: number, maxBackoffMs: number): number {
   return Math.min(10_000 * 2 ** Math.max(0, attempt - 1), maxBackoffMs);
 }
 
+const credits = (value: number) => Number(value.toFixed(2));
+
+/** Why this run may not start another session, or null. */
+export function runLimitReached(cycle: RunCycle, config: ServiceConfig): string | null {
+  if (cycle.sessions >= config.agent.maxSessions) {
+    return `It used all ${config.agent.maxSessions} sessions allowed per run (agent.max_sessions) without handing the issue off.`;
+  }
+  const budget = config.copilot.maxAiCreditsPerIssue;
+  if (budget !== null && cycle.aiCredits >= budget) {
+    return `It reached this run's AI credit budget: ${credits(cycle.aiCredits)} of ${budget} (copilot.max_ai_credits_per_issue).`;
+  }
+  return null;
+}
+
 export class Orchestrator {
   private readonly deps: OrchestratorDeps;
   private readonly log: Logger;
@@ -80,6 +101,7 @@ export class Orchestrator {
   private readonly retries = new Map<string, RetryEntry>();
   private readonly completed = new Set<string>();
   private readonly totals = { input: 0, output: 0, total: 0, secondsEnded: 0 };
+  private readonly ledger: RunLedger;
   private rateLimits: unknown = null;
   private tracker: TrackerAdapter | null = null;
   private trackerConfig: ServiceConfig | null = null;
@@ -91,6 +113,7 @@ export class Orchestrator {
     this.deps = deps;
     this.log = deps.log;
     this.now = deps.now ?? Date.now;
+    this.ledger = deps.ledger ?? new RunLedger();
   }
 
   /** Validates, sweeps terminal workspaces, and schedules the first tick. Throws when startup validation fails. */
@@ -149,13 +172,21 @@ export class Orchestrator {
         return;
       }
       let dispatched = 0;
+      if (!this.deps.dryRun) this.closeFinishedRuns(candidates);
       for (const issue of sortForDispatch(candidates)) {
         if (this.availableSlots(config) - (this.deps.dryRun ? dispatched : 0) <= 0) break;
         if (!this.shouldDispatch(issue, config)) continue;
-        dispatched++;
         if (this.deps.dryRun) {
+          const cycle = this.ledger.get(issue.id);
+          const limit = cycle ? runLimitReached(cycle, config) : null;
+          if (limit) {
+            this.log.info("dry run: would halt", { issue_id: issue.id, issue_identifier: issue.identifier, reason: limit });
+            continue;
+          }
+          dispatched++;
           this.log.info("dry run: would dispatch", { issue_id: issue.id, issue_identifier: issue.identifier, state: issue.state, priority: issue.priority, title: issue.title });
-        } else {
+        } else if (await this.admit(issue, config)) {
+          dispatched++;
           this.dispatch(issue, null, workflow, tracker);
         }
       }
@@ -201,10 +232,15 @@ export class Orchestrator {
         started_at: iso(e.startedAt),
         last_event_at: iso(e.lastEventAt),
         tokens: { input_tokens: e.tokens.input, output_tokens: e.tokens.output, total_tokens: e.tokens.total },
+        run: { sessions: e.cycle?.sessions ?? 0, ai_credits: credits(e.cycle?.aiCredits ?? 0) },
       })),
       retrying: [...this.retries.values()].map((r) => ({
         issue_id: r.issueId, issue_identifier: r.identifier, issue_url: r.url, attempt: r.attempt, due_at: iso(r.dueAt), error: r.error,
       })),
+      halted: this.ledger.issueIds().flatMap((id) => {
+        const cycle = this.ledger.get(id)!;
+        return cycle.halted ? [{ issue_id: id, issue_identifier: cycle.identifier, reason: cycle.halted.reason, at: cycle.halted.at }] : [];
+      }),
       totals: {
         input_tokens: this.totals.input,
         output_tokens: this.totals.output,
@@ -254,7 +290,82 @@ export class Orchestrator {
     if (!issue.id || !issue.identifier || !issue.title || !issue.state) return false;
     if (!isActiveState(config, issue.state) || !isRoutable(config, issue)) return false;
     if (this.running.has(issue.id) || this.claimed.has(issue.id)) return false;
+    if (this.ledger.get(issue.id)?.halted) return false;
     return this.stateHasSlot(config, issue.state);
+  }
+
+  /** False when the issue's run has used up its limits; the issue is halted and reported. */
+  private async admit(issue: Issue, config: ServiceConfig): Promise<boolean> {
+    const cycle = this.ledger.get(issue.id);
+    if (!cycle) return true;
+    if (cycle.halted) return false;
+    const reason = runLimitReached(cycle, config);
+    if (!reason) return true;
+    this.markHalted(issue, cycle, reason);
+    await this.reportHalt(issue, cycle);
+    return false;
+  }
+
+  private markHalted(issue: Issue, cycle: RunCycle, reason: string): void {
+    cycle.halted = { reason, state: issue.state, at: new Date(this.now()).toISOString() };
+    this.saveLedger();
+    this.log.warn("issue halted", {
+      issue_id: issue.id, issue_identifier: issue.identifier, reason, sessions: cycle.sessions, ai_credits: credits(cycle.aiCredits),
+    });
+  }
+
+  /** Tells people on the issue why work stopped, and moves the card out of the active states if the tracker can. */
+  private async reportHalt(issue: Issue, cycle: RunCycle): Promise<void> {
+    const tracker = this.tracker;
+    const log = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
+    let moved: string | null = null;
+    try {
+      moved = (await tracker?.blockIssue?.(issue)) ?? null;
+    } catch (error) {
+      log.warn("could not move halted issue", { error: (error as Error).message });
+    }
+    if (moved && cycle.halted) {
+      cycle.halted.state = moved;
+      this.saveLedger();
+    }
+    const next = moved
+      ? `The card was moved to "${moved}". Move it back to an active column to start a new run with fresh limits.`
+      : "Move the card to a different column (for example out of the active columns and back) to start a new run with fresh limits.";
+    const body = `**symphony-copilot stopped working on this issue.** ${cycle.halted?.reason ?? ""}\n\n`
+      + `This run used ${cycle.sessions} session(s) and ${credits(cycle.aiCredits)} AI credits. ${next}`;
+    try {
+      await tracker?.commentOnIssue?.(issue, body);
+    } catch (error) {
+      log.warn("could not comment on halted issue", { error: (error as Error).message });
+    }
+  }
+
+  /** A run ends once its issue is seen outside the active states, or moved after being halted. */
+  private closeFinishedRuns(candidates: Issue[]): void {
+    const active = new Map(candidates.map((issue) => [issue.id, issue]));
+    let changed = false;
+    for (const id of this.ledger.issueIds()) {
+      if (this.claimed.has(id)) continue;
+      const cycle = this.ledger.get(id)!;
+      const issue = active.get(id);
+      const movedAfterHalt = cycle.halted !== null && issue !== undefined && normalizeState(issue.state) !== normalizeState(cycle.halted.state);
+      if (issue && !movedAfterHalt) continue;
+      this.ledger.close(id);
+      changed = true;
+      this.log.info("run closed", {
+        issue_id: id, issue_identifier: cycle.identifier, state: issue?.state ?? "not active",
+        sessions: cycle.sessions, ai_credits: credits(cycle.aiCredits), halted: cycle.halted?.reason ?? null,
+      });
+    }
+    if (changed) this.saveLedger();
+  }
+
+  private saveLedger(): void {
+    try {
+      this.ledger.save();
+    } catch (error) {
+      this.log.error("run ledger save failed", { path: this.ledger.path, error: (error as Error).message });
+    }
   }
 
   private dispatch(issue: Issue, attempt: number | null, workflow: EffectiveWorkflow, tracker: TrackerAdapter): void {
@@ -262,9 +373,12 @@ export class Orchestrator {
     const abort = new AbortController();
     const entry: RunningEntry = {
       issue, abort, attempt, startedAt: this.now(), threadId: null, turnCount: 0, lastEvent: null, lastEventAt: null, lastMessage: null,
-      tokens: { input: 0, output: 0, total: 0 }, lastReported: { input: 0, output: 0, total: 0 }, termination: null, stalled: false,
+      tokens: { input: 0, output: 0, total: 0 }, lastReported: { input: 0, output: 0, total: 0 },
+      cycle: this.ledger.open(issue.id, issue.identifier, new Date(this.now())), lastReportedCredits: 0, halt: null,
+      termination: null, stalled: false,
       done: Promise.resolve(),
     };
+    this.saveLedger();
     const retry = this.retries.get(issue.id);
     if (retry) clearTimeout(retry.timer);
     this.retries.delete(issue.id);
@@ -295,11 +409,35 @@ export class Orchestrator {
         entry.lastReported[key] = update.tokens[key];
       }
     }
+    if (entry.cycle) this.recordUsage(entry, update);
     if (["session_started", "turn_started", "turn_completed"].includes(update.event)) {
       this.log.info(update.event, {
         issue_id: entry.issue.id, issue_identifier: entry.issue.identifier,
         session_id: entry.threadId ? `${entry.threadId}-${entry.turnCount}` : null, total_tokens: entry.tokens.total,
       });
+    }
+  }
+
+  private recordUsage(entry: RunningEntry, update: AgentUpdate): void {
+    const cycle = entry.cycle!;
+    let changed = false;
+    if (update.event === "session_started") {
+      cycle.sessions++;
+      entry.lastReportedCredits = 0;
+      changed = true;
+    }
+    if (update.aiCredits !== undefined && update.aiCredits > entry.lastReportedCredits) {
+      cycle.aiCredits += update.aiCredits - entry.lastReportedCredits;
+      entry.lastReportedCredits = update.aiCredits;
+      changed = true;
+    }
+    if (!changed) return;
+    this.saveLedger();
+    const budget = this.trackerConfig?.copilot.maxAiCreditsPerIssue ?? null;
+    if (budget !== null && cycle.aiCredits >= budget && !entry.halt && !entry.termination) {
+      entry.halt = `It reached this run's AI credit budget: ${credits(cycle.aiCredits)} of ${budget} (copilot.max_ai_credits_per_issue).`;
+      this.markHalted(entry.issue, cycle, entry.halt);
+      this.terminate(entry, false, "AI credit budget reached");
     }
   }
 
@@ -309,25 +447,27 @@ export class Orchestrator {
     this.running.delete(id);
     this.totals.secondsEnded += (this.now() - entry.startedAt) / 1000;
     const log = this.log.child({ issue_id: id, issue_identifier: entry.issue.identifier });
+    const run = { run_sessions: entry.cycle?.sessions ?? 0, run_ai_credits: credits(entry.cycle?.aiCredits ?? 0) };
     if (entry.termination) {
       this.claimed.delete(id);
-      log.info("worker stopped by reconciliation", { reason: entry.termination.reason, cleanup: entry.termination.cleanup });
+      log.info("worker stopped by reconciliation", { reason: entry.termination.reason, cleanup: entry.termination.cleanup, ...run });
+      if (entry.halt && entry.cycle) await this.reportHalt(entry.issue, entry.cycle);
       if (entry.termination.cleanup) await this.safeRemove(entry.issue);
       return;
     }
     if (this.stopped) {
-      log.info("worker finished during shutdown", { error: error?.message ?? null });
+      log.info("worker finished during shutdown", { error: error?.message ?? null, ...run });
       return;
     }
     if (!error && !entry.stalled) {
       this.completed.add(id);
-      log.info("worker completed; continuation check scheduled");
+      log.info("worker completed; continuation check scheduled", run);
       this.scheduleRetry(entry.issue, 1, null, CONTINUATION_DELAY_MS);
       return;
     }
     const attempt = (entry.attempt ?? 0) + 1;
     const reason = entry.stalled ? "stalled" : error!.message;
-    log.warn("worker failed; retrying", { attempt, error: reason });
+    log.warn("worker failed; retrying", { attempt, error: reason, ...run });
     this.scheduleRetry(entry.issue, attempt, `worker exited: ${reason}`);
   }
 
@@ -377,6 +517,11 @@ export class Orchestrator {
     if (!isActiveState(config, issue.state) || !isRoutable(config, issue)) {
       this.claimed.delete(id);
       log.info("claim released: issue not active or not routable", { state: issue.state });
+      return;
+    }
+    if (!(await this.admit(issue, config))) {
+      this.claimed.delete(id);
+      log.info("claim released: run limits reached");
       return;
     }
     const problem = this.preflight(workflow);

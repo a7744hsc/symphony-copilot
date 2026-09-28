@@ -1,6 +1,8 @@
 #!/usr/bin/env node
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { scrubEnvironment } from "./env.ts";
+import { RunLedger } from "./ledger.ts";
 import { createLogger } from "./log.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { runAgentAttempt } from "./runner.ts";
@@ -42,8 +44,10 @@ function main(): Promise<number> | number {
   const dryRun = args.values["dry-run"];
 
   let store: WorkflowStore;
+  let ledger: RunLedger;
   try {
     store = new WorkflowStore(args.positionals[0] ?? "WORKFLOW.md", log);
+    ledger = new RunLedger(join(store.workflow.config.workspace.root, ".symphony-ledger.json"), { readOnly: dryRun });
   } catch (error) {
     log.error("startup failed", { error: (error as Error).message });
     return 1;
@@ -52,6 +56,7 @@ function main(): Promise<number> | number {
   const orchestrator = new Orchestrator({
     log,
     dryRun,
+    ledger,
     refreshWorkflow: () => store.refresh(),
     workflowError: () => store.reloadError,
     createTracker: (config) => createTracker(config, process.env, log),
@@ -77,7 +82,7 @@ function main(): Promise<number> | number {
   process.on("unhandledRejection", (reason) => log.error("unhandled rejection", { error: String(reason) }));
 
   return (async () => {
-    log.info("starting", { workflow: store.path, dry_run: dryRun, once: args.values.once, workspace_root: store.workflow.config.workspace.root });
+    log.info("starting", { workflow: store.path, dry_run: dryRun, once: args.values.once, workspace_root: store.workflow.config.workspace.root, ledger: ledger.path });
     try {
       if (args.values.once) {
         await orchestrator.runOnce();

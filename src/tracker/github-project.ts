@@ -20,6 +20,7 @@ export interface GitHubProjectSettings {
   branchPrefix: string;
   agentStates: string[];
   handoffState: string | null;
+  blockedState: string | null;
 }
 
 const NO_STATUS = "No Status";
@@ -48,6 +49,8 @@ export function parseSettings(provider: Record<string, unknown>, env: NodeJS.Pro
   }
   const handoff = provider.handoff_state;
   if (handoff !== undefined && handoff !== null && typeof handoff !== "string") throw new TrackerError("invalid_tracker_config", "tracker.provider.handoff_state must be a string");
+  const blocked = provider.blocked_state;
+  if (blocked !== undefined && blocked !== null && typeof blocked !== "string") throw new TrackerError("invalid_tracker_config", "tracker.provider.blocked_state must be a string");
   return {
     endpoint: str("endpoint", "https://api.github.com/graphql"),
     token,
@@ -63,6 +66,7 @@ export function parseSettings(provider: Record<string, unknown>, env: NodeJS.Pro
     branchPrefix: str("branch_prefix", "agent/"),
     agentStates: agentStates as string[],
     handoffState: typeof handoff === "string" && handoff.trim() !== "" ? handoff.trim() : null,
+    blockedState: typeof blocked === "string" && blocked.trim() !== "" ? blocked.trim() : null,
   };
 }
 
@@ -216,6 +220,16 @@ export class GitHubProjectTracker implements TrackerAdapter {
     const names = ["SYMPHONY_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
     if (this.settings.tokenEnvName) names.push(this.settings.tokenEnvName);
     return [...new Set(names)];
+  }
+
+  async commentOnIssue(issue: Issue, body: string): Promise<void> {
+    await this.addComment(this.issueNodeId(issue), body);
+  }
+
+  async blockIssue(issue: Issue): Promise<string | null> {
+    if (!this.settings.blockedState) return null;
+    await this.setStatus(issue, this.settings.blockedState);
+    return this.settings.blockedState;
   }
 
   async fetchIssuesByStates(states: string[]): Promise<Issue[]> {

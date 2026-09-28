@@ -40,6 +40,8 @@ export interface AgentUpdate {
   turn?: number;
   message?: string;
   tokens?: TokenTotals;
+  /** Absolute AI credits used by this session so far. */
+  aiCredits?: number;
   rateLimits?: unknown;
 }
 
@@ -145,6 +147,7 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
   await p.workspaces.hook(config, "before_run", workspace, p.issue, true);
   let client: CopilotClient | null = null;
   let session: CopilotSession | null = null;
+  let nanoAiu = 0;
   try {
     assertInsideRoot(config.workspace.root, workspace.path);
     if (p.signal.aborted) throw new RunError("canceled", String(p.signal.reason ?? "canceled"));
@@ -203,6 +206,8 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
             tokens.output += event.data.outputTokens ?? 0;
             tokens.total = tokens.input + tokens.output;
             update.tokens = { ...tokens };
+            nanoAiu += event.data.copilotUsage?.totalNanoAiu ?? 0;
+            update.aiCredits = nanoAiu / 1e9;
           }
           p.onUpdate(update);
         },
@@ -229,6 +234,8 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
           ai_credits: metrics.totalNanoAiu === undefined ? null : Number((metrics.totalNanoAiu / 1e9).toFixed(4)),
         });
       }
+      const finalNanoAiu = Math.max(nanoAiu, metrics?.totalNanoAiu ?? 0);
+      p.onUpdate({ event: "session_usage", timestamp: new Date(), sessionId: session.sessionId, aiCredits: finalNanoAiu / 1e9 });
       await session.disconnect().catch(() => {});
     }
     if (client) await stopClient(client, p.log);

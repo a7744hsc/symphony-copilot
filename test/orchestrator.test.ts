@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { LedgerError, RunLedger } from "../src/ledger.ts";
 import { Orchestrator, retryDelayMs, sortForDispatch, type WorkerParams } from "../src/orchestrator.ts";
 import type { TrackerAdapter } from "../src/tracker/index.ts";
 import { normalizeState, type Issue } from "../src/types.ts";
@@ -8,6 +12,8 @@ import { captureLog, flush, makeConfig, makeIssue, makeWorkflow } from "./helper
 class FakeTracker implements TrackerAdapter {
   readonly kind = "fake";
   readonly issues = new Map<string, Issue>();
+  readonly comments: string[] = [];
+  blockedState: string | null = "Blocked";
   refreshFails = false;
   add(...issues: Issue[]) {
     for (const issue of issues) this.issues.set(issue.id, issue);
@@ -29,6 +35,13 @@ class FakeTracker implements TrackerAdapter {
   secretEnvironmentNames() {
     return [];
   }
+  async commentOnIssue(issue: Issue, body: string) {
+    this.comments.push(`${issue.id}: ${body}`);
+  }
+  async blockIssue(issue: Issue) {
+    if (this.blockedState) this.set(issue.id, { state: this.blockedState });
+    return this.blockedState;
+  }
 }
 
 interface WorkerCall {
@@ -38,7 +51,7 @@ interface WorkerCall {
   aborted: boolean;
 }
 
-function setup(t: TestContext, raw: Record<string, any> = {}, dryRun = false) {
+function setup(t: TestContext, raw: Record<string, any> = {}, dryRun = false, ledger?: RunLedger) {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
   const config = makeConfig({ polling: { interval_ms: 3_600_000 }, ...raw });
   const workflow = makeWorkflow(config);
@@ -49,6 +62,7 @@ function setup(t: TestContext, raw: Record<string, any> = {}, dryRun = false) {
   const orchestrator = new Orchestrator({
     log,
     dryRun,
+    ledger,
     refreshWorkflow: () => workflow,
     workflowError: () => null,
     createTracker: () => tracker,
@@ -256,4 +270,119 @@ test("stop aborts running workers and cancels retries", async (t) => {
   assert.equal(s.calls[0]!.aborted, true);
   assert.equal(s.orchestrator.snapshot().retrying.length, 0);
   assert.deepEqual(s.removed, []);
+});
+
+/** One started session that ends normally, optionally reporting AI credits. */
+async function finishSession(s: ReturnType<typeof setup>, index: number, aiCredits?: number) {
+  const call = s.calls[index]!;
+  call.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: `sess-${index}` });
+  if (aiCredits !== undefined) call.params.onUpdate({ event: "session_usage", timestamp: new Date(), aiCredits });
+  call.resolve();
+  await flush();
+}
+
+test("a run that keeps ending without a handoff is halted after max_sessions", async (t) => {
+  const s = setup(t, { agent: { max_sessions: 2 } });
+  s.tracker.add(issue("A"));
+  await s.tick();
+  await finishSession(s, 0);
+  await s.advance(1_000);
+  assert.equal(s.calls.length, 2, "the continuation starts a second session");
+  await finishSession(s, 1);
+  await s.advance(1_000);
+  assert.equal(s.calls.length, 2, "no third session");
+  assert.equal(s.tracker.issues.get("A")!.state, "Blocked");
+  assert.match(s.tracker.comments[0] ?? "", /all 2 sessions.*moved to "Blocked"/s);
+  assert.ok(s.lines.some((l) => l.includes("issue halted")));
+  assert.equal(s.orchestrator.snapshot().retrying.length, 0);
+
+  await s.tick();
+  assert.ok(s.lines.some((l) => l.includes("run closed") && l.includes("state=\"not active\"")));
+  s.tracker.set("A", { state: "Todo" });
+  await s.tick();
+  assert.equal(s.calls.length, 3, "moving the card back starts a new run");
+  assert.equal(s.orchestrator.snapshot().running[0]!.run.sessions, 0);
+});
+
+test("the AI credit budget stops a worker mid-session and is never exceeded by a new session", async (t) => {
+  const s = setup(t, { copilot: { max_ai_credits_per_issue: 10 } });
+  s.tracker.add(issue("A"));
+  await s.tick();
+  const update = s.calls[0]!.params.onUpdate;
+  update({ event: "session_started", timestamp: new Date(), sessionId: "sess" });
+  update({ event: "assistant.usage", timestamp: new Date(), aiCredits: 4 });
+  assert.equal(s.calls[0]!.aborted, false);
+  update({ event: "assistant.usage", timestamp: new Date(), aiCredits: 10.5 });
+  assert.equal(s.calls[0]!.aborted, true);
+  await flush();
+  assert.equal(s.tracker.issues.get("A")!.state, "Blocked");
+  assert.match(s.tracker.comments[0] ?? "", /budget: 10\.5 of 10/);
+  assert.equal(s.orchestrator.snapshot().retrying.length, 0);
+  await s.advance(600_000);
+  assert.equal(s.calls.length, 1);
+});
+
+test("without a blocked state, a halted issue waits until a person moves it", async (t) => {
+  const s = setup(t, { agent: { max_sessions: 1 } });
+  s.tracker.blockedState = null;
+  s.tracker.add(issue("A"));
+  await s.tick();
+  await finishSession(s, 0);
+  await s.advance(1_000);
+  await s.tick();
+  assert.equal(s.calls.length, 1);
+  assert.equal(s.tracker.issues.get("A")!.state, "Todo");
+  assert.match(s.tracker.comments[0] ?? "", /Move the card to a different column/);
+  assert.equal(s.orchestrator.snapshot().halted[0]!.issue_identifier, "GH-A");
+
+  s.tracker.set("A", { state: "In Progress" });
+  await s.tick();
+  assert.equal(s.calls.length, 2);
+  assert.equal(s.orchestrator.snapshot().halted.length, 0);
+});
+
+test("a handoff ends the run, so rework starts with fresh limits", async (t) => {
+  const s = setup(t, { agent: { max_sessions: 1 } });
+  s.tracker.add(issue("A"));
+  await s.tick();
+  s.tracker.set("A", { state: "Human Review" });
+  await finishSession(s, 0, 3);
+  await s.advance(1_000);
+  await s.tick();
+  assert.ok(s.lines.some((l) => l.includes("run closed") && l.includes("sessions=1") && l.includes("ai_credits=3")));
+  s.tracker.set("A", { state: "Todo" });
+  await s.tick();
+  assert.equal(s.calls.length, 2);
+  assert.deepEqual(s.tracker.comments, []);
+});
+
+test("run limits survive a restart through the ledger file", async (t) => {
+  const path = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.json");
+  const first = setup(t, { copilot: { max_ai_credits_per_issue: 10 } }, false, new RunLedger(path));
+  first.tracker.add(issue("A"));
+  await first.tick();
+  first.calls[0]!.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: "s1" });
+  first.calls[0]!.params.onUpdate({ event: "assistant.usage", timestamp: new Date(), aiCredits: 6 });
+  await first.orchestrator.stop();
+  t.mock.timers.reset();
+
+  const reloaded = new RunLedger(path);
+  assert.equal(reloaded.get("A")!.sessions, 1);
+  assert.equal(reloaded.get("A")!.aiCredits, 6);
+  const second = setup(t, { copilot: { max_ai_credits_per_issue: 10 } }, false, reloaded);
+  second.tracker.add(issue("A"));
+  await second.tick();
+  second.calls[0]!.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: "s2" });
+  second.calls[0]!.params.onUpdate({ event: "assistant.usage", timestamp: new Date(), aiCredits: 4 });
+  assert.equal(second.calls[0]!.aborted, true, "6 + 4 reaches the budget of 10");
+});
+
+test("a corrupt ledger fails startup instead of resetting limits; dry runs never write", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ledger-"));
+  writeFileSync(join(dir, "bad.json"), "{ nope");
+  assert.throws(() => new RunLedger(join(dir, "bad.json")), LedgerError);
+  const readOnly = new RunLedger(join(dir, "ro.json"), { readOnly: true });
+  readOnly.open("A", "GH-A", new Date());
+  readOnly.save();
+  assert.equal(new RunLedger(join(dir, "ro.json")).get("A"), undefined);
 });

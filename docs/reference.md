@@ -50,6 +50,7 @@ Optional, with defaults:
 | `branch_prefix` | `agent/` | Prefix for agent branches |
 | `agent_states` | None | States the agent may set with `tracker_set_status`; without it, that tool is not offered |
 | `handoff_state` | None | State set by `tracker_submit_for_review`; without it, the state is left alone |
+| `blocked_state` | None | State the orchestrator moves a card to when its run reaches a [run limit](../README.md#run-limits); without it, the card stays where it is and is skipped until someone moves it |
 
 A bad setting is reported as `invalid_tracker_config`, and a missing token as `missing_tracker_secret`.
 
@@ -100,6 +101,7 @@ If a tool fails, it returns a failure result and the session continues.
 
 ## Differences from the spec
 
+- Run limits (`agent.max_sessions`, `copilot.max_ai_credits_per_issue`) are an addition. The spec keeps dispatching an active issue indefinitely; here a run that reaches a limit is halted until the issue leaves the active states. The per-run counts are the only state kept across restarts (`.symphony-ledger.json` under `workspace.root`); a corrupt ledger fails startup rather than silently resetting the limits.
 - The optional HTTP status API (§13.7) is not implemented yet. `Orchestrator.snapshot()` already returns the data described in §13.3.
 - As in the spec, the retry queue is not persisted. After a restart, the orchestrator recovers from the board and the workspaces that are still on disk.
 - A workspace path that already exists as a file or symlink fails the attempt; it is never deleted or replaced.

@@ -14,6 +14,8 @@ test("defaults apply when optional values are missing", () => {
   assert.equal(c.hooks.timeoutMs, 60_000);
   assert.equal(c.agent.maxConcurrentAgents, 10);
   assert.equal(c.agent.maxTurns, 20);
+  assert.equal(c.agent.maxSessions, 5);
+  assert.equal(c.copilot.maxAiCreditsPerIssue, null);
   assert.equal(c.agent.maxRetryBackoffMs, 300_000);
   assert.equal(c.copilot.turnTimeoutMs, 3_600_000);
   assert.equal(c.copilot.stallTimeoutMs, 300_000);

@@ -13,6 +13,7 @@ tracker:
     priority_field: Priority         # single select like P1, P2, ... (lower runs first)
     agent_states: [In Progress, Blocked]
     handoff_state: Human Review
+    blocked_state: Blocked           # where the orchestrator puts cards that reach a run limit
   required_labels: [agent]           # only cards with this label are dispatched
   active_states: [Todo, In Progress, Rework]
   terminal_states: [Done, Canceled]
@@ -31,9 +32,10 @@ hooks:
 agent:
   max_concurrent_agents: 2
   max_turns: 6
+  max_sessions: 3                    # per card per run
 copilot:
   model: auto
-  max_ai_credits: 30                 # soft cap per session
+  max_ai_credits_per_issue: 100      # per card per run; the model is not told
   shell_allow: [npm test, npm run]   # added to the built-in git and file tools
 ---
 You are the developer agent for this repository, working on {{ issue.identifier }}: {{ issue.title }}

@@ -13,6 +13,8 @@ export interface HooksConfig {
 export interface AgentConfig {
   maxConcurrentAgents: number;
   maxTurns: number;
+  /** Copilot sessions allowed per issue per run (until the issue leaves the active states). */
+  maxSessions: number;
   maxRetryBackoffMs: number;
   /** Keys are normalized state names. */
   maxConcurrentAgentsByState: Record<string, number>;
@@ -25,6 +27,8 @@ export interface CopilotConfig {
   model: string | null;
   reasoningEffort: string | null;
   maxAiCredits: number | null;
+  /** Enforced by the orchestrator across sessions; the model is never told about it. */
+  maxAiCreditsPerIssue: number | null;
   startupTimeoutMs: number;
   turnTimeoutMs: number;
   stallTimeoutMs: number;
@@ -189,6 +193,7 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
     agent: {
       maxConcurrentAgents: integer(agent.max_concurrent_agents, 10, "agent.max_concurrent_agents", problems, 1),
       maxTurns: integer(agent.max_turns, 20, "agent.max_turns", problems, 1),
+      maxSessions: integer(agent.max_sessions, 5, "agent.max_sessions", problems, 1),
       maxRetryBackoffMs: integer(agent.max_retry_backoff_ms, 300_000, "agent.max_retry_backoff_ms", problems, 1_000),
       maxConcurrentAgentsByState: byState,
       continuationPrompt: text(agent.continuation_prompt, "agent.continuation_prompt", problems) ?? DEFAULT_CONTINUATION,
@@ -198,6 +203,7 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
       model: text(copilot.model, "copilot.model", problems),
       reasoningEffort: text(copilot.reasoning_effort, "copilot.reasoning_effort", problems),
       maxAiCredits: optionalInteger(copilot.max_ai_credits, "copilot.max_ai_credits", problems, 1),
+      maxAiCreditsPerIssue: optionalInteger(copilot.max_ai_credits_per_issue, "copilot.max_ai_credits_per_issue", problems, 1),
       startupTimeoutMs: integer(copilot.startup_timeout_ms, 60_000, "copilot.startup_timeout_ms", problems, 1),
       turnTimeoutMs: integer(copilot.turn_timeout_ms, 3_600_000, "copilot.turn_timeout_ms", problems, 1),
       stallTimeoutMs: integer(copilot.stall_timeout_ms, 300_000, "copilot.stall_timeout_ms", problems, -Infinity),

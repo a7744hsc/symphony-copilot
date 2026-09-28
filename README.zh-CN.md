@@ -10,7 +10,7 @@ Symphony 的理念是“管理工作，而不是管理 agent”：你写 Issue�
 
 - **内核是 Symphony，引擎是 Copilot。** 按规范实现了轮询、每个 Issue 一个工作区、多轮会话、与看板对账、卡死检测、退避重试，以及保存即生效的 `WORKFLOW.md`。
 - **本地运行。** agent 就在你电脑上的目录里干活，用你的编译器、SDK、模拟器、数据库和有授权的工具。不用准备容器、虚拟机或 runner。
-- **零额外成本。** 不要 API key，不要云主机，不耗 Actions 分钟数。会话走你现有的 Copilot 套餐，和 Copilot CLI 一样计量；`max_ai_credits` 给每个会话设上限。[^cost]
+- **零额外成本。** 不要 API key，不要云主机，不耗 Actions 分钟数。会话走你现有的 Copilot 套餐，和 Copilot CLI 一样计量；每张卡片有[运行上限](#运行上限)，花费有封顶。[^cost]
 - **看板就是界面。** 把卡片拖到 Todo，PR 就会出现，卡片同时移到 Human Review。拖到 Rework，agent 会读审核意见接着改。
 - **默认有护栏。** 只能写工作区内的文件；shell 命令要在白名单里；不能联网；令牌不交给 agent；推送只能通过调度器的 `tracker_submit_for_review` 工具。
 - **小而易读。** 约 2400 行 TypeScript，不用编译，60 多个单元测试。
@@ -96,14 +96,15 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 
 `WORKFLOW.md` 由 YAML front matter 和一个 [Liquid](https://liquidjs.com/) 提示词模板组成；未知的变量和过滤器都会报错。保存了无效的文件时，调度器记录错误，继续用上一份有效配置。
 
-规范里的键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都不变，只多了 `agent.continuation_prompt`：之后每一轮开头发送的消息，可用变量 `issue`、`turn`、`max_turns`。
+规范里的键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都不变，只多了两个：`agent.continuation_prompt`，之后每一轮开头发送的消息，可用变量 `issue`、`turn`、`max_turns`；`agent.max_sessions`，见[运行上限](#运行上限)。
 
 `copilot` 块是本实现特有的：
 
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `model`、`reasoning_effort` | 运行时默认 | 传给 Copilot 会话 |
-| `max_ai_credits` | 无上限 | 每个会话的软上限。用完后本次尝试结束，稍后重试。 |
+| `max_ai_credits_per_issue` | 无上限 | 每张卡片每次运行的 AI credits 预算，由调度器执行，见[运行上限](#运行上限) |
+| `max_ai_credits` | 无上限 | 由 Copilot 运行时执行的单个会话上限。运行时会把用量告诉模型，测试中模型因此偷工；建议改用 `max_ai_credits_per_issue`。 |
 | `shell_allow` | 内置列表 | 在内置的 git 和文件工具**之外**额外允许的命令 |
 | `shell_deny` | 内置列表 | 在内置列表之外额外禁止的命令；禁止优先 |
 | `read_allow` | 无 | 工作区之外允许 agent 读取的目录 |
@@ -117,6 +118,19 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 hook 用 `bash -lc` 在工作区里执行，环境变量里去掉了 tracker 令牌，并加上 `SYMPHONY_ISSUE_ID`、`SYMPHONY_ISSUE_IDENTIFIER`、`SYMPHONY_ISSUE_BRANCH`、`SYMPHONY_WORKSPACE`、`SYMPHONY_WORKSPACE_KEY`。
 
 GitHub Project 适配器的设置、agent 工具、错误分类，以及规范如何对应到 Copilot SDK，见 [docs/reference.md](docs/reference.md)（英文）。
+
+## 运行上限
+
+“一次运行”指一张卡片的一段连续工作：从卡片被派发开始，到调度器看到卡片离开活跃列为止（交接审核、受阻、完成，或被你移走）。按规范，只要卡片还在活跃列就会不断开新会话，一张始终不交接的卡片可能无限花钱。所以调度器对每次运行设两个上限：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `agent.max_sessions` | 5 | 每次运行最多几个 Copilot 会话。一个会话在跑满 `max_turns` 轮或 agent 停下时结束。 |
+| `copilot.max_ai_credits_per_issue` | 无上限 | 每次运行的 AI credits，按每次模型调用实时累计，一到预算就停下会话。 |
+
+碰到上限时，调度器停下 agent，在 Issue 下留言说明这次运行用了多少，如果设了 `tracker.provider.blocked_state` 就把卡片移过去。工作区保留。把卡片拖回活跃列就开始新的一次运行，上限重新计算；交接后返工也一样。
+
+模型永远看不到这两个上限。用量保存在 `workspace.root` 下的 `.symphony-ledger.json`，重启调度器不会清零。无人值守运行时，请两个上限和 `blocked_state` 都设上。
 
 ## 安全模型
 

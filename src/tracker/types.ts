@@ -35,4 +35,8 @@ export interface TrackerAdapter {
   agentTools(context: AgentToolContext): Tool<any>[];
   /** Environment names that must not reach the agent process. */
   secretEnvironmentNames(): string[];
+  /** Posts an orchestrator note on the issue. */
+  commentOnIssue?(issue: Issue, body: string): Promise<void>;
+  /** Moves the issue to the configured blocked state; returns that state, or null if none is configured. */
+  blockIssue?(issue: Issue): Promise<string | null>;
 }

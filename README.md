@@ -13,7 +13,7 @@ Symphony's idea is "manage work, not agents": you write issues, and an orchestra
 
 - **Symphony with Copilot inside.** Polling, one workspace per issue, multi-turn sessions, reconciliation with the board, stall detection, retries with backoff, and a `WORKFLOW.md` that reloads on save, as the spec describes.
 - **Local runtime.** Agents work in folders on your computer, with your compilers, SDKs, simulators, databases and licensed tools. There are no containers, VMs or runners to set up.
-- **$0 extra.** No API keys, cloud machines or Actions minutes. Sessions draw on your existing Copilot plan, the same way Copilot CLI does, and `max_ai_credits` caps each session.[^cost]
+- **$0 extra.** No API keys, cloud machines or Actions minutes. Sessions draw on your existing Copilot plan, the same way Copilot CLI does, and per-card [run limits](#run-limits) cap what any one card can spend.[^cost]
 - **The board is the UI.** Move a card to Todo and a pull request appears, with the card moved to Human Review. Move the card to Rework and the agent reads the review and continues.
 - **Guardrails by default.** Writes stay inside the workspace. Shell commands must be on an allowlist. Network access is off. Tokens are never passed to the agent. The only way to push is the orchestrator's `tracker_submit_for_review` tool.
 - **Small and readable.** About 2,400 lines of TypeScript with no build step, and 60+ unit tests.
@@ -99,14 +99,15 @@ Then label an issue `agent`, move its card to Todo, and watch the log.
 
 `WORKFLOW.md` has YAML front matter followed by a [Liquid](https://liquidjs.com/) prompt template. Unknown variables and filters are errors. If you save an invalid file, the orchestrator logs the error and keeps using the last valid version.
 
-The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their meaning and defaults. There is one addition, `agent.continuation_prompt`: the message sent at the start of each later turn, with the variables `issue`, `turn` and `max_turns`.
+The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their meaning and defaults. There are two additions: `agent.continuation_prompt`, the message sent at the start of each later turn (variables `issue`, `turn` and `max_turns`), and `agent.max_sessions` (see [Run limits](#run-limits)).
 
 The `copilot` block is specific to this implementation:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `model`, `reasoning_effort` | Runtime default | Passed to the Copilot session |
-| `max_ai_credits` | No limit | Soft cap per session. When it is reached, the attempt ends and is retried later. |
+| `max_ai_credits_per_issue` | No limit | AI credit budget per card per run, enforced by the orchestrator (see [Run limits](#run-limits)) |
+| `max_ai_credits` | No limit | Per-session cap enforced by the Copilot runtime. The runtime tells the model how much it has used, which made agents cut corners in testing; prefer `max_ai_credits_per_issue`. |
 | `shell_allow` | Built-in list | Commands to allow **in addition to** the built-in git and file tools |
 | `shell_deny` | Built-in list | Commands to deny in addition to the built-in list. Deny always wins. |
 | `read_allow` | None | Directories outside the workspace that the agent may read |
@@ -120,6 +121,19 @@ The `copilot` block is specific to this implementation:
 Hooks run with `bash -lc` inside the workspace. Tracker tokens are removed from their environment, and these variables are added: `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_ISSUE_BRANCH`, `SYMPHONY_WORKSPACE`, `SYMPHONY_WORKSPACE_KEY`.
 
 See [docs/reference.md](docs/reference.md) for the GitHub Project adapter settings, the agent tools, error categories and how the spec maps onto the Copilot SDK.
+
+## Run limits
+
+A *run* is one stretch of work on a card. It starts when the card is dispatched and ends when the orchestrator sees the card outside the active columns: handed off, blocked, done, or moved by you. The spec keeps starting sessions for as long as a card stays active, so a card that never hands off could spend credits forever. The orchestrator enforces two limits per run:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `agent.max_sessions` | 5 | Copilot sessions per run. A session ends after `max_turns` turns or when the agent stops. |
+| `copilot.max_ai_credits_per_issue` | No limit | AI credits per run, counted live from every model call. The session is stopped as soon as the budget is reached. |
+
+When a run reaches a limit, the orchestrator stops the agent, comments on the issue with what the run used, and moves the card to `tracker.provider.blocked_state` if you set one. The workspace is kept. Moving the card back to an active column starts a new run with fresh limits, and so does rework after a handoff.
+
+The model is never told about these limits. Usage is saved in `.symphony-ledger.json` under `workspace.root`, so restarting the orchestrator does not reset it. For unattended use, set both limits and a `blocked_state`.
 
 ## Safety model
 
