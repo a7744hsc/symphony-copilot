@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
 import { isActiveState, isRoutable, isTerminalState, type ServiceConfig } from "./config.ts";
 import { RunLedger, type RunCycle } from "./ledger.ts";
-import type { Logger } from "./log.ts";
-import type { AgentUpdate, TokenTotals } from "./runner.ts";
+import { truncate, type Logger } from "./log.ts";
+import type { AgentUpdate, SessionSummary, TokenTotals } from "./runner.ts";
 import type { TrackerAdapter } from "./tracker/index.ts";
 import { normalizeState, type Issue } from "./types.ts";
 import type { EffectiveWorkflow } from "./workflow.ts";
@@ -47,6 +47,7 @@ interface RunningEntry {
   lastReported: TokenTotals;
   cycle: RunCycle | null;
   lastReportedCredits: number;
+  summary: SessionSummary | null;
   /** Set when the orchestrator stops the worker because the run hit a limit. */
   halt: string | null;
   termination: { cleanup: boolean; reason: string } | null;
@@ -79,6 +80,37 @@ export function retryDelayMs(attempt: number, maxBackoffMs: number): number {
 }
 
 const credits = (value: number) => Number(value.toFixed(2));
+
+function compact(n: number): string {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(n);
+}
+
+export function formatDuration(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/** Markdown usage report for one session, posted on the issue. */
+export function formatUsageReport(s: SessionSummary, cycle: RunCycle | null, config: ServiceConfig, headline: string, elapsedMs: number): string {
+  const models = s.models.length > 0 ? s.models.map((m) => `${m.model} (${m.requests} calls)`).join(", ") : "unknown";
+  const budget = config.copilot.maxAiCreditsPerIssue;
+  const run = cycle ? ` · ${credits(cycle.aiCredits)}${budget !== null ? ` of ${budget}` : ""} this run` : "";
+  const code = s.code ? ` · Code: +${s.code.linesAdded} −${s.code.linesRemoved} in ${s.code.files} files` : "";
+  const premium = s.premiumRequests !== null ? ` · Premium requests: ${s.premiumRequests}` : "";
+  return [
+    `**symphony-copilot · session ${cycle?.sessions ?? "?"} of ${config.agent.maxSessions} · ${headline}**`,
+    "",
+    `- Model: ${models}`,
+    `- Turns: ${s.turns} of ${config.agent.maxTurns} · Time: ${formatDuration(elapsedMs)}${code}`,
+    `- AI credits: ${credits(s.aiCredits)} this session${run}`,
+    `- Tokens: ${compact(s.inputTokens)} in · ${compact(s.outputTokens)} out${premium}`,
+  ].join("\n");
+}
 
 /** Why this run may not start another session, or null. */
 export function runLimitReached(cycle: RunCycle, config: ServiceConfig): string | null {
@@ -315,7 +347,7 @@ export class Orchestrator {
   }
 
   /** Tells people on the issue why work stopped, and moves the card out of the active states if the tracker can. */
-  private async reportHalt(issue: Issue, cycle: RunCycle): Promise<void> {
+  private async reportHalt(issue: Issue, cycle: RunCycle, usage: string | null = null): Promise<void> {
     const tracker = this.tracker;
     const log = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
     let moved: string | null = null;
@@ -332,7 +364,8 @@ export class Orchestrator {
       ? `The card was moved to "${moved}". Move it back to an active column to start a new run with fresh limits.`
       : "Move the card to a different column (for example out of the active columns and back) to start a new run with fresh limits.";
     const body = `**symphony-copilot stopped working on this issue.** ${cycle.halted?.reason ?? ""}\n\n`
-      + `This run used ${cycle.sessions} session(s) and ${credits(cycle.aiCredits)} AI credits. ${next}`;
+      + `This run used ${cycle.sessions} session(s) and ${credits(cycle.aiCredits)} AI credits. ${next}`
+      + (usage ? `\n\n${usage}` : "");
     try {
       await tracker?.commentOnIssue?.(issue, body);
     } catch (error) {
@@ -374,7 +407,7 @@ export class Orchestrator {
     const entry: RunningEntry = {
       issue, abort, attempt, startedAt: this.now(), threadId: null, turnCount: 0, lastEvent: null, lastEventAt: null, lastMessage: null,
       tokens: { input: 0, output: 0, total: 0 }, lastReported: { input: 0, output: 0, total: 0 },
-      cycle: this.ledger.open(issue.id, issue.identifier, new Date(this.now())), lastReportedCredits: 0, halt: null,
+      cycle: this.ledger.open(issue.id, issue.identifier, new Date(this.now())), lastReportedCredits: 0, summary: null, halt: null,
       termination: null, stalled: false,
       done: Promise.resolve(),
     };
@@ -398,6 +431,7 @@ export class Orchestrator {
     if (update.sessionId) entry.threadId = update.sessionId;
     if (update.turn && update.turn > entry.turnCount) entry.turnCount = update.turn;
     if (update.rateLimits !== undefined) this.rateLimits = update.rateLimits;
+    if (update.summary) entry.summary = update.summary;
     if (update.tokens) {
       // Absolute per-session totals: only the growth since the last report counts (spec §13.5).
       for (const key of ["input", "output", "total"] as const) {
@@ -448,27 +482,66 @@ export class Orchestrator {
     this.totals.secondsEnded += (this.now() - entry.startedAt) / 1000;
     const log = this.log.child({ issue_id: id, issue_identifier: entry.issue.identifier });
     const run = { run_sessions: entry.cycle?.sessions ?? 0, run_ai_credits: credits(entry.cycle?.aiCredits ?? 0) };
+    const headline = this.sessionHeadline(entry, error);
     if (entry.termination) {
       this.claimed.delete(id);
       log.info("worker stopped by reconciliation", { reason: entry.termination.reason, cleanup: entry.termination.cleanup, ...run });
-      if (entry.halt && entry.cycle) await this.reportHalt(entry.issue, entry.cycle);
+      if (entry.halt && entry.cycle) await this.reportHalt(entry.issue, entry.cycle, this.sessionReport(entry, headline));
+      else await this.reportSession(entry, headline);
       if (entry.termination.cleanup) await this.safeRemove(entry.issue);
       return;
     }
     if (this.stopped) {
       log.info("worker finished during shutdown", { error: error?.message ?? null, ...run });
+      await this.reportSession(entry, headline);
       return;
     }
     if (!error && !entry.stalled) {
       this.completed.add(id);
       log.info("worker completed; continuation check scheduled", run);
       this.scheduleRetry(entry.issue, 1, null, CONTINUATION_DELAY_MS);
+      await this.reportSession(entry, headline);
       return;
     }
     const attempt = (entry.attempt ?? 0) + 1;
     const reason = entry.stalled ? "stalled" : error!.message;
     log.warn("worker failed; retrying", { attempt, error: reason, ...run });
     this.scheduleRetry(entry.issue, attempt, `worker exited: ${reason}`);
+    await this.reportSession(entry, headline);
+  }
+
+  private sessionHeadline(entry: RunningEntry, error: Error | null): string {
+    if (entry.halt) return "stopped: run limit reached";
+    if (entry.termination) return `stopped: ${entry.termination.reason}`;
+    if (error || entry.stalled) return `failed: ${entry.stalled ? "stalled" : truncate(error!.message, 200)}`;
+    const state = entry.summary?.finalState ?? entry.issue.state;
+    const config = this.trackerConfig;
+    return config && isActiveState(config, state) ? `card still "${state}"` : `card now "${state}"`;
+  }
+
+  /** Logs the session's usage and returns the issue comment for it, or null if no session started. */
+  private sessionReport(entry: RunningEntry, headline: string): string | null {
+    const s = entry.summary;
+    const config = this.trackerConfig;
+    if (!s || !config) return null;
+    const elapsed = this.now() - entry.startedAt;
+    this.log.info("session summary", {
+      issue_id: entry.issue.id, issue_identifier: entry.issue.identifier, session_id: s.sessionId, outcome: headline,
+      models: s.models.map((m) => `${m.model}:${m.requests}`).join(","), turns: s.turns, ai_credits: credits(s.aiCredits),
+      run_sessions: entry.cycle?.sessions ?? 0, run_ai_credits: credits(entry.cycle?.aiCredits ?? 0),
+      input_tokens: s.inputTokens, output_tokens: s.outputTokens, premium_requests: s.premiumRequests, seconds: Math.round(elapsed / 1000),
+    });
+    return formatUsageReport(s, entry.cycle, config, headline, elapsed);
+  }
+
+  private async reportSession(entry: RunningEntry, headline: string): Promise<void> {
+    const report = this.sessionReport(entry, headline);
+    if (!report || !this.trackerConfig?.agent.usageComments || !this.tracker?.commentOnIssue) return;
+    try {
+      await this.tracker.commentOnIssue(entry.issue, report);
+    } catch (error) {
+      this.log.warn("could not post usage comment", { issue_id: entry.issue.id, issue_identifier: entry.issue.identifier, error: (error as Error).message });
+    }
   }
 
   // ---- retries ----

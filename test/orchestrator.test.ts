@@ -386,3 +386,51 @@ test("a corrupt ledger fails startup instead of resetting limits; dry runs never
   readOnly.save();
   assert.equal(new RunLedger(join(dir, "ro.json")).get("A"), undefined);
 });
+
+const summary = {
+  sessionId: "sess", turns: 1, models: [{ model: "claude-opus-5.5", requests: 21, aiCredits: 54.38 }], aiCredits: 54.38,
+  premiumRequests: 1, inputTokens: 785_701, outputTokens: 9_876, code: { linesAdded: 4, linesRemoved: 4, files: 2 }, finalState: "Human Review",
+};
+
+test("every session posts a usage summary on the issue and in the log", async (t) => {
+  const s = setup(t, { copilot: { max_ai_credits_per_issue: 300 } });
+  s.tracker.add(issue("A"));
+  await s.tick();
+  const call = s.calls[0]!;
+  call.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: "sess" });
+  await s.advance(392_000);
+  call.params.onUpdate({ event: "session_usage", timestamp: new Date(), aiCredits: 54.38, summary });
+  call.resolve();
+  await flush();
+  const comment = s.tracker.comments[0] ?? "";
+  assert.match(comment, /session 1 of 5 · card now "Human Review"/);
+  assert.match(comment, /Model: claude-opus-5\.5 \(21 calls\)/);
+  assert.match(comment, /Turns: 1 of 20 · Time: 6m 32s · Code: \+4 −4 in 2 files/);
+  assert.match(comment, /AI credits: 54\.38 this session · 54\.38 of 300 this run/);
+  assert.match(comment, /Tokens: 785\.7k in · 9\.9k out · Premium requests: 1/);
+  assert.ok(s.lines.some((l) => l.includes("session summary") && l.includes("models=claude-opus-5.5:21")));
+});
+
+test("usage comments can be turned off; a budget halt folds the usage into its notice", async (t) => {
+  const quiet = setup(t, { agent: { usage_comments: false } });
+  quiet.tracker.add(issue("A"));
+  await quiet.tick();
+  quiet.calls[0]!.params.onUpdate({ event: "session_started", timestamp: new Date(), sessionId: "sess" });
+  quiet.calls[0]!.params.onUpdate({ event: "session_usage", timestamp: new Date(), summary });
+  quiet.calls[0]!.resolve();
+  await flush();
+  assert.deepEqual(quiet.tracker.comments, []);
+  assert.ok(quiet.lines.some((l) => l.includes("session summary")), "the log still gets the summary");
+  t.mock.timers.reset();
+
+  const s = setup(t, { copilot: { max_ai_credits_per_issue: 50 } });
+  s.tracker.add(issue("B"));
+  await s.tick();
+  const update = s.calls[0]!.params.onUpdate;
+  update({ event: "session_started", timestamp: new Date(), sessionId: "sess" });
+  update({ event: "assistant.usage", timestamp: new Date(), aiCredits: 51 });
+  update({ event: "session_usage", timestamp: new Date(), aiCredits: 54.38, summary: { ...summary, finalState: "In Progress" } });
+  await flush();
+  assert.equal(s.tracker.comments.length, 1);
+  assert.match(s.tracker.comments[0]!, /stopped working.*session 1 of 5 · stopped: run limit reached/s);
+});

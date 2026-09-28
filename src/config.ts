@@ -15,6 +15,8 @@ export interface AgentConfig {
   maxTurns: number;
   /** Copilot sessions allowed per issue per run (until the issue leaves the active states). */
   maxSessions: number;
+  /** Post a usage summary on the issue after every session. */
+  usageComments: boolean;
   maxRetryBackoffMs: number;
   /** Keys are normalized state names. */
   maxConcurrentAgentsByState: Record<string, number>;
@@ -123,6 +125,13 @@ function optionalInteger(value: unknown, name: string, problems: string[], min: 
   return value === undefined || value === null ? null : integer(value, 0, name, problems, min);
 }
 
+function bool(value: unknown, fallback: boolean, name: string, problems: string[]): boolean {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === "boolean") return value;
+  problems.push(`${name} must be true or false`);
+  return fallback;
+}
+
 function text(value: unknown, name: string, problems: string[]): string | null {
   if (value === undefined || value === null) return null;
   if (typeof value === "string") return value.trim() === "" ? null : value;
@@ -194,6 +203,7 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
       maxConcurrentAgents: integer(agent.max_concurrent_agents, 10, "agent.max_concurrent_agents", problems, 1),
       maxTurns: integer(agent.max_turns, 20, "agent.max_turns", problems, 1),
       maxSessions: integer(agent.max_sessions, 5, "agent.max_sessions", problems, 1),
+      usageComments: bool(agent.usage_comments, true, "agent.usage_comments", problems),
       maxRetryBackoffMs: integer(agent.max_retry_backoff_ms, 300_000, "agent.max_retry_backoff_ms", problems, 1_000),
       maxConcurrentAgentsByState: byState,
       continuationPrompt: text(agent.continuation_prompt, "agent.continuation_prompt", problems) ?? DEFAULT_CONTINUATION,

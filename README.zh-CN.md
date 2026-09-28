@@ -96,7 +96,11 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 
 `WORKFLOW.md` 由 YAML front matter 和一个 [Liquid](https://liquidjs.com/) 提示词模板组成；未知的变量和过滤器都会报错。保存了无效的文件时，调度器记录错误，继续用上一份有效配置。
 
-规范里的键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都不变，只多了两个：`agent.continuation_prompt`，之后每一轮开头发送的消息，可用变量 `issue`、`turn`、`max_turns`；`agent.max_sessions`，见[运行上限](#运行上限)。
+规范里的键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都不变，另外多了三个：
+
+- `agent.continuation_prompt`：之后每一轮开头发送的消息，可用变量 `issue`、`turn`、`max_turns`。
+- `agent.max_sessions`：见[运行上限](#运行上限)。
+- `agent.usage_comments`（默认 `true`）：每个会话结束后，调度器在 Issue 下留言，写明结果、模型和调用次数、轮次、耗时、改动行数、AI credits（本会话和本次运行）以及 token。同样的摘要总会以 `session summary` 写进日志。
 
 `copilot` 块是本实现特有的：
 

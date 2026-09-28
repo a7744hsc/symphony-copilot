@@ -32,6 +32,20 @@ export interface TokenTotals {
   total: number;
 }
 
+/** What one Copilot session used, reported when it ends. */
+export interface SessionSummary {
+  sessionId: string;
+  turns: number;
+  models: Array<{ model: string; requests: number; aiCredits: number }>;
+  aiCredits: number;
+  premiumRequests: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  code: { linesAdded: number; linesRemoved: number; files: number } | null;
+  /** Card state from the last refresh inside the session. */
+  finalState: string;
+}
+
 /** Update sent upstream to the orchestrator (spec §10.4). Token counts are absolute per session. */
 export interface AgentUpdate {
   event: string;
@@ -42,6 +56,7 @@ export interface AgentUpdate {
   tokens?: TokenTotals;
   /** Absolute AI credits used by this session so far. */
   aiCredits?: number;
+  summary?: SessionSummary;
   rateLimits?: unknown;
 }
 
@@ -148,6 +163,10 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
   let client: CopilotClient | null = null;
   let session: CopilotSession | null = null;
   let nanoAiu = 0;
+  let turns = 0;
+  let issue = p.issue;
+  const tokens: TokenTotals = { input: 0, output: 0, total: 0 };
+  const liveModels = new Map<string, { requests: number; nanoAiu: number }>();
   try {
     assertInsideRoot(config.workspace.root, workspace.path);
     if (p.signal.aborted) throw new RunError("canceled", String(p.signal.reason ?? "canceled"));
@@ -186,13 +205,12 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
       () => {},
     );
 
-    const tokens: TokenTotals = { input: 0, output: 0, total: 0 };
-    let issue = p.issue;
     for (let turn = 1; ; turn++) {
       const prompt = turn === 1
         ? renderIssuePrompt(p.promptTemplate, issue, p.attempt)
         : renderContinuationPrompt(config.agent.continuationPrompt, issue, turn, config.agent.maxTurns);
       p.onUpdate({ event: "turn_started", timestamp: new Date(), sessionId, turn });
+      turns = turn;
       await runTurn({
         session,
         prompt,
@@ -208,6 +226,10 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
             update.tokens = { ...tokens };
             nanoAiu += event.data.copilotUsage?.totalNanoAiu ?? 0;
             update.aiCredits = nanoAiu / 1e9;
+            const model = liveModels.get(event.data.model) ?? { requests: 0, nanoAiu: 0 };
+            model.requests++;
+            model.nanoAiu += event.data.copilotUsage?.totalNanoAiu ?? 0;
+            liveModels.set(event.data.model, model);
           }
           p.onUpdate(update);
         },
@@ -235,7 +257,21 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
         });
       }
       const finalNanoAiu = Math.max(nanoAiu, metrics?.totalNanoAiu ?? 0);
-      p.onUpdate({ event: "session_usage", timestamp: new Date(), sessionId: session.sessionId, aiCredits: finalNanoAiu / 1e9 });
+      const models = metrics && Object.keys(metrics.modelMetrics).length > 0
+        ? Object.entries(metrics.modelMetrics).map(([model, m]) => ({ model, requests: m?.requests.count ?? 0, aiCredits: (m?.totalNanoAiu ?? 0) / 1e9 }))
+        : [...liveModels].map(([model, m]) => ({ model, requests: m.requests, aiCredits: m.nanoAiu / 1e9 }));
+      const summary: SessionSummary = {
+        sessionId: session.sessionId,
+        turns,
+        models,
+        aiCredits: finalNanoAiu / 1e9,
+        premiumRequests: metrics?.totalPremiumRequestCost ?? null,
+        inputTokens: tokens.input,
+        outputTokens: tokens.output,
+        code: metrics ? { linesAdded: metrics.codeChanges.linesAdded, linesRemoved: metrics.codeChanges.linesRemoved, files: metrics.codeChanges.filesModified.length } : null,
+        finalState: issue.state,
+      };
+      p.onUpdate({ event: "session_usage", timestamp: new Date(), sessionId: session.sessionId, aiCredits: summary.aiCredits, summary });
       await session.disconnect().catch(() => {});
     }
     if (client) await stopClient(client, p.log);

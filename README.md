@@ -99,7 +99,11 @@ Then label an issue `agent`, move its card to Todo, and watch the log.
 
 `WORKFLOW.md` has YAML front matter followed by a [Liquid](https://liquidjs.com/) prompt template. Unknown variables and filters are errors. If you save an invalid file, the orchestrator logs the error and keeps using the last valid version.
 
-The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their meaning and defaults. There are two additions: `agent.continuation_prompt`, the message sent at the start of each later turn (variables `issue`, `turn` and `max_turns`), and `agent.max_sessions` (see [Run limits](#run-limits)).
+The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their meaning and defaults. There are three additions:
+
+- `agent.continuation_prompt`: the message sent at the start of each later turn (variables `issue`, `turn` and `max_turns`).
+- `agent.max_sessions`: see [Run limits](#run-limits).
+- `agent.usage_comments` (default `true`): after every session, the orchestrator comments on the issue with the outcome, model and number of model calls, turns, time, lines changed, AI credits (this session and this run) and tokens. The same summary is always logged as `session summary`.
 
 The `copilot` block is specific to this implementation:
 
