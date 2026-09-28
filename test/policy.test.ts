@@ -4,12 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { PermissionRequest } from "@github/copilot-sdk";
-import { DEFAULT_READ_ALLOW, DEFAULT_SHELL_ALLOW, DEFAULT_SHELL_DENY } from "../src/config.ts";
+import { DEFAULT_SHELL_ALLOW, DEFAULT_SHELL_DENY } from "../src/config.ts";
 import { decide, ruleMatches, type PolicyOptions } from "../src/policy.ts";
 
 const ws = mkdtempSync(join(tmpdir(), "policy-ws-"));
 mkdirSync(join(ws, "src"));
-const options: PolicyOptions = { workspace: ws, shellAllow: DEFAULT_SHELL_ALLOW, shellDeny: DEFAULT_SHELL_DENY, readAllow: DEFAULT_READ_ALLOW, urlAllow: [] };
+const options: PolicyOptions = {
+  workspace: ws,
+  shellAllow: [...DEFAULT_SHELL_ALLOW, "swift", "xcodebuild", "xcrun simctl", "python3 tools/"],
+  shellDeny: DEFAULT_SHELL_DENY,
+  readAllow: ["/Applications/Xcode.app"],
+  urlAllow: [],
+};
 
 function shell(text: string, extra: Record<string, unknown> = {}): PermissionRequest {
   const segments = text.split(/\s*(?:&&|\|\||;|\|)\s*/).map((seg) => ({ identifier: seg.split(" ")[0]!, fullCommandText: seg }));

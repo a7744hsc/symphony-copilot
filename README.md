@@ -1,156 +1,160 @@
 # symphony-copilot
 
-按 Symphony 规范（本机 `~/Codes/symphony-SPEC.md`）写的本机调度器，把 Codex app-server 换成了 [GitHub Copilot SDK](https://github.com/github/copilot-sdk)：
+[![CI](https://github.com/a7744hsc/symphony-copilot/actions/workflows/ci.yml/badge.svg)](https://github.com/a7744hsc/symphony-copilot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-- 定时读取 GitHub Project 看板；
-- 给每张可领取的卡片建一个独立工作区；
-- 在工作区里启动 Copilot agent 会话，多轮续写；
-- 卡片状态变化时停止或清理，失败时退避重试。
+**[OpenAI Symphony](https://github.com/openai/symphony), powered by GitHub Copilot.** Put cards on a GitHub Project board and get pull requests back. The agents run on your own machine and use the Copilot plan you already pay for.
 
-调度规则和提示词放在目标仓库根目录的 `WORKFLOW.md`，随代码一起版本管理，修改后不用重启。
+[中文说明](README.zh-CN.md)
 
-## 运行
+Symphony's idea is "manage work, not agents": you write issues, and an orchestrator hands each one to a coding agent in its own workspace, keeps it going, and stops it when the card moves. symphony-copilot implements the [Symphony spec](https://github.com/openai/symphony/blob/main/SPEC.md) with two swaps: Codex is replaced by the [GitHub Copilot SDK](https://github.com/github/copilot-sdk), and Linear is replaced by GitHub Projects.
 
-需要 Node 24 以上（直接运行 `.ts`，不用编译），并且本机的 Copilot CLI 已登录。
+## Highlights
 
-```sh
-npm install
-export SYMPHONY_GITHUB_TOKEN=$(gh auth token)   # 只给调度器用，不会传给 agent
+- **Symphony with Copilot inside.** Polling, one workspace per issue, multi-turn sessions, reconciliation with the board, stall detection, retries with backoff, and a `WORKFLOW.md` that reloads on save, as the spec describes.
+- **Local runtime.** Agents work in folders on your computer, with your compilers, SDKs, simulators, databases and licensed tools. There are no containers, VMs or runners to set up.
+- **$0 extra.** No API keys, cloud machines or Actions minutes. Sessions draw on your existing Copilot plan, the same way Copilot CLI does, and `max_ai_credits` caps each session.[^cost]
+- **The board is the UI.** Move a card to Todo and a pull request appears, with the card moved to Human Review. Move the card to Rework and the agent reads the review and continues.
+- **Guardrails by default.** Writes stay inside the workspace. Shell commands must be on an allowlist. Network access is off. Tokens are never passed to the agent. The only way to push is the orchestrator's `tracker_submit_for_review` tool.
+- **Small and readable.** About 2,400 lines of TypeScript with no build step, and 60+ unit tests.
 
-node src/cli.ts ~/Codes/elevator-manager-simulator/WORKFLOW.md --dry-run --once   # 只读试跑一轮
-node src/cli.ts ~/Codes/elevator-manager-simulator/WORKFLOW.md                    # 常驻运行，Ctrl-C 停止
+[^cost]: Each prompt counts toward your Copilot usage allowance, as with Copilot CLI ([billing details](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)). Past your allowance, normal Copilot billing applies. In our end-to-end test, a small tech-debt card (edit a test, run the test suite, open a PR) used 1 premium request.
 
-npm test          # 单元测试
-npm run typecheck
+## How it works
+
+```mermaid
+flowchart LR
+  A["Card in Todo<br/>(label: agent)"] -->|poll| B[symphony-copilot]
+  B --> C["Workspace per issue<br/>clone + branch agent/N"]
+  C --> D["Copilot session<br/>multi-turn"]
+  D -->|tracker_submit_for_review| E["Push branch<br/>open PR"]
+  E --> F[Card: Human Review]
+  F -->|you merge| G[Done]
+  F -->|you move it to Rework| D
 ```
 
-| 参数 | 作用 |
+1. You label an issue `agent` and put its card in an active column (for example Todo).
+2. symphony-copilot claims the card, creates a workspace for it (in the example workflow, the `after_create` hook clones the repo and checks out `agent/<number>`), and starts a Copilot session with the prompt from `WORKFLOW.md`.
+3. The agent works, runs your checks, commits, and calls `tracker_submit_for_review`. The orchestrator pushes the branch, opens a PR that closes the issue, and moves the card to Human Review.
+4. You review. Merge, and the card goes to Done. Or move the card to Rework, and the agent picks it up again in the same workspace, with your review comments.
+
+## Compared with
+
+| | OpenAI Symphony | **symphony-copilot** | GitHub Copilot coding agent |
+|---|---|---|---|
+| Coding agent | Codex | GitHub Copilot, any model your plan offers | GitHub Copilot |
+| Work queue | Linear | GitHub Projects | Issues assigned to Copilot |
+| Runs on | Your machine | Your machine | GitHub Actions |
+| What you pay | Codex usage (ChatGPT plan or OpenAI API) | Your existing Copilot plan | Copilot plan plus Actions minutes |
+| Local tools, devices and services | Yes | Yes | Only what the runner can install |
+| Form | Spec plus Elixir reference implementation | Small TypeScript app | Hosted service |
+
+## Quick start
+
+You need Node.js 24 or later (it runs the TypeScript directly), git, the [GitHub CLI](https://cli.github.com/), and a GitHub account with a Copilot plan. It is developed on macOS, and CI also runs the tests on Linux. Windows is untested.
+
+**1. Prepare the board.** Create a GitHub Project (or use an existing one) with these options in its Status field:
+
+| Status | Meaning |
 |---|---|
-| `--dry-run` | 只读看板、打印“本来会派发哪些”，不建工作区、不启动 agent、不清理 |
-| `--once` | 只跑一轮轮询，等派发出去的 worker 结束后退出 |
-| `--log-level` | `debug` / `info`（默认）/ `warn` / `error` |
+| Todo, In Progress, Rework | Active: the orchestrator runs an agent on these cards |
+| Human Review | Handoff: the agent submitted a PR and waits for you |
+| Blocked | The agent needs help; it comments on the issue first |
+| Done, Canceled | Terminal: the workspace is deleted, right away if an agent is still running, otherwise the next time the orchestrator starts |
 
-日志是 `key=value` 格式，输出到 stderr；和卡片有关的日志带 `issue_id`、`issue_identifier`，会话日志带 `session_id`。
+Optionally, add a single-select Priority field with options like `P1`, `P2`, `P3` (lower numbers run first). In the project's workflows, set "Pull request linked to issue" to Human Review or turn it off. Otherwise the card jumps back to an active column when the PR opens, and the agent starts again.
 
-## 结构
+**2. Install and sign in.**
 
-| 文件 | 职责（规范章节） |
+```sh
+git clone https://github.com/a7744hsc/symphony-copilot.git
+cd symphony-copilot
+npm install
+
+gh auth login              # the account with your Copilot plan
+gh auth refresh -s project # the orchestrator reads and moves cards
+gh auth setup-git          # lets the orchestrator push agent branches
+```
+
+**3. Add a `WORKFLOW.md` to your repository.** Copy [examples/WORKFLOW.md](examples/WORKFLOW.md) to the root of the repository the agents will work on. Fill in `owner`, `project_number` and `repo`, adjust the status names, and list your build and test commands in `copilot.shell_allow`. The Markdown body is the agent's prompt. Commit the file so the prompt is versioned with your code.
+
+**4. Run it.**
+
+```sh
+export SYMPHONY_GITHUB_TOKEN=$(gh auth token)   # used by the orchestrator only, never passed to agents
+
+node src/cli.ts ~/code/your-repo/WORKFLOW.md --dry-run --once   # read-only: shows which cards would run
+node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # keeps running; Ctrl-C to stop
+```
+
+Then label an issue `agent`, move its card to Todo, and watch the log.
+
+| Flag | Effect |
 |---|---|
-| `src/workflow.ts` | 读取、解析、监听 `WORKFLOW.md`；改坏了保留上一份有效配置（§5、§6.2） |
-| `src/config.ts` | 带默认值的类型化配置、`$VAR`、`~`、相对路径（§6） |
-| `src/template.ts` | Liquid 严格模式：未知变量、未知过滤器都报错（§5.4、§12） |
-| `src/orchestrator.ts` | 唯一的调度状态：轮询、派发、对账、卡死检测、重试（§7、§8、§16） |
-| `src/workspace.ts` | 工作区命名、根目录限制、四个 hook（§9） |
-| `src/runner.ts` | Copilot SDK 会话与多轮循环（§10、§16.5） |
-| `src/policy.ts` | agent 工具的权限判定（§10.5、§15） |
-| `src/tracker/github-project.ts` | GitHub Project 适配器与 agent 工具（§11） |
+| `--dry-run` | Reads the board and logs what would be dispatched. Creates no workspaces, starts no agents, and removes nothing. |
+| `--once` | Polls once, waits for dispatched agents to finish, then exits. |
+| `--log-level` | `debug`, `info` (default), `warn` or `error`. Logs are `key=value` lines on stderr. |
 
-## Codex app-server 与 Copilot SDK 的对应
+## Configuration
 
-| 规范概念 | 本实现 |
-|---|---|
-| `codex app-server` 子进程 | 每个 worker 一个 `CopilotClient`，stdio 方式启动 SDK 自带的 CLI（或 `copilot.cli_path`） |
-| thread / turn | `createSession({ workingDirectory: 工作区 })` 的 `sessionId`；一次 `send()` 到主 agent `session.idle` 算一轮 |
-| `session_id` | `<sessionId>-<轮次>` |
-| 续写 | 同一会话再 `send()` 一次 `agent.continuation_prompt` |
-| turn 失败 / 取消 | `session.error` / `session.idle` 且 `aborted` |
-| `turn_timeout_ms` | 两个会话事件之间的最长静默，超时就 `abort()` |
-| token 统计 | 累加 `assistant.usage`，以会话绝对值上报，调度器只计增量 |
-| rate limits | `account.getQuota` 的快照 |
-| `codex` 配置块 | `copilot` 配置块（见下） |
+`WORKFLOW.md` has YAML front matter followed by a [Liquid](https://liquidjs.com/) prompt template. Unknown variables and filters are errors. If you save an invalid file, the orchestrator logs the error and keeps using the last valid version.
 
-## `WORKFLOW.md` 配置
+The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their meaning and defaults. There is one addition, `agent.continuation_prompt`: the message sent at the start of each later turn, with the variables `issue`, `turn` and `max_turns`.
 
-规范里的核心键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都照规范，只多了 `agent.continuation_prompt`：续写时的提示词，Liquid 模板，可用变量 `issue`、`turn`、`max_turns`。
+The `copilot` block is specific to this implementation:
 
-`copilot` 是扩展块：
-
-| 键 | 默认 | 说明 |
+| Key | Default | Meaning |
 |---|---|---|
-| `cli_path` | SDK 自带运行时 | 指定 Copilot CLI 可执行文件 |
-| `model` / `reasoning_effort` | 运行时默认 | 传给 `createSession` |
-| `max_ai_credits` | 无上限 | 每个会话的 AI Credits 软上限；用完判为 `budget_exhausted` 并重试 |
-| `startup_timeout_ms` | 60000 | 启动运行时、建会话的超时 |
-| `turn_timeout_ms` | 3600000 | 一轮里两次事件间的最长静默 |
-| `stall_timeout_ms` | 300000 | 调度器按事件间隔判断卡死；`<= 0` 关闭 |
-| `shell_allow` / `shell_deny` | 见 `src/config.ts` | 命令白名单 / 黑名单 |
-| `read_allow` | Xcode、CommandLineTools | 工作区之外允许只读的目录 |
-| `url_allow` | 空 | 允许访问的 URL 前缀 |
-| `user_input_reply` | 中文固定答复 | agent 提问时的自动回答 |
+| `model`, `reasoning_effort` | Runtime default | Passed to the Copilot session |
+| `max_ai_credits` | No limit | Soft cap per session. When it is reached, the attempt ends and is retried later. |
+| `shell_allow` | Built-in list | Commands to allow **in addition to** the built-in git and file tools |
+| `shell_deny` | Built-in list | Commands to deny in addition to the built-in list. Deny always wins. |
+| `read_allow` | None | Directories outside the workspace that the agent may read |
+| `url_allow` | None | URL prefixes the agent may fetch |
+| `user_input_reply` | English | Automatic answer when the agent asks a question |
+| `cli_path` | Runtime bundled with the SDK | Use a specific Copilot CLI binary |
+| `startup_timeout_ms` | 60000 | Timeout for starting the runtime and creating the session |
+| `turn_timeout_ms` | 3600000 | Longest silence between session events within a turn |
+| `stall_timeout_ms` | 300000 | The orchestrator restarts an agent that has been silent this long; `<= 0` disables it |
 
-hook 用 `bash -lc` 在工作区里执行，环境变量里去掉了 tracker 令牌，额外提供 `SYMPHONY_ISSUE_ID`、`SYMPHONY_ISSUE_IDENTIFIER`、`SYMPHONY_ISSUE_BRANCH`、`SYMPHONY_WORKSPACE`、`SYMPHONY_WORKSPACE_KEY`。工作区路径上如果已有文件或符号链接，本次尝试直接失败，不会删除或替换它。
+Hooks run with `bash -lc` inside the workspace. Tracker tokens are removed from their environment, and these variables are added: `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_ISSUE_BRANCH`, `SYMPHONY_WORKSPACE`, `SYMPHONY_WORKSPACE_KEY`.
 
-## 信任边界与权限策略
+See [docs/reference.md](docs/reference.md) for the GitHub Project adapter settings, the agent tools, error categories and how the spec maps onto the Copilot SDK.
 
-适用于**单用户、可信的本机环境**，不是沙箱。
+## Safety model
 
-- **运行位置**：agent 只在自己的工作区里运行（cwd 等于工作区，工作区必须在 `workspace.root` 之下）。
-- **tracker 令牌**：只在调度器进程里用；agent 进程和 hook 的环境变量都去掉了 `SYMPHONY_GITHUB_TOKEN`、`GH_TOKEN`、`GITHUB_TOKEN` 等。
-- **权限判定**：由 `src/policy.ts` 逐项决定：
-  - 写文件：只允许工作区内，符号链接解析后仍须在工作区内。
-  - 读文件：工作区，加 `read_allow` 列出的目录。
-  - shell 命令：
-    - 每一段命令都要在白名单里，且不命中黑名单。默认禁止 `git push`、`git remote`、`git config`、`git -c`、`git -C`、`gh`、`curl`、`wget`、`ssh`、`sudo`、`open`、`osascript`、`security` 等。
-    - 会写入的命令只能碰工作区里的路径；命令里带 URL 就拒绝；要求绕过沙箱也拒绝。
-  - 网络访问、MCP 工具、memory 等其他请求一律拒绝，只有调度器注册的 `tracker_*` 工具放行。
-  - 托管策略要求真人确认的请求，回答"无人可确认"。
-- **提问**：agent 提问时自动回答 `user_input_reply`，不会一直干等。
-- **已知缺口**：本机 `gh` 的登录保存在钥匙串里，只靠上面的命令黑名单拦住 agent 使用它。`find -exec`、`python3 tools/…` 这类命令仍然可能间接执行任意操作。要更强的隔离，请用单独的 macOS 用户运行调度器。
+symphony-copilot is meant for **one trusted user on their own machine**. It is not a sandbox.
 
-## 适配器说明：`tracker.kind: github_project`
+- Each agent runs with its workspace as the working directory, and every workspace must be inside `workspace.root`.
+- The tracker token stays in the orchestrator process. `SYMPHONY_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` and similar variables are removed from the environment of agents and hooks.
+- Every permission request from the agent goes through [src/policy.ts](src/policy.ts):
+  - Writes must stay inside the workspace, even after resolving symlinks.
+  - Reads are limited to the workspace and `read_allow`.
+  - Every segment of a shell command must match the allowlist and must not match the denylist. The built-in denylist includes `git push`, `git remote`, `git config`, `git -c`, `git -C`, `gh`, `curl`, `wget`, `ssh`, `sudo` and `open`.
+  - Shell commands that write may only touch paths inside the workspace. Commands containing URLs and requests to bypass the sandbox are rejected.
+  - URL fetches, MCP tools and memory are refused. Only the orchestrator's own `tracker_*` tools are allowed.
+- When the agent asks a question, it gets `user_input_reply` instead of waiting forever.
 
-- **`tracker.provider` 的键**：
-  - 必填：`owner`、`project_number`、`repo`（`owner/name`）。
-  - 选填，括号里是默认值：
-    - `owner_type`（`user`，或 `organization`）；
-    - `token`（`$SYMPHONY_GITHUB_TOKEN`，这是密钥，值为空也算缺失）；
-    - `endpoint`（`https://api.github.com/graphql`）；
-    - `status_field`（`Status`）、`priority_field`（`Priority`）；
-    - `identifier_prefix`（`GH-`）、`branch_prefix`（`agent/`）；
-    - `agent_states`（空，表示不提供 `tracker_set_status`）；
-    - `handoff_state`（空，表示提交审核时不改状态）。
-  - 配置错误报 `invalid_tracker_config`，令牌缺失报 `missing_tracker_secret`。
-- **范围**：只看这个 Project 里、来自 `repo` 的 Issue；草稿、PR、其他仓库的 Issue 都忽略。按状态查询时每页 100 条，最多 100 页；按 ID 查询时每批 100 个。
-- **字段映射**：
+Known gaps: your local `gh` login is stored in the system keychain, and only the denylist stops an agent from using it. Allowed programs that can run other programs (for example `find -exec`, or build scripts the agent can edit) can still do anything your user can. For stronger isolation, run the orchestrator as a separate OS user.
 
-| 字段 | 取值 |
-|---|---|
-| `id` | Project item ID |
-| `native_ref` | `project_item_id`、`issue_id`、`issue_number`、`repository` |
-| `identifier` | `GH-<编号>` |
-| `branch_name` | `agent/<编号>` |
-| `state` | Status 选项名；没设 Status 时为 `No Status` |
-| `priority` | 单选名里的数字（如 `P2` 取 2），或数字字段的整数值 |
-| `labels` | 小写、去空白、去重 |
-| `blocked_by` | GitHub Issue 依赖关系 |
-| `dispatchable` | Issue 未关闭、项目条目未归档、所有前置 Issue 都已关闭 |
+## Status
 
-- **格式不对的条目**：按状态查询时跳过并记日志；按 ID 查询时直接报错，因为漏掉一条会被误当成"已不可见"。
-- **错误分类**：
-  - 网络失败：`tracker_request`；
-  - HTTP 非 2xx：`tracker_status`；
-  - 429、403 且剩余额度为 0、GraphQL 返回 `RATE_LIMITED`：`tracker_rate_limited`；
-  - 其他 GraphQL 错误或 JSON 解析失败：`tracker_response`；
-  - 有下一页却没有游标：`tracker_pagination`。
+Early (v0.1). It has been used end to end on one real project (Swift, with Xcode builds and simulator tests), one agent at a time. Expect rough edges and breaking changes.
 
-  调度器只区分成功和失败。
-- **agent 工具**：都只能操作当前这张卡片，在调度器进程里用它的令牌执行：
+Planned next:
 
-| 工具 | 是否改看板 | 作用 |
-|---|---|---|
-| `tracker_get_issue` | 否 | 看板状态、正文、评论，以及对应分支上打开的 PR 的审核意见 |
-| `tracker_comment` | 是 | 在 Issue 下评论 |
-| `tracker_set_status` | 是 | 只能改成 `agent_states` 里的状态 |
-| `tracker_submit_for_review` | 是 | 要求改动都已提交；把 HEAD 推到 `agent/<编号>`，创建 PR（写 `Closes #编号`）或在已有 PR 下留言，再把状态改成 `handoff_state` |
+- An `init` command that sets up the board's status options and writes a starter `WORKFLOW.md`
+- An npm package, so you can run it with `npx`
+- Live status in the terminal, and the spec's optional HTTP status API
+- Keeping run evidence (logs, screenshots) after a workspace is removed
+- More trackers
 
-  工具出错时返回失败结果，会话继续。
+Issues and pull requests are welcome.
 
-## 和规范的差异、后续计划
+## Acknowledgements
 
-- 没做可选的 HTTP 状态接口（§13.7）。`Orchestrator.snapshot()` 已经按 §13.3 给出了数据。
-- 和规范一样，重启后不恢复重试队列，靠重新读取看板和保留下来的工作区恢复。
-- 后续：
-  - M2：用一个小 Issue 端到端跑通到"待验证"；
-  - M3：验证返工和中断；
-  - M4：状态接口；
-  - M5：每个 agent 一台复制出来的模拟器，支持并发。
+The orchestration design comes from [OpenAI Symphony](https://github.com/openai/symphony) (Apache-2.0). symphony-copilot is an independent implementation of its spec, built on the [GitHub Copilot SDK](https://github.com/github/copilot-sdk). It is not affiliated with or endorsed by OpenAI or GitHub.
+
+## License
+
+[MIT](LICENSE)

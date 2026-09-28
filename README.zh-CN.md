@@ -1,0 +1,157 @@
+# symphony-copilot
+
+**用 GitHub Copilot 驱动的 [OpenAI Symphony](https://github.com/openai/symphony)。** 把卡片放到 GitHub Project 看板上，拿回 pull request。agent 在你自己的电脑上运行，用的是你已经在付费的 Copilot 套餐。
+
+[English](README.md)
+
+Symphony 的理念是“管理工作，而不是管理 agent”：你写 Issue，调度器把每个 Issue 交给一个 coding agent，在独立的工作区里做，推着它往下走，卡片状态变了就停下。symphony-copilot 按 [Symphony 规范](https://github.com/openai/symphony/blob/main/SPEC.md)实现，换了两样东西：Codex 换成 [GitHub Copilot SDK](https://github.com/github/copilot-sdk)，Linear 换成 GitHub Projects。
+
+## 亮点
+
+- **内核是 Symphony，引擎是 Copilot。** 按规范实现了轮询、每个 Issue 一个工作区、多轮会话、与看板对账、卡死检测、退避重试，以及保存即生效的 `WORKFLOW.md`。
+- **本地运行。** agent 就在你电脑上的目录里干活，用你的编译器、SDK、模拟器、数据库和有授权的工具。不用准备容器、虚拟机或 runner。
+- **零额外成本。** 不要 API key，不要云主机，不耗 Actions 分钟数。会话走你现有的 Copilot 套餐，和 Copilot CLI 一样计量；`max_ai_credits` 给每个会话设上限。[^cost]
+- **看板就是界面。** 把卡片拖到 Todo，PR 就会出现，卡片同时移到 Human Review。拖到 Rework，agent 会读审核意见接着改。
+- **默认有护栏。** 只能写工作区内的文件；shell 命令要在白名单里；不能联网；令牌不交给 agent；推送只能通过调度器的 `tracker_submit_for_review` 工具。
+- **小而易读。** 约 2400 行 TypeScript，不用编译，60 多个单元测试。
+
+[^cost]: 每条提示都计入你的 Copilot 用量额度，和 Copilot CLI 相同（[计费说明](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)）。超出额度后按 Copilot 正常规则计费。我们端到端测试时，一张小的技术债卡片（改一个测试、跑测试、开 PR）用了 1 次高级请求。
+
+## 工作流程
+
+```mermaid
+flowchart LR
+  A["Todo 里的卡片<br/>（标签 agent）"] -->|轮询| B[symphony-copilot]
+  B --> C["每个 Issue 一个工作区<br/>克隆 + 分支 agent/N"]
+  C --> D["Copilot 会话<br/>多轮"]
+  D -->|tracker_submit_for_review| E["推送分支<br/>开 PR"]
+  E --> F[卡片：Human Review]
+  F -->|你合并| G[Done]
+  F -->|你拖回 Rework| D
+```
+
+1. 给 Issue 打上 `agent` 标签，把卡片放进活跃列（比如 Todo）。
+2. symphony-copilot 领取卡片，为它建工作区（示例工作流里，`after_create` hook 会克隆仓库并切到 `agent/<编号>`），然后用 `WORKFLOW.md` 里的提示词启动 Copilot 会话。
+3. agent 干活、跑检查、提交，然后调用 `tracker_submit_for_review`。调度器推送分支，开一个会关闭该 Issue 的 PR，把卡片移到 Human Review。
+4. 你来审核。合并后卡片进入 Done；或者拖回 Rework，agent 会在同一个工作区里带着你的审核意见继续。
+
+## 对比
+
+| | OpenAI Symphony | **symphony-copilot** | GitHub Copilot coding agent |
+|---|---|---|---|
+| coding agent | Codex | GitHub Copilot，套餐里的模型都能用 | GitHub Copilot |
+| 任务来源 | Linear | GitHub Projects | 指派给 Copilot 的 Issue |
+| 运行位置 | 你的电脑 | 你的电脑 | GitHub Actions |
+| 费用 | Codex 用量（ChatGPT 套餐或 OpenAI API） | 你现有的 Copilot 套餐 | Copilot 套餐加 Actions 分钟数 |
+| 本机工具、设备和服务 | 能用 | 能用 | 只有 runner 能装上的 |
+| 形态 | 规范加 Elixir 参考实现 | 小型 TypeScript 应用 | 托管服务 |
+
+## 快速开始
+
+需要 Node.js 24 以上（直接运行 TypeScript）、git、[GitHub CLI](https://cli.github.com/)，以及一个有 Copilot 套餐的 GitHub 账号。在 macOS 上开发，CI 也会在 Linux 上跑测试；Windows 没测过。
+
+**1. 准备看板。** 新建一个 GitHub Project（或用已有的），Status 字段里要有这些选项：
+
+| 状态 | 含义 |
+|---|---|
+| Todo、In Progress、Rework | 活跃：调度器会在这些卡片上运行 agent |
+| Human Review | 交接：agent 已提交 PR，等你审核 |
+| Blocked | agent 需要帮助，会先在 Issue 下留言 |
+| Done、Canceled | 终止：删除工作区；如果 agent 还在运行就立即删，否则在调度器下次启动时删 |
+
+可选：加一个单选的 Priority 字段，选项如 `P1`、`P2`、`P3`（数字小的先做）。在项目的 Workflows 里，把 “Pull request linked to issue” 设成 Human Review 或者关掉；否则 PR 一开，卡片又被移回活跃列，agent 会重新开工。
+
+**2. 安装并登录。**
+
+```sh
+git clone https://github.com/a7744hsc/symphony-copilot.git
+cd symphony-copilot
+npm install
+
+gh auth login              # 用有 Copilot 套餐的账号
+gh auth refresh -s project # 调度器要读取和移动卡片
+gh auth setup-git          # 调度器要推送 agent 的分支
+```
+
+**3. 在你的仓库里加 `WORKFLOW.md`。** 把 [examples/WORKFLOW.md](examples/WORKFLOW.md) 复制到 agent 要处理的仓库根目录，填好 `owner`、`project_number`、`repo`，调整状态名，在 `copilot.shell_allow` 里列出你的构建和测试命令。Markdown 正文就是给 agent 的提示词。把这个文件提交进仓库，提示词就和代码一起做版本管理。
+
+**4. 运行。**
+
+```sh
+export SYMPHONY_GITHUB_TOKEN=$(gh auth token)   # 只给调度器用，不会传给 agent
+
+node src/cli.ts ~/code/your-repo/WORKFLOW.md --dry-run --once   # 只读：看看会派发哪些卡片
+node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行，Ctrl-C 停止
+```
+
+然后给一个 Issue 打上 `agent` 标签，把卡片拖到 Todo，看日志。
+
+| 参数 | 作用 |
+|---|---|
+| `--dry-run` | 读取看板，记录本来会派发哪些卡片。不建工作区、不启动 agent、不删除任何东西。 |
+| `--once` | 只轮询一次，等派发出去的 agent 结束后退出。 |
+| `--log-level` | `debug`、`info`（默认）、`warn` 或 `error`。日志是输出到 stderr 的 `key=value` 行。 |
+
+## 配置
+
+`WORKFLOW.md` 由 YAML front matter 和一个 [Liquid](https://liquidjs.com/) 提示词模板组成；未知的变量和过滤器都会报错。保存了无效的文件时，调度器记录错误，继续用上一份有效配置。
+
+规范里的键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都不变，只多了 `agent.continuation_prompt`：之后每一轮开头发送的消息，可用变量 `issue`、`turn`、`max_turns`。
+
+`copilot` 块是本实现特有的：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `model`、`reasoning_effort` | 运行时默认 | 传给 Copilot 会话 |
+| `max_ai_credits` | 无上限 | 每个会话的软上限。用完后本次尝试结束，稍后重试。 |
+| `shell_allow` | 内置列表 | 在内置的 git 和文件工具**之外**额外允许的命令 |
+| `shell_deny` | 内置列表 | 在内置列表之外额外禁止的命令；禁止优先 |
+| `read_allow` | 无 | 工作区之外允许 agent 读取的目录 |
+| `url_allow` | 无 | 允许 agent 访问的 URL 前缀 |
+| `user_input_reply` | 英文 | agent 提问时的自动回答 |
+| `cli_path` | SDK 自带的运行时 | 指定 Copilot CLI 可执行文件 |
+| `startup_timeout_ms` | 60000 | 启动运行时、创建会话的超时 |
+| `turn_timeout_ms` | 3600000 | 一轮内两次会话事件之间的最长静默 |
+| `stall_timeout_ms` | 300000 | agent 静默超过这个时长，调度器就重启它；`<= 0` 关闭 |
+
+hook 用 `bash -lc` 在工作区里执行，环境变量里去掉了 tracker 令牌，并加上 `SYMPHONY_ISSUE_ID`、`SYMPHONY_ISSUE_IDENTIFIER`、`SYMPHONY_ISSUE_BRANCH`、`SYMPHONY_WORKSPACE`、`SYMPHONY_WORKSPACE_KEY`。
+
+GitHub Project 适配器的设置、agent 工具、错误分类，以及规范如何对应到 Copilot SDK，见 [docs/reference.md](docs/reference.md)（英文）。
+
+## 安全模型
+
+symphony-copilot 面向**在自己电脑上运行的单个可信用户**，它不是沙箱。
+
+- 每个 agent 以自己的工作区为工作目录，所有工作区都必须在 `workspace.root` 之下。
+- tracker 令牌只留在调度器进程里。agent 和 hook 的环境变量里会去掉 `SYMPHONY_GITHUB_TOKEN`、`GH_TOKEN`、`GITHUB_TOKEN` 等。
+- agent 的每个权限请求都经过 [src/policy.ts](src/policy.ts)：
+  - 写文件必须在工作区内，解析符号链接后也一样。
+  - 读文件限于工作区和 `read_allow`。
+  - shell 命令的每一段都要命中白名单、不命中黑名单。内置黑名单包括 `git push`、`git remote`、`git config`、`git -c`、`git -C`、`gh`、`curl`、`wget`、`ssh`、`sudo`、`open`。
+  - 会写入的 shell 命令只能碰工作区内的路径；带 URL 的命令、要求绕过沙箱的请求都会被拒绝。
+  - URL 访问、MCP 工具、memory 一律拒绝，只放行调度器自己的 `tracker_*` 工具。
+- agent 提问时会收到 `user_input_reply`，不会一直干等。
+
+已知缺口：本机 `gh` 的登录保存在系统钥匙串里，只靠黑名单拦住 agent 使用它。能再启动其他程序的已允许命令（比如 `find -exec`，或 agent 能改的构建脚本）仍然可以做你的用户能做的任何事。要更强的隔离，请用单独的系统用户运行调度器。
+
+## 现状
+
+早期版本（v0.1）。已在一个真实项目上端到端跑通（Swift，含 Xcode 构建和模拟器测试），一次一个 agent。会有粗糙之处，也可能有不兼容的改动。
+
+接下来计划：
+
+- `init` 命令：配好看板的状态选项，生成初始 `WORKFLOW.md`
+- 发布 npm 包，可以用 `npx` 运行
+- 终端里的实时状态，以及规范里可选的 HTTP 状态接口
+- 工作区删除后保留运行证据（日志、截图）
+- 支持更多 tracker
+
+欢迎提 Issue 和 PR。
+
+## 致谢
+
+调度设计来自 [OpenAI Symphony](https://github.com/openai/symphony)（Apache-2.0）。symphony-copilot 是其规范的独立实现，基于 [GitHub Copilot SDK](https://github.com/github/copilot-sdk)，与 OpenAI、GitHub 均无隶属或背书关系。
+
+## 许可证
+
+[MIT](LICENSE)

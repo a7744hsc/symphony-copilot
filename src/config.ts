@@ -60,11 +60,12 @@ export class ConfigError extends Error {
   }
 }
 
+/** Always allowed; `copilot.shell_allow` adds the project's own build and test commands. */
 export const DEFAULT_SHELL_ALLOW = [
-  "swift", "xcodebuild", "xcrun simctl", "xcrun xcresulttool", "xcrun swift", "git", "python3 tools/",
+  "git",
   "ls", "cat", "head", "tail", "grep", "rg", "find", "sed", "awk", "wc", "sort", "uniq", "diff", "cmp",
-  "echo", "printf", "pwd", "cd", "mkdir", "cp", "mv", "rm", "touch", "test", "[", "true", "false",
-  "which", "file", "du", "date", "basename", "dirname", "tee", "tr", "cut", "jq", "plutil", "sips", "sleep",
+  "echo", "printf", "pwd", "cd", "mkdir", "cp", "mv", "rm", "touch", "test", "[", "true", "false", "exit",
+  "which", "file", "du", "date", "basename", "dirname", "tee", "tr", "cut", "jq", "sleep",
 ];
 
 export const DEFAULT_SHELL_DENY = [
@@ -72,15 +73,14 @@ export const DEFAULT_SHELL_DENY = [
   "gh", "curl", "wget", "ssh", "scp", "sudo", "open", "osascript", "security", "launchctl", "defaults",
 ];
 
-export const DEFAULT_READ_ALLOW = ["/Applications/Xcode.app", "/Library/Developer/CommandLineTools"];
-
 const DEFAULT_CONTINUATION = [
-  "继续处理 {{ issue.identifier }}（第 {{ turn }}/{{ max_turns }} 轮）。卡片当前状态仍是「{{ issue.state }}」。",
-  "先检查工作区现状，接着完成剩余工作，不要重复已完成的步骤；完成后按工作流提交审核，遇到无法解决的阻塞就把卡片设为受阻并留言说明。",
+  "Continue working on {{ issue.identifier }} (turn {{ turn }} of {{ max_turns }}). The card is still in \"{{ issue.state }}\".",
+  "Check the current state of the workspace first, then finish the remaining work without repeating completed steps.",
+  "When you are done, submit for review as the workflow describes. If you hit a blocker you cannot resolve, comment with the reason and move the card to the blocked state.",
 ].join("\n");
 
 const DEFAULT_USER_INPUT_REPLY =
-  "当前是无人值守运行，没有人能回答问题。请自行做出合理决定，并在 Issue 评论里写明假设；如果确实无法继续，用 tracker 工具把卡片设为受阻并说明原因。";
+  "This is an unattended run and nobody can answer questions. Make a reasonable decision yourself and write down your assumptions in an issue comment. If you really cannot continue, comment with the reason and move the card to the blocked state.";
 
 const ENV_REF = /^\$([A-Za-z_][A-Za-z0-9_]*)$/;
 
@@ -201,9 +201,9 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
       startupTimeoutMs: integer(copilot.startup_timeout_ms, 60_000, "copilot.startup_timeout_ms", problems, 1),
       turnTimeoutMs: integer(copilot.turn_timeout_ms, 3_600_000, "copilot.turn_timeout_ms", problems, 1),
       stallTimeoutMs: integer(copilot.stall_timeout_ms, 300_000, "copilot.stall_timeout_ms", problems, -Infinity),
-      shellAllow: stringList(copilot.shell_allow, DEFAULT_SHELL_ALLOW, "copilot.shell_allow", problems),
-      shellDeny: stringList(copilot.shell_deny, DEFAULT_SHELL_DENY, "copilot.shell_deny", problems),
-      readAllow: stringList(copilot.read_allow, DEFAULT_READ_ALLOW, "copilot.read_allow", problems).map((p) => expandPath(p, workflowDir, env)),
+      shellAllow: [...DEFAULT_SHELL_ALLOW, ...stringList(copilot.shell_allow, [], "copilot.shell_allow", problems)],
+      shellDeny: [...DEFAULT_SHELL_DENY, ...stringList(copilot.shell_deny, [], "copilot.shell_deny", problems)],
+      readAllow: stringList(copilot.read_allow, [], "copilot.read_allow", problems).map((p) => expandPath(p, workflowDir, env)),
       urlAllow: stringList(copilot.url_allow, [], "copilot.url_allow", problems),
       userInputReply: text(copilot.user_input_reply, "copilot.user_input_reply", problems) ?? DEFAULT_USER_INPUT_REPLY,
     },

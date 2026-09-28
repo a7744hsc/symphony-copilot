@@ -2,7 +2,14 @@
   "name": "symphony-copilot",
   "version": "0.1.0",
   "private": true,
-  "description": "Polls a GitHub Project board and runs GitHub Copilot SDK agents in per-issue workspaces (a Symphony-style orchestrator).",
+  "description": "OpenAI Symphony, powered by GitHub Copilot: turn a GitHub Project board into pull requests, with agents running on your own machine.",
+  "keywords": ["symphony", "github-copilot", "copilot-sdk", "github-projects", "coding-agent", "ai-agents", "orchestration"],
+  "homepage": "https://github.com/a7744hsc/symphony-copilot#readme",
+  "bugs": "https://github.com/a7744hsc/symphony-copilot/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/a7744hsc/symphony-copilot.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -12,7 +19,7 @@
     "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc -p ."
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "dependencies": {
     "@github/copilot-sdk": "^1.0.14",
     "liquidjs": "^10.29.0",

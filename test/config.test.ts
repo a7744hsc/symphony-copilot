@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { buildConfig, ConfigError, DEFAULT_SHELL_ALLOW, expandPath, isActiveState, isRoutable, isTerminalState, resolveEnvRef } from "../src/config.ts";
+import { buildConfig, ConfigError, DEFAULT_SHELL_ALLOW, DEFAULT_SHELL_DENY, expandPath, isActiveState, isRoutable, isTerminalState, resolveEnvRef } from "../src/config.ts";
 import { makeConfig, makeIssue } from "./helpers.ts";
 
 const minimal = { tracker: { kind: "github_project", active_states: ["Todo"], terminal_states: ["Done"] } };
@@ -19,7 +19,14 @@ test("defaults apply when optional values are missing", () => {
   assert.equal(c.copilot.stallTimeoutMs, 300_000);
   assert.equal(c.copilot.cliPath, null);
   assert.deepEqual(c.copilot.shellAllow, DEFAULT_SHELL_ALLOW);
+  assert.deepEqual(c.copilot.readAllow, []);
   assert.deepEqual(c.tracker.provider, {});
+});
+
+test("shell_allow and shell_deny add to the built-in lists", () => {
+  const c = buildConfig({ ...minimal, copilot: { shell_allow: ["npm test"], shell_deny: ["rm"] } }, "/repo/WORKFLOW.md", {});
+  assert.deepEqual(c.copilot.shellAllow, [...DEFAULT_SHELL_ALLOW, "npm test"]);
+  assert.deepEqual(c.copilot.shellDeny, [...DEFAULT_SHELL_DENY, "rm"]);
 });
 
 test("workspace.root supports $VAR, ~ and paths relative to the workflow file", () => {
