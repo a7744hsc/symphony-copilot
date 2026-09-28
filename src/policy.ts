@@ -48,14 +48,21 @@ function normalizeCommand(text: string): string {
   return text.trim().replace(/\s+/g, " ");
 }
 
-/** A rule with spaces matches a command-text prefix at a word boundary; otherwise it matches the executable name. */
+function startsWithWords(text: string, prefix: string): boolean {
+  return text === prefix || text.startsWith(prefix.endsWith("/") ? prefix : `${prefix} `);
+}
+
+/**
+ * A rule with spaces matches a command prefix at a word boundary; otherwise it matches the executable.
+ * The runtime's identifier may already include a subcommand ("git status").
+ */
 export function ruleMatches(rule: string, identifier: string, commandText: string): boolean {
   const r = normalizeCommand(rule);
   if (r === "") return false;
-  if (r.includes(" ")) {
-    return commandText === r || commandText.startsWith(r.endsWith("/") ? r : `${r} `);
-  }
-  return identifier === r || basename(identifier) === r;
+  const id = normalizeCommand(identifier);
+  if (r.includes(" ")) return startsWithWords(commandText, r) || startsWithWords(id, r);
+  const executable = id.split(" ")[0] ?? "";
+  return executable === r || basename(executable) === r;
 }
 
 function urlAllowed(url: string, allow: string[]): boolean {

@@ -315,7 +315,10 @@ export class Orchestrator {
       if (entry.termination.cleanup) await this.safeRemove(entry.issue);
       return;
     }
-    if (this.stopped) return;
+    if (this.stopped) {
+      log.info("worker finished during shutdown", { error: error?.message ?? null });
+      return;
+    }
     if (!error && !entry.stalled) {
       this.completed.add(id);
       log.info("worker completed; continuation check scheduled");

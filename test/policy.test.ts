@@ -31,6 +31,23 @@ test("rules match executables or command prefixes at word boundaries", () => {
   assert.ok(!ruleMatches("python3 tools/", "python3", "python3 -c 'import os'"));
 });
 
+test("identifiers that include a subcommand still match (as the Copilot runtime sends them)", () => {
+  assert.ok(ruleMatches("git", "git status", "git status --short"));
+  assert.ok(ruleMatches("git", "git commit", "git commit -am 'x'"));
+  assert.ok(ruleMatches("git push", "git push", "git push origin HEAD"));
+  assert.ok(!ruleMatches("git push", "git pushx", "git pushx"));
+  assert.ok(!ruleMatches("gh", "git status", "git status"));
+  const real = (text: string, identifier: string) => shell(text, {
+    commands: [{ identifier, readOnly: false }],
+    commandSegments: [{ identifier, fullCommandText: text }],
+  });
+  assert.equal(kind(real("git status --short", "git status")), "approve-once");
+  assert.equal(kind(real("git commit -am 'x'", "git commit")), "approve-once");
+  assert.equal(kind(real("git push origin HEAD", "git push")), "reject");
+  assert.equal(kind(real("xcrun simctl list", "xcrun simctl")), "approve-once");
+  assert.equal(kind(real("gh pr list", "gh pr")), "reject");
+});
+
 test("allowed build and test commands run", () => {
   assert.equal(kind(shell("swift test")), "approve-once");
   assert.equal(kind(shell("xcodebuild test -scheme App -derivedDataPath work/DD")), "approve-once");

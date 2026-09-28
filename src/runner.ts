@@ -221,7 +221,16 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
       if (turn >= config.agent.maxTurns) break;
     }
   } finally {
-    if (session) await session.disconnect().catch(() => {});
+    if (session) {
+      const metrics = await session.rpc.usage.getMetrics().catch(() => null);
+      if (metrics) {
+        p.log.info("session usage", {
+          premium_requests: metrics.totalPremiumRequestCost,
+          ai_credits: metrics.totalNanoAiu === undefined ? null : Number((metrics.totalNanoAiu / 1e9).toFixed(4)),
+        });
+      }
+      await session.disconnect().catch(() => {});
+    }
     if (client) await stopClient(client, p.log);
     await p.workspaces.hook(config, "after_run", workspace, p.issue, false);
   }
