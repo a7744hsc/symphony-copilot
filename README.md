@@ -95,6 +95,20 @@ Then label an issue `agent`, move its card to Todo, and watch the log.
 | `--once` | Polls once, waits for dispatched agents to finish, then exits. |
 | `--log-level` | `debug`, `info` (default), `warn` or `error`. Logs are `key=value` lines on stderr. |
 
+**Or use `bin/symphony`**, which fetches the token from `gh`, remembers the workflow path after the first use, and refuses to start a second orchestrator:
+
+```sh
+ln -s "$PWD/bin/symphony" /usr/local/bin/symphony   # optional: put it on your PATH
+
+symphony start ~/code/your-repo/WORKFLOW.md   # background; later just `symphony start`
+symphony status                               # running? last poll and recent events
+symphony logs                                 # follow the log
+symphony stop                                 # stop agents and the orchestrator; workspaces are kept
+symphony run                                  # foreground in this terminal; Ctrl-C stops it
+```
+
+The background log is `~/symphony-workspaces/logs/orchestrator.log`; set `SYMPHONY_STATE_DIR` to keep the log and PID file elsewhere. On macOS, `start` also keeps the Mac from idle-sleeping while the orchestrator runs.
+
 ## Configuration
 
 `WORKFLOW.md` has YAML front matter followed by a [Liquid](https://liquidjs.com/) prompt template. Unknown variables and filters are errors. If you save an invalid file, the orchestrator logs the error and keeps using the last valid version.

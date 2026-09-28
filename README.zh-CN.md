@@ -92,6 +92,20 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 | `--once` | 只轮询一次，等派发出去的 agent 结束后退出。 |
 | `--log-level` | `debug`、`info`（默认）、`warn` 或 `error`。日志是输出到 stderr 的 `key=value` 行。 |
 
+**也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，第一次用过工作流路径后就记住它，并且拒绝启动第二个调度器：
+
+```sh
+ln -s "$PWD/bin/symphony" /usr/local/bin/symphony   # 可选：放到 PATH 上
+
+symphony start ~/code/your-repo/WORKFLOW.md   # 后台运行；之后直接 `symphony start`
+symphony status                               # 有没有在跑、最近一次轮询和最近的事件
+symphony logs                                 # 实时看日志
+symphony stop                                 # 停止 agent 和调度器，工作区保留
+symphony run                                  # 在当前终端前台运行，Ctrl-C 停止
+```
+
+后台运行的日志在 `~/symphony-workspaces/logs/orchestrator.log`；设置 `SYMPHONY_STATE_DIR` 可以把日志和 PID 文件放到别处。在 macOS 上，`start` 还会在调度器运行期间阻止 Mac 自动休眠。
+
 ## 配置
 
 `WORKFLOW.md` 由 YAML front matter 和一个 [Liquid](https://liquidjs.com/) 提示词模板组成；未知的变量和过滤器都会报错。保存了无效的文件时，调度器记录错误，继续用上一份有效配置。
