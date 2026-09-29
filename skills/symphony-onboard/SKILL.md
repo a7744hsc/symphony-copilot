@@ -116,7 +116,7 @@ Run `$SYMPHONY_HOME/bin/symphony check WORKFLOW.md` and fix every error. The onl
 Show the user what you wrote, then list the next steps. They need the user's GitHub login, so the user runs them in a terminal:
 
 1. Commit and push the files; agents clone the repository, so the files must be on the default branch.
-2. `gh auth refresh -s project`, then `$SYMPHONY_HOME/bin/symphony setup-board WORKFLOW.md`: it creates the board, writes `project_number`, and lists the project settings to change in the browser. Commit the number.
+2. `gh auth refresh -s project`, then `$SYMPHONY_HOME/bin/symphony setup-board WORKFLOW.md`: it creates the board, writes `project_number`, and explains that GitHub Project workflows are separate, cannot be configured through the public API, and do not need changes for onboarding. If card statuses later change unexpectedly or skip a Symphony stage, inspect enabled workflows on the project's Workflows page. Commit the number.
 3. `$SYMPHONY_HOME/bin/symphony check WORKFLOW.md --online`, then a dry run: `node $SYMPHONY_HOME/src/cli.ts WORKFLOW.md --dry-run --once`.
 4. Write the first card with the symphony-write-card skill.
 

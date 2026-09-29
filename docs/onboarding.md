@@ -123,12 +123,7 @@ As soon as the project exists, it writes the number into `tracker.provider.proje
 
 If `project_number` already points to a board, `setup-board` shows its name and card count and offers to delete it and start over, or to exit (the default). Deleting needs the board number typed in; the issues stay, but every card's status and fields are lost. It never edits an existing board.
 
-GitHub has no API for a project's workflows, so `setup-board` ends with the settings to change in the browser:
-
-- "Item closed" and "Pull request merged": set the status to your first terminal column;
-- "Item added to project": turn it off, or pick a column agents do not work on;
-- "Pull request linked to issue": turn it off; it moves the card when the agent opens its pull request;
-- "Auto-add to project": turn it on for the repository with the filter `is:issue`.
+GitHub Project workflows are separate from `WORKFLOW.md` and can change card statuses automatically. GitHub's public API does not let `setup-board` configure or enable these workflows, and onboarding does not require you to change them. If a card changes status unexpectedly or skips a Symphony stage, inspect the enabled workflows in the browser at the project's **Workflows** page; one may be responsible.
 
 Then add a Board view to see the columns, and compare the board with `WORKFLOW.md`:
 

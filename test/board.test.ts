@@ -67,9 +67,10 @@ test("the board check names missing columns, labels and a disruptive project wor
   assert.deepEqual(boardFindings(config, settings, snapshot).map((f) => `${f.level}: ${f.message.split(":")[0]}`), [
     'error: column "Blocked" (tracker.provider.blocked_state) is not an option of the board\'s "Status" field',
     'error: priority "Later" (tracker.provider.followups.priority) is not an option of the board\'s "Priority" field',
-    'warning: project workflow "Pull request linked to issue" is on',
+    'warning: project workflow "Pull request linked to issue" is enabled',
     'warning: label "tech-debt" (tracker.provider.followups.labels) does not exist in me/app; follow-ups are filed without it',
   ]);
+  assert.match(boardFindings(config, settings, snapshot)[2]!.message, /inspect it at .*\/workflows if status transitions are unexpected/);
   assert.match(boardFindings(config, settings, { project: null, repo: null }).map((f) => f.message).join("\n"), /me#1 was not found[\s\S]*me\/app was not found/);
 });
 
@@ -149,7 +150,9 @@ test("setup-board creates the board from the workflow and writes its number back
   assert.equal(calls[4]!.body.variables.name, "Priority");
   assert.equal(calls[5]!.url, "https://api.github.com/repos/me/app/labels");
   assert.equal(calls[5]!.body.name, "agent");
-  assert.ok(lines.some((l) => l.includes('"Item closed" and "Pull request merged": set the status to "Done"')));
+  assert.ok(lines.some((l) => l.includes("No workflow changes are required.")));
+  assert.ok(lines.some((l) => l.includes("inspect enabled workflows")));
+  assert.ok(!lines.some((l) => l.includes('"Pull request linked to issue": turn it off')));
 });
 
 const EXISTING = WORKFLOW.replace("owner_type: user\n", "owner_type: user\n    project_number: 3\n");

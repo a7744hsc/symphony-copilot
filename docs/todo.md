@@ -19,7 +19,7 @@
 | # | 待办 | 起因 | 状态 |
 |---|---|---|---|
 | 6 | `doctor` 命令：Node 版本、gh 登录和 `project` 权限、Copilot 认证与额度、看板状态和标签、git 能否推送、`WORKFLOW.md` 能否解析和渲染，逐项给修复提示 | 这些都手动排查过；detent 有同类命令 | 未开始 |
-| 7 | 按 `WORKFLOW.md` 一键新建看板：先生成 `WORKFLOW.md`（待办 38），脚本读它的 `tracker`、`review`、`merge_conflicts` 段，新建看板，建状态选项、优先级字段和标签，关联仓库，然后把 `project_number` 写进 `WORKFLOW.md` 并在命令行说明。`project_number` 已填且看板存在时，问用户删掉重建还是退出（默认退出；删之前显示看板名和卡片数，要输入看板编号确认）。项目自动化（Auto-add、Pull request linked）先确认 API 能不能改，不能就打印网页上要改的步骤 | 建看板时手动做了很多步；状态名写错不报错，dry-run 只显示 0 张卡；Issue 不在看板上就不会被派发，文档没提 Auto-add | 已完成：`symphony setup-board`。项目自动化 API 只能读、不能改（列表里也没有 Auto-add），改为打印网页上的步骤；新看板的 Board 视图也要手动加。还没在真实账号上跑过 |
+| 7 | 按 `WORKFLOW.md` 一键新建看板：先生成 `WORKFLOW.md`（待办 38），脚本读它的 `tracker`、`review`、`merge_conflicts` 段，新建看板，建状态选项、优先级字段和标签，关联仓库，然后把 `project_number` 写进 `WORKFLOW.md` 并在命令行说明。`project_number` 已填且看板存在时，问用户删掉重建还是退出（默认退出；删之前显示看板名和卡片数，要输入看板编号确认）。确认项目自动化 API 能力后，提示其存在和配置限制，不要求用户修改 | 建看板时手动做了很多步；状态名写错不报错，dry-run 只显示 0 张卡；Issue 不在看板上就不会被派发，文档没提 Auto-add | 已完成：`symphony setup-board`。GitHub 公共 API 可读取 Project workflow，但不能配置或启用它们；setup-board 说明这些自动化可能影响状态流转，异常时建议检查网页 Workflows 页面，不要求修改；新 Board 视图仍需单独创建 |
 | 8 | 发布 npm 包，支持 `npx`：加编译步骤，发布 JS | Node 不剥离 `node_modules` 里 `.ts` 的类型，直接发源码跑不起来 | 未开始 |
 | 9 | README 开头放演示 GIF：卡片 → PR → Human Review | 受欢迎的项目开头都有画面 | 未开始 |
 | 10 | 终端实时状态：每个 agent 的轮次、最近动作、已用高级请求 | 现在只能翻日志 | 未开始 |

@@ -87,7 +87,7 @@ symphony setup-board      # 按 WORKFLOW.md 新建看板，并把看板编号写
 | Blocked | agent 需要帮助，会先在 Issue 下留言 |
 | Done、Canceled | 终止：删除工作区；如果 agent 还在运行就立即删，否则在调度器下次启动时删 |
 
-GitHub 没有设置项目自动化（workflows）的 API，所以 `setup-board` 最后会列出要在网页上改的几项。最要紧的是关掉 “Pull request linked to issue”，否则 PR 一开，卡片就会被移到别的列。
+GitHub Project workflows（项目工作流）独立于 `WORKFLOW.md`，也可能自动改变卡片状态。由于 GitHub 没有公开 API 可供 `setup-board` 配置或启用这些 workflow，上手时不需要修改它们。如果卡片状态意外变化或跳过了 Symphony 阶段，可以到项目网页的 **Workflows** 页面检查已启用的 workflow；它可能是原因之一。
 
 **3. 运行。**
 

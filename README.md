@@ -85,7 +85,7 @@ Commit the files, so the prompt is versioned with your code. The board gets thes
 | Blocked | The agent needs help; it comments on the issue first |
 | Done, Canceled | Terminal: the workspace is deleted, right away if an agent is still running, otherwise the next time the orchestrator starts |
 
-GitHub has no API for a project's workflows, so `setup-board` ends with the few to change in the browser. The important one: turn off "Pull request linked to issue", or the card jumps to another column when the PR opens.
+GitHub Project workflows are separate from `WORKFLOW.md` and may change card statuses automatically. `setup-board` cannot configure or enable them because GitHub's public API does not expose workflow configuration; you do not need to change them during onboarding. If a card changes status unexpectedly or skips a Symphony stage, inspect the enabled workflows on the project's **Workflows** page; one may be responsible.
 
 **3. Run it.**
 

@@ -165,8 +165,8 @@ export function boardFindings(config: ServiceConfig, settings: GitHubProjectSett
     const workflow = (name: string) => p.workflows.find((w) => same(w.name, name));
     if (workflow("Pull request linked to issue")?.enabled) {
       warn(config.review
-        ? `project workflow "Pull request linked to issue" is on: it moves the card when the agent opens its pull request, which skips the review agent; turn it off at ${p.url}/workflows`
-        : `project workflow "Pull request linked to issue" is on: it moves the card when the agent opens its pull request; make it set "${settings.handoffState ?? "the handoff column"}" or turn it off at ${p.url}/workflows`);
+        ? `project workflow "Pull request linked to issue" is enabled: it may move the card when the agent opens its pull request, potentially skipping the review agent; inspect it at ${p.url}/workflows if status transitions are unexpected`
+        : `project workflow "Pull request linked to issue" is enabled: it may move the card when the agent opens its pull request instead of to "${settings.handoffState ?? "the handoff column"}"; inspect it at ${p.url}/workflows if status transitions are unexpected`);
     }
   }
   if (!snapshot.repo) {
@@ -290,14 +290,11 @@ async function createBoard(api: GitHubApi, settings: GitHubProjectSettings, desi
   return { url: project.url, labelsCreated };
 }
 
-export function manualSteps(config: ServiceConfig, settings: GitHubProjectSettings, url: string): string[] {
-  const done = config.tracker.terminalStates[0] ?? "Done";
+export function workflowNotes(url: string): string[] {
   return [
-    `Finish in the browser at ${url}/workflows (GitHub has no API for these):`,
-    `  - "Item closed" and "Pull request merged": set the status to "${done}"`,
-    `  - "Item added to project": turn it off, or pick a column agents do not work on, so a new card waits until you move it`,
-    `  - "Pull request linked to issue": turn it off; it moves the card when the agent opens its pull request`,
-    `  - "Auto-add to project": turn it on for ${settings.repoOwner}/${settings.repoName} with the filter "is:issue", so new issues land on the board`,
+    "GitHub Project workflows are separate from WORKFLOW.md and may change card statuses automatically.",
+    "setup-board cannot configure or enable them because GitHub's public API does not expose workflow configuration. No workflow changes are required.",
+    `If a card changes status unexpectedly or skips a Symphony stage, inspect enabled workflows at ${url}/workflows; they may be the cause.`,
     `Then add a Board view (New view > Board) to see the columns.`,
   ];
 }
@@ -392,7 +389,7 @@ export async function setupBoard(o: SetupOptions): Promise<number> {
   });
   o.print(`Set up ${result.url}${result.labelsCreated.length > 0 ? `; created labels ${result.labelsCreated.join(", ")}` : ""}.`);
   o.print("");
-  for (const line of manualSteps(config, settings, result.url)) o.print(line);
+  for (const line of workflowNotes(result.url)) o.print(line);
   o.print("");
   o.print("Next: commit WORKFLOW.md, run `symphony check --online`, then do a dry run.");
   return 0;

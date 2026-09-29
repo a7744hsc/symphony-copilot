@@ -144,7 +144,7 @@ Prompts are [Liquid](https://liquidjs.com/) templates. An unknown variable or fi
 | `required_labels` is not empty, `hooks.after_create` is set, and with review `hooks.before_run` resets the reviewer's workspace | Warning |
 | `project_number` is set; the token is a `$VAR` reference, not a literal | Warning |
 
-`--online` also reads the board with the token: every column the workflow names is a Status option, the follow-up priority is a Priority option, the labels exist in the repository, and the project workflow "Pull request linked to issue" is off.
+`--online` also reads the board with the token: every column the workflow names is a Status option, the follow-up priority is a Priority option, and the labels exist in the repository. It warns if the project workflow "Pull request linked to issue" is enabled because it may change card status independently of Symphony. It does not change GitHub Project workflows; inspect the project's Workflows page if a card's status transitions are unexpected.
 
 ## Scheduling guarantees
 
