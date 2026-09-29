@@ -53,32 +53,39 @@ flowchart LR
 
 You need Node.js 24 or later (it runs the TypeScript directly), git, the [GitHub CLI](https://cli.github.com/), and a GitHub account with a Copilot plan. It is developed on macOS, and CI also runs the tests on Linux. Windows is untested.
 
-**1. Prepare the board.** Create a GitHub Project (or use an existing one) with these options in its Status field:
-
-| Status | Meaning |
-|---|---|
-| Todo, In Progress, Rework | Active: the orchestrator runs an agent on these cards |
-| Human Review | Handoff: the agent submitted a PR and waits for you |
-| Blocked | The agent needs help; it comments on the issue first |
-| Done, Canceled | Terminal: the workspace is deleted, right away if an agent is still running, otherwise the next time the orchestrator starts |
-
-Optionally, add a single-select Priority field with options like `P1`, `P2`, `P3` (lower numbers run first). In the project's workflows, set "Pull request linked to issue" to Human Review or turn it off. Otherwise the card jumps back to an active column when the PR opens, and the agent starts again.
-
-**2. Install and sign in.**
+**1. Install and sign in.**
 
 ```sh
 git clone https://github.com/a7744hsc/symphony-copilot.git
 cd symphony-copilot
-npm install
-
-gh auth login              # the account with your Copilot plan
-gh auth refresh -s project # the orchestrator reads and moves cards
-gh auth setup-git          # lets the orchestrator push agent branches
 ```
 
-**3. Add a `WORKFLOW.md` to your repository.** Copy [examples/WORKFLOW.md](examples/WORKFLOW.md) to the root of the repository the agents will work on. Fill in `owner`, `project_number` and `repo`, adjust the status names, and list your build and test commands in `copilot.shell_allow`. The Markdown body is the agent's prompt. Commit the file so the prompt is versioned with your code.
+Run the first-run wizard from this checkout: `bash scripts/setup.sh` on macOS/Linux, or `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1` on Windows. It checks Node.js 24+, Git 2.38+, npm and GitHub CLI, guides you to official installers when something is missing, runs `npm ci`, signs in through `gh`, requests the Projects scope, and configures Git credentials. It never asks for or stores your password or token. Details: [first-run setup](docs/onboarding.md#install-and-sign-in).
 
-**4. Run it.**
+On macOS/Linux, optionally put `symphony` on your PATH: `ln -s "$PWD/bin/symphony" /usr/local/bin/symphony`.
+
+**2. Set up your repository.** One file at the root of the repository the agents work on, `WORKFLOW.md`, describes everything: the board and its columns, how a workspace is prepared, which commands agents may run, and the agents' prompt. You write it first, and the board is created from it. [docs/onboarding.md](docs/onboarding.md) walks through it:
+
+```sh
+symphony install-skills   # once: adds the symphony-onboard and symphony-write-card skills to Copilot
+# In your repository, run /symphony-onboard in Copilot (VS Code or CLI). It writes WORKFLOW.md,
+# AGENTS.md and REVIEW.md from the templates in examples/ and checks them with `symphony check`.
+symphony setup-board      # creates the board WORKFLOW.md describes and writes its number into WORKFLOW.md
+```
+
+Commit the files, so the prompt is versioned with your code. The board gets these columns; the names are yours to choose in `WORKFLOW.md`:
+
+| Status | Meaning |
+|---|---|
+| Todo, In Progress, Rework | Active: the orchestrator runs an agent on these cards |
+| AI Review | Active: a second agent reviews the pull request (see [Independent review](#independent-review)) |
+| Human Review | Handoff: the work waits for you |
+| Blocked | The agent needs help; it comments on the issue first |
+| Done, Canceled | Terminal: the workspace is deleted, right away if an agent is still running, otherwise the next time the orchestrator starts |
+
+GitHub has no API for a project's workflows, so `setup-board` ends with the few to change in the browser. The important one: turn off "Pull request linked to issue", or the card jumps to another column when the PR opens.
+
+**3. Run it.**
 
 ```sh
 export SYMPHONY_GITHUB_TOKEN=$(gh auth token)   # used by the orchestrator only, never passed to agents
@@ -87,7 +94,7 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md --dry-run --once   # read-only: sho
 node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # keeps running; Ctrl-C to stop
 ```
 
-Then label an issue `agent`, move its card to Todo, and watch the log.
+Then write a card with `/symphony-write-card` (or label an issue `agent` and move its card to Todo), and watch the log.
 
 | Flag | Effect |
 |---|---|
@@ -98,8 +105,6 @@ Then label an issue `agent`, move its card to Todo, and watch the log.
 **Or use `bin/symphony`**, which fetches the token from `gh`, remembers the workflow path after the first use, and refuses to start a second orchestrator:
 
 ```sh
-ln -s "$PWD/bin/symphony" /usr/local/bin/symphony   # optional: put it on your PATH
-
 symphony start ~/code/your-repo/WORKFLOW.md   # background; later just `symphony start`
 symphony status                               # running? last poll and recent events
 symphony logs                                 # follow the log
@@ -111,7 +116,7 @@ The background log is `~/symphony-workspaces/logs/orchestrator.log`; set `SYMPHO
 
 ## Configuration
 
-`WORKFLOW.md` has YAML front matter followed by a [Liquid](https://liquidjs.com/) prompt template. Unknown variables and filters are errors. If you save an invalid file, the orchestrator logs the error and keeps using the last valid version.
+`WORKFLOW.md` has YAML front matter followed by a [Liquid](https://liquidjs.com/) prompt template. Unknown variables and filters are errors. If you save an invalid file, the orchestrator logs the error and keeps using the last valid version. Every key is described in [schema/workflow.schema.json](schema/workflow.schema.json), and `symphony check` validates a file against it and the rules in [docs/reference.md](docs/reference.md#checking-a-workflow).
 
 The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their meaning and defaults. There are three additions:
 
@@ -209,7 +214,6 @@ Early (v0.1). It has been used end to end on one real project (Swift, with Xcode
 
 Planned next:
 
-- An `init` command that sets up the board's status options and writes a starter `WORKFLOW.md`
 - An npm package, so you can run it with `npx`
 - Live status in the terminal, and the spec's optional HTTP status API
 - Keeping run evidence (logs, screenshots) after a workspace is removed

@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/a7744hsc/symphony-copilot/blob/main/schema/workflow.schema.json",
+  "title": "symphony-copilot WORKFLOW.md front matter",
+  "description": "The YAML front matter of WORKFLOW.md. The Markdown body after it is the implementer's prompt, a Liquid template (variables: docs/reference.md#prompt-templates). Every column named here must be an option of the board's Status field; `symphony setup-board` creates a board with exactly these options. Validate a file with `symphony check`: this schema lists the keys, the orchestrator checks the values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tracker"],
+  "properties": {
+    "tracker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "provider", "active_states", "terminal_states"],
+      "properties": {
+        "kind": { "const": "github_project", "description": "Tracker adapter. Only github_project exists." },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["owner", "repo"],
+          "description": "Settings of the github_project adapter.",
+          "properties": {
+            "owner": { "type": "string", "description": "User or organization that owns the project board." },
+            "owner_type": { "enum": ["user", "organization"], "default": "user" },
+            "project_number": { "type": "integer", "minimum": 1, "description": "Number in the board URL (.../projects/<number>). Leave it out until the board exists: `symphony setup-board` creates the board and writes the number here." },
+            "repo": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$", "description": "Repository as owner/name. Only its issues are dispatched; branches and pull requests go here." },
+            "token": { "type": "string", "default": "$SYMPHONY_GITHUB_TOKEN", "description": "A $ENV_VAR reference to a GitHub token with the project and repo scopes. Never write the token itself here. bin/symphony fills SYMPHONY_GITHUB_TOKEN from `gh auth token`." },
+            "endpoint": { "type": "string", "default": "https://api.github.com/graphql" },
+            "status_field": { "type": "string", "default": "Status", "description": "Single-select field whose options are the columns." },
+            "priority_field": { "type": "string", "default": "Priority", "description": "Single-select field with options like P1, P2 (the number is the priority; lower runs first), or a number field." },
+            "identifier_prefix": { "type": "string", "default": "GH-", "description": "Prefix of issue identifiers in logs, prompts and workspace names." },
+            "branch_prefix": { "type": "string", "default": "agent/", "description": "Agent branches are <branch_prefix><issue number>." },
+            "agent_states": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Columns the agent may move its card to with tracker_set_status, typically the in-progress column and blocked_state. Without it that tool is not offered." },
+            "handoff_state": { "type": "string", "description": "Column tracker_submit_for_review moves the card to. With review, one of review.states; otherwise a waiting column such as Human Review. Never an implementer column, or the agent starts again right away." },
+            "blocked_state": { "type": "string", "description": "Column the orchestrator moves a card to when its run reaches a run limit. Not an active column and not in merge_conflicts.states. Without it, a halted card stays where it is." },
+            "evidence_branch": { "type": "string", "default": "symphony-evidence", "description": "Branch that stores screenshots attached to submissions. Never merged; keep it, or the images stop loading." },
+            "followups": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Lets agents file out-of-scope problems as new issues with tracker_create_followup.",
+              "properties": {
+                "labels": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Labels of the new issues. Never a label from tracker.required_labels: a person decides when a follow-up is worked on." },
+                "state": { "type": "string", "description": "Column of the new card." },
+                "priority": { "type": "string", "description": "Priority option of the new card, for example P4." },
+                "max_per_session": { "type": "integer", "minimum": 1, "default": 3 }
+              }
+            }
+          }
+        },
+        "required_labels": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Only issues with all these labels are dispatched (case-insensitive). Usually [agent]." },
+        "active_states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Columns agents work on, in board order. Includes review.states and merge_conflicts.return_state." },
+        "terminal_states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Finished columns. The workspace of a card here is deleted." }
+      }
+    },
+    "polling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "interval_ms": { "type": "integer", "minimum": 1000, "default": 30000, "description": "How often the board is read." }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "root": { "type": "string", "default": "<system temp dir>/symphony_workspaces", "description": "One folder per issue is created here. Supports ~, $VAR and paths relative to WORKFLOW.md. Keep it outside the repository and use one orchestrator per root; the run ledger .symphony-ledger.json lives here." }
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Shell scripts run with `bash -lc` inside the workspace, with network access (agents have none) and without tracker tokens. Variables: SYMPHONY_ISSUE_ID, SYMPHONY_ISSUE_IDENTIFIER, SYMPHONY_ISSUE_BRANCH, SYMPHONY_WORKSPACE, SYMPHONY_WORKSPACE_KEY, SYMPHONY_ROLE (implement or review) and, for the reviewer, SYMPHONY_IMPLEMENTER_WORKSPACE.",
+      "properties": {
+        "after_create": { "type": "string", "description": "Runs once in the new, empty workspace: clone the repository, switch to $SYMPHONY_ISSUE_BRANCH, install dependencies. A failure fails the attempt." },
+        "before_run": { "type": "string", "description": "Runs before every session; a failure fails the attempt. With review, reset the reviewer's workspace to the pushed branch when $SYMPHONY_ROLE is review." },
+        "after_run": { "type": "string", "description": "Runs after every session; a failure is logged and ignored." },
+        "before_remove": { "type": "string", "description": "Runs before a workspace is deleted; a failure is ignored." },
+        "timeout_ms": { "type": "integer", "minimum": 1, "default": 60000 }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrent_agents": { "type": "integer", "minimum": 1, "default": 10 },
+        "max_turns": { "type": "integer", "minimum": 1, "default": 20, "description": "Turns per Copilot session." },
+        "max_sessions": { "type": "integer", "minimum": 1, "default": 5, "description": "Copilot sessions per card per run. A run ends when the card leaves the active columns." },
+        "usage_comments": { "type": "boolean", "default": true, "description": "Comment the usage of every session on the issue." },
+        "max_retry_backoff_ms": { "type": "integer", "minimum": 1000, "default": 300000 },
+        "max_concurrent_agents_by_state": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1 }, "description": "Column name to the most agents working that column at once." },
+        "continuation_prompt": { "type": "string", "description": "Liquid template sent at the start of every later turn. Variables: issue, turn, max_turns." }
+      }
+    },
+    "copilot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cli_path": { "type": "string", "description": "Copilot CLI binary to run instead of the runtime bundled with the SDK." },
+        "model": { "type": "string", "description": "Model for the implementer, for example auto or a model id. Omit for the runtime default." },
+        "reasoning_effort": { "enum": ["low", "medium", "high", "xhigh", "max"] },
+        "max_ai_credits": { "type": "integer", "minimum": 1, "description": "Per-session cap enforced by the runtime, which tells the model; prefer max_ai_credits_per_issue." },
+        "max_ai_credits_per_issue": { "type": "integer", "minimum": 1, "description": "AI credits per card per run, enforced by the orchestrator without telling the model." },
+        "startup_timeout_ms": { "type": "integer", "minimum": 1, "default": 60000 },
+        "turn_timeout_ms": { "type": "integer", "minimum": 1, "default": 3600000, "description": "Longest silence between session events within a turn." },
+        "stall_timeout_ms": { "type": "integer", "default": 300000, "description": "The orchestrator restarts an agent silent this long; <= 0 disables it." },
+        "shell_allow": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Commands allowed in addition to the built-in git and file tools, matched by prefix (for example `npm test`). Exact build and test commands are safer than interpreters like `node` or `python3`, which can run anything." },
+        "shell_deny": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Commands denied in addition to the built-in list. Deny wins." },
+        "read_allow": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Directories outside the workspace the agent may read, such as a toolchain." },
+        "url_allow": { "type": "array", "items": { "type": "string" }, "default": [], "description": "URL prefixes the agent may fetch." },
+        "user_input_reply": { "type": "string", "description": "Automatic answer when the agent asks a question." }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["states", "prompt_file", "pass_state", "fail_state"],
+      "description": "An independent reviewer agent that checks every submission in its own session and workspace before a person sees it.",
+      "properties": {
+        "states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Columns worked by the reviewer; also listed in tracker.active_states. Make one of them tracker.provider.handoff_state." },
+        "prompt_file": { "type": "string", "description": "Reviewer prompt, a Liquid template relative to WORKFLOW.md. Variables: issue, attempt, review_round, max_review_rounds, implementer_workspace." },
+        "model": { "type": "string", "description": "Ideally a different model family from the implementer." },
+        "reasoning_effort": { "enum": ["low", "medium", "high", "xhigh", "max"] },
+        "pass_state": { "type": "string", "description": "Column for approved work, a waiting column such as Human Review; not an active column." },
+        "fail_state": { "type": "string", "description": "Column for requested changes, an active column worked by the implementer such as Rework." },
+        "max_rounds": { "type": "integer", "minimum": 1, "default": 3, "description": "After the last round, a failing card goes to pass_state for a person to decide." },
+        "continuation_prompt": { "type": "string", "description": "Liquid template for later reviewer turns. Variables: issue, turn, max_turns." }
+      }
+    },
+    "merge_conflicts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["states", "return_state"],
+      "description": "Sends a waiting card back to the implementer, ahead of other work, when its pull request stops merging.",
+      "properties": {
+        "states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Waiting columns whose open pull requests are checked on every poll; not active, not terminal." },
+        "return_state": { "type": "string", "description": "Active implementer column the card is moved to, such as Rework." }
+      }
+    }
+  }
+}

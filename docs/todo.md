@@ -19,14 +19,15 @@
 | # | 待办 | 起因 | 状态 |
 |---|---|---|---|
 | 6 | `doctor` 命令：Node 版本、gh 登录和 `project` 权限、Copilot 认证与额度、看板状态和标签、git 能否推送、`WORKFLOW.md` 能否解析和渲染，逐项给修复提示 | 这些都手动排查过；detent 有同类命令 | 未开始 |
-| 7 | 按 `WORKFLOW.md` 一键新建看板：先生成 `WORKFLOW.md`（待办 38），脚本读它的 `tracker`、`review`、`merge_conflicts` 段，新建看板，建状态选项、优先级字段和标签，关联仓库，然后把 `project_number` 写进 `WORKFLOW.md` 并在命令行说明。`project_number` 已填且看板存在时，问用户删掉重建还是退出（默认退出；删之前显示看板名和卡片数，要输入看板编号确认）。项目自动化（Auto-add、Pull request linked）先确认 API 能不能改，不能就打印网页上要改的步骤 | 建看板时手动做了很多步；状态名写错不报错，dry-run 只显示 0 张卡；Issue 不在看板上就不会被派发，文档没提 Auto-add | 未开始 |
+| 7 | 按 `WORKFLOW.md` 一键新建看板：先生成 `WORKFLOW.md`（待办 38），脚本读它的 `tracker`、`review`、`merge_conflicts` 段，新建看板，建状态选项、优先级字段和标签，关联仓库，然后把 `project_number` 写进 `WORKFLOW.md` 并在命令行说明。`project_number` 已填且看板存在时，问用户删掉重建还是退出（默认退出；删之前显示看板名和卡片数，要输入看板编号确认）。项目自动化（Auto-add、Pull request linked）先确认 API 能不能改，不能就打印网页上要改的步骤 | 建看板时手动做了很多步；状态名写错不报错，dry-run 只显示 0 张卡；Issue 不在看板上就不会被派发，文档没提 Auto-add | 已完成：`symphony setup-board`。项目自动化 API 只能读、不能改（列表里也没有 Auto-add），改为打印网页上的步骤；新看板的 Board 视图也要手动加。还没在真实账号上跑过 |
 | 8 | 发布 npm 包，支持 `npx`：加编译步骤，发布 JS | Node 不剥离 `node_modules` 里 `.ts` 的类型，直接发源码跑不起来 | 未开始 |
 | 9 | README 开头放演示 GIF：卡片 → PR → Human Review | 受欢迎的项目开头都有画面 | 未开始 |
 | 10 | 终端实时状态：每个 agent 的轮次、最近动作、已用高级请求 | 现在只能翻日志 | 未开始 |
 | 11 | 社区文件：CONTRIBUTING、SECURITY.md、Issue 模板、Dependabot | 公开仓库的基本配置 | 未开始 |
-| 38 | `WORKFLOW.md` 契约：front matter 的 JSON Schema（每个键的类型、默认值、说明），和检查工具 `symphony check`：解析、按 schema 报未知键、跑 `buildConfig` 的跨字段校验、用示例 Issue 渲染提示词模板。再加一个交互式生成 `WORKFLOW.md` 的 skill：读仓库定构建命令、hooks 和允许列表，按契约填写，跑 check 直到通过 | 各列该写进 `active_states`、`agent_states`、`handoff_state`、`review.states`、`merge_conflicts` 哪一项，分散在 README 三节和 reference 里；拼错的键现在被静默忽略。契约管“填得对不对”，skill 管“按这个项目该填什么” | 未开始 |
-| 39 | 通用的 `AGENTS.md`、`REVIEW.md` 模板（放 `examples/`），和按仓库生成它们的 skill；示例 `WORKFLOW.md` 补上 `review` 段和审核者的 `before_run` 重置 | 示例提示词让 agent 先读 AGENTS.md，但没有写法和示例；REVIEW.md 和重置分支的 hook 只在试点仓库里有 | 未开始 |
-| 40 | 卡片契约：Issue 表单模板（目标、验收条件、怎么验证、范围外），和写卡片的 skill（写好后建 Issue、加到看板、打 `agent` 标签） | 卡片怎么写没有任何文档，而验收条件和验证方式直接决定 agent 做得对不对 | 未开始 |
+| 38 | `WORKFLOW.md` 契约：front matter 的 JSON Schema（每个键的类型、默认值、说明），和检查工具 `symphony check`：解析、按 schema 报未知键、跑 `buildConfig` 的跨字段校验、用示例 Issue 渲染提示词模板。再加一个交互式生成 `WORKFLOW.md` 的 skill：读仓库定构建命令、hooks 和允许列表，按契约填写，跑 check 直到通过 | 各列该写进 `active_states`、`agent_states`、`handoff_state`、`review.states`、`merge_conflicts` 哪一项，分散在 README 三节和 reference 里；拼错的键现在被静默忽略。契约管“填得对不对”，skill 管“按这个项目该填什么” | 已完成：`schema/workflow.schema.json`（测试保证它和代码读的键一致）、`symphony check`（`--online` 核对看板）、skill `symphony-onboard`，用 `symphony install-skills` 装到 `~/.copilot/skills` |
+| 39 | 通用的 `AGENTS.md`、`REVIEW.md` 模板（放 `examples/`），和按仓库生成它们的 skill；示例 `WORKFLOW.md` 补上 `review` 段和审核者的 `before_run` 重置 | 示例提示词让 agent 先读 AGENTS.md，但没有写法和示例；REVIEW.md 和重置分支的 hook 只在试点仓库里有 | 已完成：`examples/AGENTS.md`、`examples/REVIEW.md`，由 `symphony-onboard` 按仓库生成 |
+| 40 | 卡片契约：Issue 表单模板（目标、验收条件、怎么验证、范围外），和写卡片的 skill（写好后建 Issue、加到看板、打 `agent` 标签） | 卡片怎么写没有任何文档，而验收条件和验证方式直接决定 agent 做得对不对 | 已完成：`examples/ISSUE_TEMPLATE/agent-task.yml`（故意不自动加标签）、skill `symphony-write-card` |
+| 47 | 跨平台 setup 向导：从仓库目录运行，不依赖 Node 启动；检查 Node 24+、Git 2.38+、npm、GitHub CLI，按系统给出/执行官方维护的安装方式，交互式 `gh auth login`、刷新 `project` scope、配置 git 凭据，最后安装 npm 依赖并验证；支持 macOS、Linux、Windows（Bash + PowerShell） | 新用户需要分别找安装说明、装工具、登录并配权限；直接发版前要先让本地源码 checkout 能快速就绪 | 已实现：`scripts/setup.sh`、`scripts/setup.ps1`；macOS 上用 mock 工具测试登录/安装流程和缺 Node 失败路径。Windows/Linux 尚未实机验证；缺 Node/Git 时向导给官方安装来源，不静默下载执行 |
 
 ### P1：运行质量
 
@@ -46,7 +47,7 @@
 | 31 | 再次提交审核时用新的 summary 更新 PR 正文（保留评论记录） | 返工后 PR 正文还是第一次的内容，审核的人要翻评论才知道现状 | 未开始 |
 | 32 | shell 命令的路径检查补上命令文本里的绝对路径、`~`、`$HOME` 和通配符（按通配符前的部分判断），超出工作区就拒绝 | GH-14 的 agent 用 `for d in /Users/<用户>/*/work/art-raw …` 搜主目录，放行了。`policy.ts` 只检查运行时解析出的 `possiblePaths`，通配符和变量展开后的路径不在里面 | 未开始 |
 | 34 | 等人处理的 PR 与主分支冲突时，退回实现者并优先派发 | GH-13 的 PR #22 在待验证时，因为 #23 先合并而冲突；调度器只看活跃列，没人管 | 已完成（1b4fb28）：`merge_conflicts`（`states`、`return_state`）；提交审核前用 `git merge-tree` 检查冲突 |
-| 35 | `merge_conflicts.states` 不能包含 `tracker.provider.blocked_state`：配置校验时拒绝，或 `returnConflicted` 跳过受阻列的卡片 | 受阻卡片不在活跃列，`closeFinishedRuns` 会结束它的运行；冲突退回时开的是新运行、上限全新，冲突解决不了就会无限循环地花钱 | 未开始 |
+| 35 | `merge_conflicts.states` 不能包含 `tracker.provider.blocked_state`：配置校验时拒绝，或 `returnConflicted` 跳过受阻列的卡片 | 受阻卡片不在活跃列，`closeFinishedRuns` 会结束它的运行；冲突退回时开的是新运行、上限全新，冲突解决不了就会无限循环地花钱 | 部分完成：`symphony check` 报错拦下这种配置；运行时还没拦 |
 | 36 | 冲突退回时记下 PR 的 `headRefOid`，同一个提交不重复退回 | GitHub 异步处理推送，交接后很快轮询可能读到旧提交的 `CONFLICTING`，白跑一次会话、多发一条留言 | 未开始 |
 | 37 | 提交审核时的冲突检查改为对比 PR 的 `baseRefName`（没有 PR 时再用默认分支） | 现在提交时对比 `origin/<默认分支>`，调度器看的是 PR 的目标分支；有人改了 PR 目标分支时，卡片会每次轮询来回退，每次都是新运行 | 未开始 |
 

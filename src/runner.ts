@@ -199,6 +199,8 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
         model: (review?.model ?? config.copilot.model) ?? undefined,
         reasoningEffort: ((review?.reasoningEffort ?? config.copilot.reasoningEffort) ?? undefined) as "low" | "medium" | "high" | "xhigh" | "max" | undefined,
         sessionLimits: config.copilot.maxAiCredits ? { maxAiCredits: config.copilot.maxAiCredits } : undefined,
+        // Installed for people setting up a repository, not for agents working a card.
+        disabledSkills: ["symphony-onboard", "symphony-write-card"],
         tools: p.tracker.agentTools({
           issue: p.issue,
           workspacePath: workspace.path,

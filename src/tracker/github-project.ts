@@ -6,6 +6,7 @@ import { ExecError, run } from "../exec.ts";
 import { truncate, type Logger } from "../log.ts";
 import { isInside } from "../policy.ts";
 import { normalizeState, type BlockerRef, type Issue } from "../types.ts";
+import { graphqlRequest, restRequest, type FetchLike, type GitHubApi } from "./github-api.ts";
 import { TrackerError, type AgentToolContext, type MergeConflict, type ReviewToolContext, type TrackerAdapter } from "./types.ts";
 
 interface ReviewArgs {
@@ -269,8 +270,6 @@ const ITEM_FIELDS = `
       blockedBy(first: 20) { nodes { id number state repository { nameWithOwner } } }
     }
   }`;
-
-type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
 interface ProjectMeta {
   projectId: string;
@@ -823,58 +822,15 @@ export class GitHubProjectTracker implements TrackerAdapter {
   }
 
   /** GitHub REST call with the tracker token; `allowMissing` turns a 404 into null. */
-  private async rest(method: string, path: string, body?: unknown, allowMissing = false): Promise<unknown> {
-    const base = this.settings.endpoint.replace(/\/api\/graphql$/, "/api/v3").replace(/\/graphql$/, "");
-    let response: Response;
-    try {
-      response = await this.fetchImpl(`${base}${path}`, {
-        method,
-        headers: { authorization: `bearer ${this.settings.token}`, accept: "application/vnd.github+json", "content-type": "application/json", "user-agent": "symphony-copilot" },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(60_000),
-      });
-    } catch (error) {
-      throw new TrackerError("tracker_request", (error as Error).message);
-    }
-    if (allowMissing && response.status === 404) return null;
-    if (response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) {
-      throw new TrackerError("tracker_rate_limited", `HTTP ${response.status}`);
-    }
-    if (!response.ok) throw new TrackerError("tracker_status", `HTTP ${response.status} for ${method} ${path}`);
-    try {
-      return await response.json();
-    } catch (error) {
-      throw new TrackerError("tracker_response", `invalid JSON: ${(error as Error).message}`);
-    }
+  private rest(method: string, path: string, body?: unknown, allowMissing = false): Promise<unknown> {
+    return restRequest(this.api(), method, path, body, allowMissing);
   }
 
-  private async graphql(query: string, variables: Record<string, unknown>): Promise<unknown> {
-    let response: Response;
-    try {
-      response = await this.fetchImpl(this.settings.endpoint, {
-        method: "POST",
-        headers: { authorization: `bearer ${this.settings.token}`, "content-type": "application/json", "user-agent": "symphony-copilot" },
-        body: JSON.stringify({ query, variables }),
-        signal: AbortSignal.timeout(30_000),
-      });
-    } catch (error) {
-      throw new TrackerError("tracker_request", (error as Error).message);
-    }
-    if (response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) {
-      throw new TrackerError("tracker_rate_limited", `HTTP ${response.status}`);
-    }
-    if (!response.ok) throw new TrackerError("tracker_status", `HTTP ${response.status}`);
-    let payload: { data?: unknown; errors?: Array<{ type?: string; message?: string }> };
-    try {
-      payload = await response.json() as typeof payload;
-    } catch (error) {
-      throw new TrackerError("tracker_response", `invalid JSON: ${(error as Error).message}`);
-    }
-    if (payload.errors?.length) {
-      const limited = payload.errors.some((e) => e.type === "RATE_LIMITED");
-      throw new TrackerError(limited ? "tracker_rate_limited" : "tracker_response", payload.errors.map((e) => e.message).join("; "));
-    }
-    if (payload.data === undefined || payload.data === null) throw new TrackerError("tracker_response", "response without data");
-    return payload.data;
+  private graphql(query: string, variables: Record<string, unknown>): Promise<unknown> {
+    return graphqlRequest(this.api(), query, variables);
+  }
+
+  private api(): GitHubApi {
+    return { endpoint: this.settings.endpoint, token: this.settings.token, fetchImpl: this.fetchImpl };
   }
 }

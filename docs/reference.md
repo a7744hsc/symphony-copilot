@@ -14,6 +14,11 @@ Details that the [README](../README.md) leaves out. Section numbers (§) refer t
 | `src/runner.ts` | Copilot SDK session and the multi-turn loop (§10, §16.5) |
 | `src/policy.ts` | Permission decisions for agent tool calls (§10.5, §15) |
 | `src/tracker/github-project.ts` | GitHub Project adapter and the agent tools (§11) |
+| `src/tracker/github-api.ts` | GraphQL and REST requests with the tracker token |
+| `schema/workflow.schema.json` | Every `WORKFLOW.md` key with its default and meaning |
+| `src/check.ts` | `symphony check`: keys, values, column rules, templates |
+| `src/board.ts` | `symphony check --online` and `symphony setup-board` |
+| `src/tools.ts` | Command line for `check` and `setup-board` |
 
 ## From Codex app-server to the Copilot SDK
 
@@ -109,6 +114,37 @@ The reviewer (see [Independent review](../README.md#independent-review)) gets `t
 | Tool | Changes the board | What it does |
 |---|---|---|
 | `tracker_submit_review` | Yes | `verdict` (`approve` or `request_changes`), `summary`, `blocking_issues` (required when requesting changes) and optional `attachments`. Posts a comment review on the open PR and the same text on the issue, then moves the card to `review.pass_state` or `review.fail_state`. On the last round, requesting changes moves the card to `pass_state` so a human decides |
+
+## Prompt templates
+
+Prompts are [Liquid](https://liquidjs.com/) templates. An unknown variable or filter fails the attempt, and `symphony check` reports it beforehand.
+
+| Template | Variables |
+|---|---|
+| `WORKFLOW.md` body (implementer's first turn) | `issue`, `attempt` (empty on a first run, then the retry number) |
+| `agent.continuation_prompt`, `review.continuation_prompt` | `issue`, `turn`, `max_turns` |
+| `review.prompt_file` (reviewer's first turn) | `issue`, `attempt`, `review_round`, `max_review_rounds`, `implementer_workspace` |
+
+`issue` has `id`, `identifier`, `title`, `description`, `priority`, `state`, `branch_name`, `url`, `assignee_id`, `labels`, `blocked_by` (each with `id`, `identifier`, `state`), `dispatchable`, `created_at`, `updated_at` and `native_ref` (see [Field mapping](#field-mapping)).
+
+## Checking a workflow
+
+`symphony check [WORKFLOW.md]` runs without network access and exits with 1 if it finds an error.
+
+| Check | Level |
+|---|---|
+| The file parses, and every key is in [the schema](../schema/workflow.schema.json); a misspelled key gets a suggestion | Error |
+| Values are valid, as the orchestrator checks them at startup | Error |
+| `blocked_state` is not an active column and not in `merge_conflicts.states` | Error |
+| `handoff_state` is not a column the implementer works | Error |
+| `review.pass_state` is not active; `review.fail_state` is an implementer column | Error |
+| `followups.labels` contain no `required_labels` label | Error |
+| Every prompt renders with a sample issue, with and without `attempt`; `review.prompt_file` and `copilot.cli_path` exist | Error |
+| With review, `handoff_state` is one of `review.states` | Warning |
+| `required_labels` is not empty, `hooks.after_create` is set, and with review `hooks.before_run` resets the reviewer's workspace | Warning |
+| `project_number` is set; the token is a `$VAR` reference, not a literal | Warning |
+
+`--online` also reads the board with the token: every column the workflow names is a Status option, the follow-up priority is a Priority option, the labels exist in the repository, and the project workflow "Pull request linked to issue" is off.
 
 ## Scheduling guarantees
 

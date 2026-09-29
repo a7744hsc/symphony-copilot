@@ -20,13 +20,19 @@ usage() {
   cat <<EOF
 Usage: symphony <command> [path/to/WORKFLOW.md]
 
-  run      run in this terminal; Ctrl-C stops it
-  start    run in the background; keeps running after the terminal closes
-  stop     stop the background run (agents stop, workspaces are kept)
-  status   is it running, and what did it do last
-  logs     follow the log
+  run             run in this terminal; Ctrl-C stops it
+  start           run in the background; keeps running after the terminal closes
+  stop            stop the background run (agents stop, workspaces are kept)
+  status          is it running, and what did it do last
+  logs            follow the log
 
-The workflow defaults to the one used last time, then ./WORKFLOW.md.
+Setting up a repository (see docs/onboarding.md):
+  install-skills  install the symphony-onboard and symphony-write-card skills into ~/.copilot/skills
+  check           validate WORKFLOW.md; add --online to compare it with the board
+  setup-board     create the board WORKFLOW.md describes and write its number into it
+
+run and start default to the workflow used last time, then ./WORKFLOW.md;
+check and setup-board default to ./WORKFLOW.md.
 The GitHub token comes from SYMPHONY_GITHUB_TOKEN, or else 'gh auth token'.
 Log: $LOG_FILE
 EOF
@@ -164,6 +170,34 @@ case "$COMMAND" in
       exit 0
     fi
     tail -n 30 -f "$LOG_FILE" | grep --line-buffered -v "permission approved"
+    ;;
+  check|setup-board)
+    wf="./WORKFLOW.md"
+    if [[ -n "${1:-}" && "$1" != --* ]]; then wf="$1"; shift; fi
+    if [[ ! -f "$wf" ]]; then
+      echo "No workflow at $wf. Pass it: symphony $COMMAND path/to/WORKFLOW.md" >&2
+      exit 1
+    fi
+    wf="$(cd "$(dirname "$wf")" && pwd)/$(basename "$wf")"
+    if [[ "$COMMAND" == setup-board || " $* " == *" --online "* ]]; then load_token; fi
+    exec node "$ROOT/src/tools.ts" "$COMMAND" "$wf" ${@+"$@"}
+    ;;
+  install-skills)
+    dest="${COPILOT_SKILLS_DIR:-$HOME/.copilot/skills}"
+    root_escaped="$(printf '%s' "$ROOT" | sed 's/[&|\\]/\\&/g')"
+    for dir in "$ROOT"/skills/*/; do
+      name="$(basename "$dir")"
+      target="$dest/$name/SKILL.md"
+      if [[ -f "$target" ]] && ! grep -q "Installed by symphony-copilot" "$target"; then
+        echo "Skipped $name: $target exists and was not installed by symphony-copilot." >&2
+        continue
+      fi
+      mkdir -p "$dest/$name"
+      # The skills refer to templates and commands by absolute path.
+      sed 's|\$SYMPHONY_HOME|'"$root_escaped"'|g' "$dir/SKILL.md" > "$target"
+      echo "Installed $name in $dest/$name"
+    done
+    echo "VS Code and Copilot CLI pick them up from there. Rerun this after updating symphony-copilot."
     ;;
   help|-h|--help)
     usage

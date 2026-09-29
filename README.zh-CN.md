@@ -9,6 +9,11 @@ Symphony 的理念是“管理工作，而不是管理 agent”：你写 Issue�
 ## 亮点
 
 - **内核是 Symphony，引擎是 Copilot。** 按规范实现了轮询、每个 Issue 一个工作区、多轮会话、与看板对账、卡死检测、退避重试，以及保存即生效的 `WORKFLOW.md`。
+macOS/Linux 上可以选择把 `symphony` 放到 PATH：`ln -s "$PWD/bin/symphony" /usr/local/bin/symphony`。
+可选：把 `bin/symphony` 加入 PATH，方便之后运行命令：
+```sh
+ln -s "$PWD/bin/symphony" /usr/local/bin/symphony   # 可选：把 symphony 命令放到 PATH 上
+```
 - **本地运行。** agent 就在你电脑上的目录里干活，用你的编译器、SDK、模拟器、数据库和有授权的工具。不用准备容器、虚拟机或 runner。
 - **零额外成本。** 不要 API key，不要云主机，不耗 Actions 分钟数。会话走你现有的 Copilot 套餐，和 Copilot CLI 一样计量；每张卡片有[运行上限](#运行上限)，花费有封顶。[^cost]
 - **看板就是界面。** 把卡片拖到 Todo，PR 就会出现，卡片同时移到 Human Review。拖到 Rework，agent 会读审核意见接着改。
@@ -50,32 +55,39 @@ flowchart LR
 
 需要 Node.js 24 以上（直接运行 TypeScript）、git、[GitHub CLI](https://cli.github.com/)，以及一个有 Copilot 套餐的 GitHub 账号。在 macOS 上开发，CI 也会在 Linux 上跑测试；Windows 没测过。
 
-**1. 准备看板。** 新建一个 GitHub Project（或用已有的），Status 字段里要有这些选项：
-
-| 状态 | 含义 |
-|---|---|
-| Todo、In Progress、Rework | 活跃：调度器会在这些卡片上运行 agent |
-| Human Review | 交接：agent 已提交 PR，等你审核 |
-| Blocked | agent 需要帮助，会先在 Issue 下留言 |
-| Done、Canceled | 终止：删除工作区；如果 agent 还在运行就立即删，否则在调度器下次启动时删 |
-
-可选：加一个单选的 Priority 字段，选项如 `P1`、`P2`、`P3`（数字小的先做）。在项目的 Workflows 里，把 “Pull request linked to issue” 设成 Human Review 或者关掉；否则 PR 一开，卡片又被移回活跃列，agent 会重新开工。
-
-**2. 安装并登录。**
+**1. 安装并登录。**
 
 ```sh
 git clone https://github.com/a7744hsc/symphony-copilot.git
 cd symphony-copilot
-npm install
-
-gh auth login              # 用有 Copilot 套餐的账号
-gh auth refresh -s project # 调度器要读取和移动卡片
-gh auth setup-git          # 调度器要推送 agent 的分支
 ```
 
-**3. 在你的仓库里加 `WORKFLOW.md`。** 把 [examples/WORKFLOW.md](examples/WORKFLOW.md) 复制到 agent 要处理的仓库根目录，填好 `owner`、`project_number`、`repo`，调整状态名，在 `copilot.shell_allow` 里列出你的构建和测试命令。Markdown 正文就是给 agent 的提示词。把这个文件提交进仓库，提示词就和代码一起做版本管理。
+在这个仓库里运行首次设置向导：macOS/Linux 用 `bash scripts/setup.sh`，Windows PowerShell 用 `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`。它会检查 Node.js 24+、Git 2.38+、npm 和 GitHub CLI；缺少时引导使用官方安装源，然后运行 `npm ci`，通过 `gh` 登录、申请 Projects 权限，并配置 Git 凭据。不会索取或保存密码、token。完整流程见[首次设置](docs/onboarding.md#install-and-sign-in)（英文）。
 
-**4. 运行。**
+macOS/Linux 上可以选择把 `symphony` 放到 PATH：`ln -s "$PWD/bin/symphony" /usr/local/bin/symphony`。
+
+**2. 配置你的仓库。** agent 要处理的仓库根目录里放一个 `WORKFLOW.md`，它描述所有配置：看板和各列、工作区怎么准备、agent 能运行哪些命令、给 agent 的提示词。先写好它，再按它建看板。完整步骤见 [docs/onboarding.md](docs/onboarding.md)（英文）：
+
+```sh
+symphony install-skills   # 只需一次：给 Copilot 装上 symphony-onboard 和 symphony-write-card 两个 skill
+# 在你的仓库里用 Copilot（VS Code 或 CLI）运行 /symphony-onboard：它按 examples/ 里的模板
+# 写好 WORKFLOW.md、AGENTS.md 和 REVIEW.md，并用 `symphony check` 检查。
+symphony setup-board      # 按 WORKFLOW.md 新建看板，并把看板编号写回 WORKFLOW.md
+```
+
+把这些文件提交进仓库，提示词就和代码一起做版本管理。看板会有下面这些列，列名在 `WORKFLOW.md` 里自己定：
+
+| 状态 | 含义 |
+|---|---|
+| Todo、In Progress、Rework | 活跃：调度器会在这些卡片上运行 agent |
+| AI Review | 活跃：另一个 agent 审核 PR（见[独立审核](#独立审核)） |
+| Human Review | 交接：等你处理 |
+| Blocked | agent 需要帮助，会先在 Issue 下留言 |
+| Done、Canceled | 终止：删除工作区；如果 agent 还在运行就立即删，否则在调度器下次启动时删 |
+
+GitHub 没有设置项目自动化（workflows）的 API，所以 `setup-board` 最后会列出要在网页上改的几项。最要紧的是关掉 “Pull request linked to issue”，否则 PR 一开，卡片就会被移到别的列。
+
+**3. 运行。**
 
 ```sh
 export SYMPHONY_GITHUB_TOKEN=$(gh auth token)   # 只给调度器用，不会传给 agent
@@ -84,7 +96,7 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md --dry-run --once   # 只读：看�
 node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行，Ctrl-C 停止
 ```
 
-然后给一个 Issue 打上 `agent` 标签，把卡片拖到 Todo，看日志。
+然后用 `/symphony-write-card` 写一张卡片（或者给一个 Issue 打上 `agent` 标签，把卡片拖到 Todo），看日志。
 
 | 参数 | 作用 |
 |---|---|
@@ -95,8 +107,6 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 **也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，第一次用过工作流路径后就记住它，并且拒绝启动第二个调度器：
 
 ```sh
-ln -s "$PWD/bin/symphony" /usr/local/bin/symphony   # 可选：放到 PATH 上
-
 symphony start ~/code/your-repo/WORKFLOW.md   # 后台运行；之后直接 `symphony start`
 symphony status                               # 有没有在跑、最近一次轮询和最近的事件
 symphony logs                                 # 实时看日志
@@ -108,7 +118,7 @@ symphony run                                  # 在当前终端前台运行，Ct
 
 ## 配置
 
-`WORKFLOW.md` 由 YAML front matter 和一个 [Liquid](https://liquidjs.com/) 提示词模板组成；未知的变量和过滤器都会报错。保存了无效的文件时，调度器记录错误，继续用上一份有效配置。
+`WORKFLOW.md` 由 YAML front matter 和一个 [Liquid](https://liquidjs.com/) 提示词模板组成；未知的变量和过滤器都会报错。保存了无效的文件时，调度器记录错误，继续用上一份有效配置。所有键的说明在 [schema/workflow.schema.json](schema/workflow.schema.json)；`symphony check` 按它和 [docs/reference.md](docs/reference.md#checking-a-workflow) 里的规则检查文件。
 
 规范里的键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都不变，另外多了三个：
 
@@ -206,7 +216,6 @@ symphony-copilot 面向**在自己电脑上运行的单个可信用户**，它�
 
 接下来计划：
 
-- `init` 命令：配好看板的状态选项，生成初始 `WORKFLOW.md`
 - 发布 npm 包，可以用 `npx` 运行
 - 终端里的实时状态，以及规范里可选的 HTTP 状态接口
 - 工作区删除后保留运行证据（日志、截图）
