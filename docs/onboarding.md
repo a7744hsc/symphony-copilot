@@ -70,15 +70,18 @@ Open the repository in VS Code (or start `copilot` in it) and run `/symphony-onb
 2. Whether to automatically detect merge conflicts on PRs waiting for a person and send them back to the implementer.
 3. Whether to show a Blocked lane for run limits and work that needs human input.
 4. Whether agents may file low-priority, unlabelled follow-up issues for unrelated problems.
+5. Whether to add the optional structured GitHub issue form for human-written agent tasks.
 
-It recommends defaults, explains the cost/behavior tradeoffs, and also asks for model and run limits. It infers board owner, language, build/test commands and default branch from the repository where possible. From those capability choices, it derives the columns and shows you the resulting lane plan; it does **not** expect you to invent a state machine. For example, independent AI review adds AI Review and Rework; turning it off removes both and sends submissions directly to Human Review. Human Review remains the final person-owned step. After the choices, the skill writes `WORKFLOW.md`, `AGENTS.md`, and `REVIEW.md` only if AI review is enabled, then runs `symphony check` until there are no errors.
+It asks these together once, recommends defaults, and explains cost/behavior tradeoffs. It also asks about implementer/reviewer model, concurrency, sessions and the per-card AI-credit budget (recommended starting cap: 1000 credits per run, shared by implementer and reviewer). It infers board owner, language, build/test commands and default branch where possible. From capability choices it derives and previews the columns; it does **not** expect you to invent a state machine. For example, independent AI review adds AI Review and Rework; turning it off removes AI Review and sends submissions directly to Human Review. Rework remains if conflict recovery is enabled. Human Review is always the final person-owned step. After your choices, the skill writes `WORKFLOW.md`, `AGENTS.md`, optional `REVIEW.md`, and the issue form only if selected, then runs `symphony check` until there are no errors.
 
 | File | Purpose | Template |
 |---|---|---|
 | `WORKFLOW.md` | Board, columns, hooks, limits, allowed commands, and the implementer's prompt | [examples/WORKFLOW.md](../examples/WORKFLOW.md) |
 | `AGENTS.md` | What agents read first: where to start, how to build and verify, hard rules | [examples/AGENTS.md](../examples/AGENTS.md) |
 | `REVIEW.md` | The review agent's prompt | [examples/REVIEW.md](../examples/REVIEW.md) |
-| `.github/ISSUE_TEMPLATE/agent-task.yml` | Optional issue form with the sections a card needs | [examples/ISSUE_TEMPLATE/agent-task.yml](../examples/ISSUE_TEMPLATE/agent-task.yml) |
+| `.github/ISSUE_TEMPLATE/agent-task.yml` | Optional structured “New issue” form with Goal, Acceptance criteria, How to verify, Out of scope and Notes | [examples/ISSUE_TEMPLATE/agent-task.yml](../examples/ISSUE_TEMPLATE/agent-task.yml) |
+
+The optional issue form only guides people writing issues. It does not create an issue, put it on the project, add the dispatch label, or start an agent. Agent-generated follow-up issues are a separate capability. A maintainer still chooses which submitted issue should be dispatched.
 
 To write them by hand, copy the templates and fill them in. Every key of `WORKFLOW.md` is described in [schema/workflow.schema.json](../schema/workflow.schema.json). Check the result:
 

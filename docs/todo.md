@@ -29,6 +29,7 @@
 | 40 | 卡片契约：Issue 表单模板（目标、验收条件、怎么验证、范围外），和写卡片的 skill（写好后建 Issue、加到看板、打 `agent` 标签） | 卡片怎么写没有任何文档，而验收条件和验证方式直接决定 agent 做得对不对 | 已完成：`examples/ISSUE_TEMPLATE/agent-task.yml`（故意不自动加标签）、skill `symphony-write-card` |
 | 47 | 跨平台 setup 向导：检查 Node 22.18+、Git 2.38+、npm、GitHub CLI、Copilot CLI，列出缺项，用户确认一次后自动装支持的平台包；默认装官方最新 Node 24 LTS（归档 SHA-256 校验、用户目录安装）。然后确认 `npm ci`，在同一登录阶段完成 `gh auth login`/Project scope/Git 凭据和 `copilot login`；让用户选择 Copilot browser-link 或 device-code 流程；让新 login 与交互式 shell 都能找到用户级 node/npm/copilot；支持 macOS、Linux、Windows | 新用户需要分别找安装说明、装工具、登录并配权限；容器 root 环境没有 sudo，且非 login bash 不读 `.profile` | 已实现并验证：Node 24.21.0 在 Apple Container root/no-sudo 环境安装成功；新 login/interactive Bash 均找到 node/npm；117 项测试通过。Windows PowerShell 实机验证仍待做 |
 | 48 | 用 `symphony-copilot` 管理自己的开发：建看板，小卡片交给它自己做 | 未开始 |
+| 49 | Onboarding 的模型选择：为用户提供 Copilot 账号实际可用模型的发现与选择方式；明确 `auto` 的路由行为、固定模型可复现性、reviewer 与 implementer 的独立性，以及模型可用状态和成本差异。设计完成后再决定是否提供 `symphony models` 命令、交互 picker 或只给出安全指引 | 用户无法判断 Auto 是否太随机，也不认识模型 ID；Copilot CLI/RPC 可返回账号模型目录，但罗列 ID 不能单独解决推荐、权限状态、成本与独立审核的决策问题 | 暂缓：本轮撤回模型目录命令和 skill 自动查询；保留当前 `auto` 默认。后续先设计完整选择体验 |
 
 ### P1：运行质量
 

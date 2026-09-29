@@ -34,13 +34,15 @@ Users should not have to know Symphony's internal state machine or invent a boar
 
 Ask:
 
-- Independent AI review before a person reviews/merges the PR? Recommend yes for quality-sensitive work; no saves cost and latency. Human approval before merge remains final either way; Symphony does not merge. If yes, ask reviewer model, preferably from a different model family.
-- Automatically detect PR merge conflicts while a PR waits for a person and return the card to the implementer? Recommend yes; if no, explain a person can move it back manually.
-- A visible Blocked lane when an agent hits a run limit or cannot proceed? Recommend yes; if no, omit the column and explain the card remains paused until a person intervenes.
-- Let agents file low-priority follow-up issues for unrelated work? Recommend off if issue noise is a concern; when on, explain follow-ups use `tech-debt` and P4 and do not receive the dispatch label, so never start automatically.
-- Implementer model (default `auto`), concurrent agents (default 1), sessions per card/run (default 8), and per-card AI-credit budget (choose a conservative default; review rounds count toward it).
+- Independent AI review before a person reviews/merges the PR? Explain the extra model usage/latency; human approval before merge remains final either way. If enabled, use reviewer model `auto` by default: Copilot chooses a model available to this account. Ask this as a normal-language question, not a technical model picker. Do not present a picker of guessed model IDs or ask the user to recognize names they may not know. Configure a fixed reviewer model only if the user explicitly requests it and provides an ID, or you have verified that exact ID is available to their Copilot account. A different model family can improve independence, but never invent an ID to achieve that.
+- Automatically detect PR merge conflicts while a PR waits for a person and return the card to the implementer? Recommend Yes; if No, explain a person can move it back manually.
+- A visible Blocked lane when an agent hits a run limit or cannot proceed? Recommend Yes; if No, omit the column and explain the card remains paused until a person intervenes.
+- Let agents file low-priority follow-up issues for unrelated problems? Recommend No if issue noise is a concern; when Yes, explain follow-ups use `tech-debt` and P4 and do not receive the dispatch label, so never start automatically. Clarify this is separate from the issue form below.
+- Implementer model defaults to `auto` (Copilot selects an available model). Do not present an unverified model list. If the user requests a fixed model, use an ID they provide or one verified as available; otherwise keep `auto`. Also ask concurrent agents (default 1), sessions per card/run (default 8), and per-card AI-credit budget; review rounds count toward it.
+- Per-card AI-credit budget: recommend 1000 credits per run as the starting cap; it covers implementer and reviewer calls together and the run halts at the cap. Explain that higher caps permit more work but may incur more usage, and let the user lower or raise it.
 - Board owner only if it cannot be inferred: default to repository owner; `gh api users/<owner> --jq .type` distinguishes user from organization.
 - Dispatch label (default `agent`); only issues with this label are eligible.
+- Add an optional GitHub task issue form? Recommend Yes. Explain it only adds a structured New issue form for human-written tasks (goal, acceptance, verification, scope, notes); it does not create, label, dispatch, or start issues. This is distinct from agent-generated follow-up issues.
 
 Use the user's conversation language for questions and generated column names. Do not ask for individual column names. Show the derived lane plan after the capability answers; the user may ask to rename lanes. Keep chosen names consistent in WORKFLOW.md, REVIEW.md and the handoff summary.
 
@@ -75,7 +77,7 @@ Generate config consistently from the answers:
 - Follow-ups on: configure `followups` with `state: Todo`, `labels: [tech-debt]`, and `priority: P4`; never attach the dispatch label. Todo is the human intake queue; an issue is not picked up until a person explicitly labels it for dispatch.
 - Set `terminal_states: [Done, Canceled]`. `agent_states` contains only statuses an agent may set directly: `[In Progress]`, plus Blocked if selected. Do not list every active state; AI Review, Rework, Human Review and terminal states are set by submission/review/orchestrator tools, not `tracker_set_status`.
 
-Before writing, show a compact preview, for example: “AI reviewer: on; conflict return: on; blocked lane: on; columns: Todo → In Progress → Rework → AI Review → Human Review → Blocked → Done → Canceled.” Then generate from this plan; do not copy the full-featured example unchanged.
+Before writing, show a compact preview, for example: “AI reviewer: on; conflict return: on; blocked lane: on; task issue form: yes; columns: Todo → In Progress → Rework → AI Review → Human Review → Blocked → Done → Canceled.” Then generate from this plan; do not copy the full-featured example unchanged.
 
 ## 3. Write WORKFLOW.md
 
@@ -101,9 +103,9 @@ If the repository has one, keep it and add only what is missing: a "Build and ve
 
 If independent AI review is on, start from the template, point its verify step at AGENTS.md's "Build and verify", and keep the rule that changes to WORKFLOW.md, REVIEW.md, AGENTS.md or CI go to a person. If review is off, do not create a REVIEW.md just to satisfy the example; the human-review handoff still remains.
 
-## 6. Offer the issue form
+## 6. Apply the issue-form choice
 
-Copy `$SYMPHONY_HOME/examples/ISSUE_TEMPLATE/agent-task.yml` to `.github/ISSUE_TEMPLATE/`. It adds no labels on purpose: only a maintainer should start an agent.
+Use the Yes/No answer collected in step 2; do not ask a second time. If Yes, copy `$SYMPHONY_HOME/examples/ISSUE_TEMPLATE/agent-task.yml` to `.github/ISSUE_TEMPLATE/`. It deliberately adds no dispatch label; a maintainer decides whether a submitted issue should be added to the board and labeled to start work. If No, do not create the form.
 
 ## 7. Check
 
