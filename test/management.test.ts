@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -41,6 +41,10 @@ setInterval(() => {}, 1000);
   const two = writeWorkflow(dir, "two.md", join(dir, "work-two"), 2);
   const duplicateProject = writeWorkflow(dir, "duplicate-project.md", join(dir, "work-three"), 1);
   const duplicateState = writeWorkflow(dir, "duplicate-state.md", join(dir, "work-one"), 3);
+  const workspaceAlias = join(dir, "work-one-alias");
+  mkdirSync(join(dir, "work-one"));
+  symlinkSync(join(dir, "work-one"), workspaceAlias, "dir");
+  const aliasedState = writeWorkflow(dir, "aliased-state.md", workspaceAlias, 4);
   const env = {
     ...process.env,
     SYMPHONY_STATE_DIR: state,
@@ -78,6 +82,9 @@ setInterval(() => {}, 1000);
   const stateConflict = run("start", duplicateState, "--id", "state-copy");
   assert.equal(stateConflict.status, 1);
   assert.match(stateConflict.stderr, /shares state.*workspace\.root/);
+  const aliasedStateConflict = run("start", aliasedState, "--id", "state-alias");
+  assert.equal(aliasedStateConflict.status, 1);
+  assert.match(aliasedStateConflict.stderr, /shares state.*workspace\.root/);
 
   const stopped = stop("alpha");
   assert.equal(stopped.status, 0, `${stopped.stdout}\n${stopped.stderr}`);

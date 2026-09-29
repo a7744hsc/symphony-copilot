@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { basename, extname, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, extname, relative, resolve } from "node:path";
 import { buildConfig } from "./config.ts";
 import { loadWorkflow } from "./workflow.ts";
 
@@ -48,15 +48,30 @@ function projectIdentity(kind: string, provider: Record<string, unknown>): strin
   return `github_project:${ownerType}:${owner}:${projectNumber}`;
 }
 
+function canonicalPath(path: string): string {
+  const absolute = resolve(path);
+  let existing = absolute;
+  while (!existsSync(existing)) {
+    const parent = dirname(existing);
+    if (parent === existing) break;
+    existing = parent;
+  }
+  return resolve(realpathSync.native(existing), relative(existing, absolute));
+}
+
 export function collisionMessage(candidate: WorkflowInstance, existing: WorkflowInstance[]): string | null {
+  const candidateWorkflow = canonicalPath(candidate.workflowPath);
+  const candidateWorkspace = canonicalPath(candidate.workspaceRoot);
+  const candidateLedger = canonicalPath(candidate.ledgerPath);
   for (const other of existing) {
-    if (other.id === candidate.id && other.workflowPath !== candidate.workflowPath) {
+    const otherWorkflow = canonicalPath(other.workflowPath);
+    if (other.id === candidate.id && otherWorkflow !== candidateWorkflow) {
       return `workflow ID "${candidate.id}" is already assigned to ${other.workflowPath}; choose a different ID with --id`;
     }
-    if (other.workflowPath === candidate.workflowPath) {
+    if (otherWorkflow === candidateWorkflow) {
       return `workflow ${candidate.workflowPath} is already running as "${other.id}"`;
     }
-    if (other.workspaceRoot === candidate.workspaceRoot || other.ledgerPath === candidate.ledgerPath) {
+    if (canonicalPath(other.workspaceRoot) === candidateWorkspace || canonicalPath(other.ledgerPath) === candidateLedger) {
       return `workflow "${candidate.id}" shares state with running workflow "${other.id}" at ${candidate.workspaceRoot}; configure a different workspace.root`;
     }
     if (candidate.project && other.project === candidate.project) {

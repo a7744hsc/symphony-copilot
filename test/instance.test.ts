@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -57,4 +57,26 @@ test("active runner collisions explain the unsafe resource", () => {
   assert.match(collisionMessage(candidate, [instance()]) ?? "", /same GitHub Project.*card claiming is not coordinated/);
   assert.match(collisionMessage({ ...candidate, project: "github_project:user:octo:2", workspaceRoot: "/state/one", ledgerPath: "/state/one/.symphony-ledger.json" }, [instance()]) ?? "", /shares state.*workspace\.root/);
   assert.equal(collisionMessage({ ...candidate, project: "github_project:user:octo:2" }, [instance()]), null);
+});
+
+test("state collisions resolve symlinked paths and nonexistent children", () => {
+  const dir = mkdtempSync(join(tmpdir(), "symphony-instance-alias-"));
+  const actual = join(dir, "actual");
+  const alias = join(dir, "alias");
+  mkdirSync(actual);
+  symlinkSync(actual, alias, "dir");
+  const running = instance({
+    workspaceRoot: join(actual, "workspaces"),
+    ledgerPath: join(actual, "workspaces", ".symphony-ledger.json"),
+    project: "github_project:user:octo:1",
+  });
+  const candidate = instance({
+    id: "two",
+    workflowPath: "/repos/two/WORKFLOW.md",
+    workspaceRoot: join(alias, "workspaces"),
+    ledgerPath: join(alias, "workspaces", ".symphony-ledger.json"),
+    project: "github_project:user:octo:2",
+  });
+
+  assert.match(collisionMessage(candidate, [running]) ?? "", /shares state.*workspace\.root/);
 });
