@@ -10,7 +10,12 @@ const setup = join(root, "scripts", "setup.sh");
 
 function mockBin(files: Record<string, string>) {
   const dir = mkdtempSync(join(tmpdir(), "symphony-setup-"));
-  for (const [name, contents] of Object.entries(files)) {
+  const commands = {
+    ...files,
+    // Never let a test accidentally reach the host sudo and prompt for a password.
+    sudo: files.sudo ?? '#!/bin/sh\necho "unexpected sudo invocation in setup test: $*" >&2\nexit 99\n',
+  };
+  for (const [name, contents] of Object.entries(commands)) {
     const path = join(dir, name);
     writeFileSync(path, contents);
     chmodSync(path, 0o755);
