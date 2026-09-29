@@ -104,7 +104,7 @@ Then write a card with `/symphony-write-card` (or label an issue `agent` and mov
 | `--once` | Polls once, waits for dispatched agents to finish, then exits. |
 | `--log-level` | `debug`, `info` (default), `warn` or `error`. Logs are `key=value` lines on stderr. |
 
-**Or use `bin/symphony`**, which fetches the token from `gh`, remembers the workflow path after the first use, and refuses to start a second orchestrator:
+**Or use `bin/symphony`**, which fetches the token from `gh` and manages independent runners:
 
 ```sh
 symphony start ~/code/your-repo/WORKFLOW.md   # background; later just `symphony start`
@@ -114,7 +114,19 @@ symphony stop                                 # stop agents and the orchestrator
 symphony run                                  # foreground in this terminal; Ctrl-C stops it
 ```
 
-The background log is `~/symphony-workspaces/logs/orchestrator.log`; set `SYMPHONY_STATE_DIR` to keep the log and PID file elsewhere. On macOS, `start` also keeps the Mac from idle-sleeping while the orchestrator runs.
+To run more than one workflow, give each a stable ID:
+
+```sh
+symphony start ~/code/app/WORKFLOW.md --id app
+symphony start ~/code/site/WORKFLOW.md --id site
+symphony status               # list all runners
+symphony status app           # one runner's recent events
+symphony logs site            # follow only site's log
+symphony stop app             # site keeps running
+symphony start app            # restart its registered workflow
+```
+
+IDs may contain letters, digits, hyphens and underscores (up to 64 characters); without `--id`, an ID derived from the workflow directory and canonical path stays stable across restarts. `run` accepts the same workflow/ID and `--id` arguments as `start`. With only one registered runner, `status`, `logs` and `stop` need no ID; with several, `stop` and `logs` require one. `start` and `run` without arguments reuse the last selected workflow, then `./WORKFLOW.md`. Logs and PID records live under `~/symphony-workspaces/runners/<ID>/`; set `SYMPHONY_STATE_DIR` to move the management directory. Each workflow's ledger and issue workspaces remain under its own `workspace.root`. Roots cannot overlap, even for stopped registrations, and two **running** workflows cannot target the same GitHub Project (shared-card claiming is unsafe). Stop a runner before changing its project or root; reloads of those settings are rejected until restart. Keep all managed runners under the same `SYMPHONY_STATE_DIR`; direct `node src/cli.ts` runs are standalone and do not join these guards. This coordination is only local to one host, not distributed.
 
 ## Configuration
 

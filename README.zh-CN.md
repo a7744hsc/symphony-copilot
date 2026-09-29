@@ -106,7 +106,7 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 | `--once` | 只轮询一次，等派发出去的 agent 结束后退出。 |
 | `--log-level` | `debug`、`info`（默认）、`warn` 或 `error`。日志是输出到 stderr 的 `key=value` 行。 |
 
-**也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，第一次用过工作流路径后就记住它，并且拒绝启动第二个调度器：
+**也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，并管理多个相互隔离的调度器：
 
 ```sh
 symphony start ~/code/your-repo/WORKFLOW.md   # 后台运行；之后直接 `symphony start`
@@ -116,7 +116,19 @@ symphony stop                                 # 停止 agent 和调度器，工�
 symphony run                                  # 在当前终端前台运行，Ctrl-C 停止
 ```
 
-后台运行的日志在 `~/symphony-workspaces/logs/orchestrator.log`；设置 `SYMPHONY_STATE_DIR` 可以把日志和 PID 文件放到别处。在 macOS 上，`start` 还会在调度器运行期间阻止 Mac 自动休眠。
+同时运行多个工作流时，给每个工作流一个固定 ID：
+
+```sh
+symphony start ~/code/app/WORKFLOW.md --id app
+symphony start ~/code/site/WORKFLOW.md --id site
+symphony status             # 列出所有调度器
+symphony status app         # 查看 app 的最近事件
+symphony logs site          # 只看 site 的日志
+symphony stop app           # site 继续运行
+symphony start app          # 用登记的工作流重启 app
+```
+
+ID 最多 64 个字符，可包含字母、数字、连字符和下划线；省略 `--id` 时根据工作流目录和规范化路径生成稳定 ID。`run` 与 `start` 接受相同的路径、ID 和 `--id` 参数。只有一个已登记调度器时，`status`、`logs`、`stop` 可省略 ID；多个调度器时，`logs` 和 `stop` 必须指定 ID。不带参数的 `start`/`run` 使用上次选择的工作流，然后是 `./WORKFLOW.md`。日志和 PID 记录分别放在 `~/symphony-workspaces/runners/<ID>/`，可用 `SYMPHONY_STATE_DIR` 修改管理目录。每个工作流的运行账本和任务工作区留在其自身的 `workspace.root`。即使调度器已停止，工作区根目录也不能互相重叠；**运行中**的两个调度器不能使用同一个 GitHub Project（不能安全地共同认领卡片）。更改项目或工作区根目录前先停止调度器，运行期间热更新这些设置会被拒绝。所有受管理调度器必须使用同一个 `SYMPHONY_STATE_DIR`；直接运行 `node src/cli.ts` 不加入这些保护。此协调仅适用于同一台主机，不支持跨主机。
 
 ## 配置
 

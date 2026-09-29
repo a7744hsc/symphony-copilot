@@ -145,4 +145,6 @@ symphony start WORKFLOW.md                                       # in the backgr
 symphony logs
 ```
 
+For multiple repositories, use `symphony start path/to/WORKFLOW.md --id NAME` for each one; `symphony status` lists them, and `symphony logs NAME` / `symphony stop NAME` target one. Use different `workspace.root` paths and GitHub Projects. See [managing multiple runners](../README.md#quick-start) for collision rules and the single-workflow defaults.
+
 After every session the orchestrator comments on the issue with what the session did and used. When the agent submits, the card moves to AI Review, then to Human Review for you. Merge the pull request, or move the card to Rework with your comments.

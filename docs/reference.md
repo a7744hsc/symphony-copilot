@@ -155,7 +155,7 @@ Prompts are [Liquid](https://liquidjs.com/) templates. An unknown variable or fi
 - **No overlap in a workspace.** The next session for an issue starts only after the previous one, including its `after_run` hook, has finished.
 - **One role per session.** When a card moves between an implementation state and a review state, the running session is stopped and the other role starts in a new session, in its own workspace.
 - **Conflicts first.** A card the orchestrator returned for a [merge conflict](../README.md#merge-conflicts) is dispatched before every other card until its run ends; the reason is kept in the ledger, so a restart does not lose it. GitHub answers `UNKNOWN` while it computes mergeability, so a conflict is acted on at the first poll after GitHub has decided.
-- **One orchestrator per `workspace.root`.** A second instance is not detected and would claim the same issues.
+- **Isolated managed runners.** `bin/symphony` serializes runner startup within one `SYMPHONY_STATE_DIR` and rejects overlapping `workspace.root` paths (including stopped registrations) and a second live runner for the same GitHub Project. It reserves project and workspace identity during a managed runner's workflow reload. Direct `node src/cli.ts` processes and processes using a different state directory do not participate in these checks; do not run those concurrently against the same project or root. This is not cross-host coordination.
 
 ## Differences from the spec
 
