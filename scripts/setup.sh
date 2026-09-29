@@ -99,10 +99,31 @@ run_privileged() {
   fi
 }
 
+download_tools_ok() {
+  command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v xz >/dev/null 2>&1 && { command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; }
+}
+
+install_download_tools() {
+  local linux_pm="$1"
+  case "$OS:$linux_pm" in
+    Darwin:*)
+      if command -v brew >/dev/null 2>&1; then brew install curl xz || return 1
+      else say "Missing download/archive utilities (curl, tar, xz or SHA-256); install them and rerun."; return 1; fi
+      ;;
+    Linux:apt) run_privileged apt-get update && run_privileged apt-get install -y curl tar xz-utils ca-certificates coreutils || return 1 ;;
+    Linux:dnf) run_privileged dnf install -y curl tar xz ca-certificates coreutils || return 1 ;;
+    Linux:zypper) run_privileged zypper --non-interactive install curl tar xz ca-certificates coreutils || return 1 ;;
+    *) say "Cannot install the required download/archive utilities on this platform."; return 1 ;;
+  esac
+  hash -r
+  download_tools_ok || { say "Download/archive utilities are still unavailable after installation."; return 1; }
+}
+
 install_confirmed_tools() {
   local linux_pm="$1"
   local shell_name rc_file export_line
   local -a rc_files
+  if ! download_tools_ok; then install_download_tools "$linux_pm" || return 1; fi
   if ! node_ok; then install_node_user || return 1; fi
   if ! command -v copilot >/dev/null 2>&1; then
     mkdir -p "$HOME/.local/bin"
@@ -194,6 +215,7 @@ missing_tools() {
   if command -v gh >/dev/null 2>&1; then say "  ✓ GitHub CLI $(gh --version | head -n 1 | awk '{print $3}')"; else say "  - GitHub CLI (gh)"; missing=1; fi
   if command -v copilot >/dev/null 2>&1; then say "  ✓ Copilot CLI $(copilot --version 2>/dev/null | head -n 1)"; else say "  - GitHub Copilot CLI (copilot)"; missing=1; fi
   if command -v npm >/dev/null 2>&1; then say "  ✓ npm $(npm --version)"; else say "  - npm (bundled with Node.js)"; missing=1; fi
+  if download_tools_ok; then say "  ✓ Node download/checksum utilities"; else say "  - Node download/checksum utilities (curl, tar, xz, SHA-256 tool)"; missing=1; fi
   return "$missing"
 }
 
@@ -223,6 +245,7 @@ if ! missing_tools; then
   fi
   say ""
   say "The following missing tools will be installed after your confirmation:"
+  if ! download_tools_ok; then say "  - Node download/checksum utilities (curl, tar, xz and SHA-256 tool) via the supported package manager"; fi
   ! node_ok && say "  - Current Node.js LTS (Node ${NODE_INSTALL_MAJOR}; satisfies minimum ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}+) from official nodejs.org archive + SHA-256 check; user directory, no sudo)"
   if ! git_ok; then
     case "$OS:$linux_pm" in

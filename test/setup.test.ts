@@ -24,6 +24,7 @@ test("the Bash wizard requests the Projects scope only when the active account l
   const bin = mockBin({
     node: '#!/bin/sh\necho v22.18.0\n',
     git: '#!/bin/sh\necho "git version 2.50.0"\n',
+    xz: '#!/bin/sh\nexit 0\n',
     gh: `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'--json hosts'*) printf '{"hosts":{"github.com":[{"active":true,"scopes":"%s"}]}}\\n' "$GH_SCOPES";; esac\ncase "$1" in --version) echo 'gh version 2.101.0';; api) echo setup-user;; esac\nexit 0\n`,
     npm: `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'@github/copilot'*) mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\\nprintf \\\"copilot %%s\\\\n\\\" \\\"$*\\\" >> \\\"$GH_LOG\\\"\\n[ \\\"$1\\\" = --version ] && echo \\\"GitHub Copilot CLI test\\\"\\nexit 0\\n' > "$HOME/.local/bin/copilot"; chmod +x "$HOME/.local/bin/copilot";; esac\nexit 0\n`,
   });
@@ -64,6 +65,7 @@ test("a missing or too-old Node is included in the install plan; declining insta
     git: '#!/bin/sh\necho "git version 2.50.0"\n',
     gh: '#!/bin/sh\n[ "$1" = --version ] && echo "gh version 2.80.0"\nexit 0\n',
     uname: '#!/bin/sh\necho Linux\n',
+    xz: '#!/bin/sh\nexit 0\n',
   });
   const result = spawnSync("bash", [setup], {
     cwd: root,
@@ -81,6 +83,7 @@ test("after confirmation, Node is downloaded from nodejs.org, checksum-verified 
   const calls = join(home, "calls.log");
   const bin = mockBin({
     uname: '#!/bin/sh\n[ "$1" = -m ] && echo aarch64 || echo Linux\n',
+    xz: '#!/bin/sh\nexit 0\n',
     "apt-get": '#!/bin/sh\nexit 0\n',
     copilot: '#!/bin/sh\nprintf "copilot %s\\n" "$*" >> "$GH_LOG"\n[ "$1" = --version ] && echo "GitHub Copilot CLI test"\nexit 0\n',
     node: '#!/bin/sh\necho v20.0.0\n',
@@ -123,6 +126,7 @@ test("the Node installer refuses an archive whose SHA-256 does not match the off
   const home = mkdtempSync(join(tmpdir(), "symphony-node-bad-hash-"));
   const bin = mockBin({
     uname: '#!/bin/sh\n[ "$1" = -m ] && echo aarch64 || echo Linux\n',
+    xz: '#!/bin/sh\nexit 0\n',
     node: '#!/bin/sh\necho v20.0.0\n',
     git: '#!/bin/sh\necho "git version 2.50.0"\n',
     gh: '#!/bin/sh\n[ "$1" = --version ] && echo "gh version 2.80.0"\nexit 0\n',
