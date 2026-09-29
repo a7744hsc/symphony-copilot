@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Start, stop and watch the symphony-copilot orchestrator.
+# Start, stop and watch isolated symphony-copilot workflow runners.
 set -euo pipefail
 
 STATE_DIR="${SYMPHONY_STATE_DIR:-$HOME/symphony-workspaces}"
-PID_FILE="$STATE_DIR/orchestrator.pid"
-LOG_FILE="$STATE_DIR/logs/orchestrator.log"
-LAST_FILE="$STATE_DIR/.last-workflow"
+RUNNERS_DIR="$STATE_DIR/runners"
+LAST_WORKFLOW="$STATE_DIR/.last-workflow"
+LAST_RUNNER="$STATE_DIR/.last-runner"
+LOCK_DIR="$STATE_DIR/.runner-lock"
 
 # Follow symlinks so the script also works when linked onto PATH.
 self="${BASH_SOURCE[0]}"
@@ -14,61 +15,78 @@ while [[ -L "$self" ]]; do
   [[ "$target" = /* ]] && self="$target" || self="$(dirname "$self")/$target"
 done
 ROOT="$(cd "$(dirname "$self")/.." && pwd)"
-CLI="$ROOT/src/cli.ts"
+CLI="${SYMPHONY_CLI:-$ROOT/src/cli.ts}"
+INSTANCE_CLI="$ROOT/src/instance.ts"
 
 usage() {
   cat <<EOF
-Usage: symphony <command> [path/to/WORKFLOW.md]
+Usage: symphony <command> [workflow-or-runner] [options]
 
-  run             run in this terminal; Ctrl-C stops it
-  start           run in the background; keeps running after the terminal closes
-  stop            stop the background run (agents stop, workspaces are kept)
-  status          is it running, and what did it do last
-  logs            follow the log
+  run [WORKFLOW] [--id ID]    run one workflow in this terminal
+  start [WORKFLOW] [--id ID]  run one workflow in the background
+  stop [ID]                   stop only that background runner
+  status [ID|--all]           show one runner, or every known runner
+  logs [ID]                   follow one runner's log
 
 Setting up a repository (see docs/onboarding.md):
   install-skills  install the symphony-onboard and symphony-write-card skills into ~/.copilot/skills
   check           validate WORKFLOW.md; add --online to compare it with the board
   setup-board     create the board WORKFLOW.md describes and write its number into it
 
-run and start default to the workflow used last time, then ./WORKFLOW.md;
-check and setup-board default to ./WORKFLOW.md.
-The GitHub token comes from SYMPHONY_GITHUB_TOKEN, or else 'gh auth token'.
-Log: $LOG_FILE
+run and start default to the workflow used last time, then ./WORKFLOW.md.
+stop, status and logs default to the runner used last time. An ID is stable for a
+workflow path; use --id to choose one. The GitHub token comes from
+SYMPHONY_GITHUB_TOKEN, or else 'gh auth token'.
+State: $RUNNERS_DIR/<id>
 EOF
 }
 
+metadata_field() {
+  node "$INSTANCE_CLI" field "$1" "$2"
+}
+
+runner_dir() {
+  echo "$RUNNERS_DIR/$1"
+}
+
 running_pid() {
-  [[ -f "$PID_FILE" ]] || return 1
-  local pid
-  pid="$(cat "$PID_FILE")"
-  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= | grep -q "src/cli.ts"; then
+  local id="$1" dir pid workflow command
+  dir="$(runner_dir "$id")"
+  [[ -f "$dir/pid" && -f "$dir/instance.json" ]] || return 1
+  pid="$(cat "$dir/pid")"
+  workflow="$(metadata_field "$dir/instance.json" workflowPath)"
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  if [[ -n "$pid" && -n "$command" ]] && kill -0 "$pid" 2>/dev/null && printf '%s' "$command" | grep -F -q -- "$workflow"; then
     echo "$pid"
     return 0
   fi
-  rm -f "$PID_FILE"
+  rm -f "$dir/pid"
   return 1
-}
-
-other_instances() {
-  local pid
-  for pid in $(pgrep -f 'src/cli\.ts' || true); do
-    ps -p "$pid" -o command= | grep -q -- '--dry-run' || echo "$pid"
-  done
 }
 
 pick_workflow() {
   local wf="${1:-${SYMPHONY_WORKFLOW:-}}"
-  if [[ -z "$wf" && -f "$LAST_FILE" ]]; then wf="$(cat "$LAST_FILE")"; fi
+  if [[ -z "$wf" && -f "$LAST_WORKFLOW" ]]; then wf="$(cat "$LAST_WORKFLOW")"; fi
   wf="${wf:-./WORKFLOW.md}"
   if [[ ! -f "$wf" ]]; then
     echo "No workflow at $wf. Pass it once: symphony $COMMAND path/to/WORKFLOW.md" >&2
     return 1
   fi
-  wf="$(cd "$(dirname "$wf")" && pwd)/$(basename "$wf")"
-  mkdir -p "$STATE_DIR"
-  echo "$wf" > "$LAST_FILE"
-  echo "$wf"
+  (cd "$(dirname "$wf")" && printf '%s/%s\n' "$PWD" "$(basename "$wf")")
+}
+
+pick_runner() {
+  local id="${1:-}"
+  if [[ -z "$id" && -f "$LAST_RUNNER" ]]; then id="$(cat "$LAST_RUNNER")"; fi
+  if [[ -z "$id" ]]; then
+    echo "No runner selected. Pass its ID, or start a workflow first." >&2
+    return 1
+  fi
+  if [[ ! -f "$(runner_dir "$id")/instance.json" ]]; then
+    echo "Unknown runner \"$id\". Run 'symphony status --all' to list runners." >&2
+    return 1
+  fi
+  echo "$id"
 }
 
 load_token() {
@@ -82,17 +100,111 @@ load_token() {
   export SYMPHONY_GITHUB_TOKEN
 }
 
-refuse_if_running() {
-  local pid others
-  if pid="$(running_pid)"; then
-    echo "Already running (pid $pid). Run 'symphony stop' first." >&2
-    exit 1
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  local tries=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [[ "$tries" -ge 50 ]]; then
+      echo "Another symphony management command is still running; retry shortly." >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+}
+
+release_lock() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+parse_start_args() {
+  WORKFLOW_ARG=""
+  ID_ARG=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --id)
+        [[ "$#" -ge 2 ]] || { echo "--id requires a value" >&2; exit 2; }
+        ID_ARG="$2"
+        shift 2
+        ;;
+      --id=*)
+        ID_ARG="${1#--id=}"
+        shift
+        ;;
+      -*)
+        echo "Unknown option: $1" >&2
+        exit 2
+        ;;
+      *)
+        [[ -z "$WORKFLOW_ARG" ]] || { echo "Only one workflow path may be supplied." >&2; exit 2; }
+        WORKFLOW_ARG="$1"
+        shift
+        ;;
+    esac
+  done
+}
+
+prepare_runner() {
+  local wf="$1" requested_id="$2" candidate id dir old_workflow meta pid legacy
+  mkdir -p "$RUNNERS_DIR"
+  candidate="$STATE_DIR/.candidate.$$"
+  trap 'rm -f "$STATE_DIR/.candidate.$$"; release_lock' EXIT
+  if [[ -n "$requested_id" ]]; then
+    node "$INSTANCE_CLI" describe "$wf" "$requested_id" > "$candidate"
+  else
+    node "$INSTANCE_CLI" describe "$wf" > "$candidate"
   fi
-  others="$(other_instances)"
-  if [[ -n "$others" ]]; then
-    # Two orchestrators would claim the same cards.
-    echo "Another orchestrator is running (pid $(echo $others)). Stop it first: kill -TERM $(echo $others)" >&2
-    exit 1
+  id="$(metadata_field "$candidate" id)"
+  dir="$(runner_dir "$id")"
+
+  acquire_lock
+  legacy="$STATE_DIR/orchestrator.pid"
+  if [[ -f "$legacy" ]]; then
+    pid="$(cat "$legacy")"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "Legacy single-workflow runner is still running (pid $pid). Stop it before starting managed runners." >&2
+      exit 1
+    fi
+    rm -f "$legacy"
+  fi
+  if [[ -f "$dir/instance.json" ]]; then
+    old_workflow="$(metadata_field "$dir/instance.json" workflowPath)"
+    if [[ "$old_workflow" != "$wf" ]]; then
+      echo "Workflow ID \"$id\" is already assigned to $old_workflow; choose a different ID with --id." >&2
+      exit 1
+    fi
+  fi
+  for meta in "$RUNNERS_DIR"/*/instance.json; do
+    [[ -f "$meta" ]] || continue
+    local other_id
+    other_id="$(metadata_field "$meta" id)"
+    if running_pid "$other_id" >/dev/null; then
+      node "$INSTANCE_CLI" check "$candidate" "$meta"
+    fi
+  done
+  mkdir -p "$dir"
+  mv "$candidate" "$dir/instance.json"
+  printf '%s\n' "$wf" > "$LAST_WORKFLOW"
+  printf '%s\n' "$id" > "$LAST_RUNNER"
+  PREPARED_ID="$id"
+  PREPARED_DIR="$dir"
+}
+
+show_status() {
+  local id="$1" dir pid log_file last_tick
+  dir="$(runner_dir "$id")"
+  log_file="$dir/orchestrator.log"
+  if pid="$(running_pid "$id")"; then
+    echo "Running \"$id\" (pid $pid, up $(ps -p "$pid" -o etime= | tr -d ' ')) with $(metadata_field "$dir/instance.json" workflowPath)"
+  else
+    echo "Not running: \"$id\" ($(metadata_field "$dir/instance.json" workflowPath))"
+  fi
+  if [[ -f "$log_file" ]]; then
+    last_tick="$(grep 'msg=tick' "$log_file" | tail -n 1 | sed -E 's/^ts=([^ ]+) .*msg=tick (.*)$/\1  \2/' || true)"
+    [[ -n "$last_tick" ]] && echo "Last poll: $last_tick"
+    echo "Latest events:"
+    grep -E 'msg=(dispatching|"session summary"|"issue halted"|"submitted for review"|"review submitted"|"follow-up issue created"|"run closed")|level=(warn|error)' "$log_file" \
+      | grep -v "permission denied" | tail -n 6 | cut -c1-200 || true
   fi
 }
 
@@ -101,45 +213,53 @@ shift || true
 
 case "$COMMAND" in
   run)
-    wf="$(pick_workflow "${1:-}")"
+    parse_start_args "$@"
+    wf="$(pick_workflow "$WORKFLOW_ARG")"
     load_token
-    refuse_if_running
-    echo "$$" > "$PID_FILE"
+    prepare_runner "$wf" "$ID_ARG"
+    echo "$$" > "$PREPARED_DIR/pid"
+    release_lock
+    trap - EXIT
     cd "$ROOT"
     exec node "$CLI" "$wf"
     ;;
   start)
-    wf="$(pick_workflow "${1:-}")"
+    parse_start_args "$@"
+    wf="$(pick_workflow "$WORKFLOW_ARG")"
     load_token
-    refuse_if_running
-    mkdir -p "$(dirname "$LOG_FILE")"
+    prepare_runner "$wf" "$ID_ARG"
+    log_file="$PREPARED_DIR/orchestrator.log"
     cd "$ROOT"
-    nohup node "$CLI" "$wf" >> "$LOG_FILE" 2>&1 < /dev/null &
+    nohup node "$CLI" "$wf" >> "$log_file" 2>&1 < /dev/null &
     pid=$!
-    echo "$pid" > "$PID_FILE"
+    echo "$pid" > "$PREPARED_DIR/pid"
+    release_lock
+    trap - EXIT
     if command -v caffeinate > /dev/null; then
       nohup caffeinate -i -w "$pid" > /dev/null 2>&1 &
     fi
-    sleep 3
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "Started in the background (pid $pid) with $wf"
-      echo "Follow it with: symphony logs"
+    sleep "${SYMPHONY_STARTUP_WAIT_SECONDS:-3}"
+    if running_pid "$PREPARED_ID" >/dev/null; then
+      echo "Started \"$PREPARED_ID\" in the background (pid $pid) with $wf"
+      echo "Follow it with: symphony logs $PREPARED_ID"
     else
-      echo "It exited right away. Last log lines:" >&2
-      tail -n 15 "$LOG_FILE" >&2
+      echo "Runner \"$PREPARED_ID\" exited right away. Last log lines:" >&2
+      tail -n 15 "$log_file" >&2
       exit 1
     fi
     ;;
   stop)
-    if ! pid="$(running_pid)"; then
-      echo "Not running."
+    id="$(pick_runner "${1:-}")"
+    dir="$(runner_dir "$id")"
+    if ! pid="$(running_pid "$id")"; then
+      echo "Not running: \"$id\"."
       exit 0
     fi
     kill -TERM "$pid"
-    printf "Stopping (pid %s)" "$pid"
+    printf "Stopping \"%s\" (pid %s)" "$id" "$pid"
     for _ in $(seq 1 60); do
-      if ! kill -0 "$pid" 2>/dev/null; then
-        rm -f "$PID_FILE"
+      if ! running_pid "$id" >/dev/null; then
+        rm -f "$dir/pid"
         echo " stopped."
         exit 0
       fi
@@ -147,29 +267,31 @@ case "$COMMAND" in
       sleep 1
     done
     echo
-    echo "Still stopping after 60 s. Check 'symphony logs', or force it with: kill -9 $pid" >&2
+    echo "Runner \"$id\" is still stopping after 60 s. Check 'symphony logs $id', or force it with: kill -9 $pid" >&2
     exit 1
     ;;
   status)
-    if pid="$(running_pid)"; then
-      echo "Running (pid $pid, up $(ps -p "$pid" -o etime= | tr -d ' ')) with $(cat "$LAST_FILE" 2>/dev/null || echo 'unknown workflow')"
+    if [[ "${1:-}" == "--all" ]]; then
+      found=false
+      for meta in "$RUNNERS_DIR"/*/instance.json; do
+        [[ -f "$meta" ]] || continue
+        found=true
+        show_status "$(metadata_field "$meta" id)"
+      done
+      $found || echo "No runners."
     else
-      echo "Not running."
-    fi
-    if [[ -f "$LOG_FILE" ]]; then
-      last_tick="$(grep 'msg=tick' "$LOG_FILE" | tail -n 1 | sed -E 's/^ts=([^ ]+) .*msg=tick (.*)$/\1  \2/')"
-      [[ -n "$last_tick" ]] && echo "Last poll: $last_tick"
-      echo "Latest events:"
-      grep -E 'msg=(dispatching|"session summary"|"issue halted"|"submitted for review"|"review submitted"|"follow-up issue created"|"run closed")|level=(warn|error)' "$LOG_FILE" \
-        | grep -v "permission denied" | tail -n 6 | cut -c1-200
+      id="$(pick_runner "${1:-}")"
+      show_status "$id"
     fi
     ;;
   logs)
-    if [[ ! -f "$LOG_FILE" ]]; then
-      echo "No log yet: $LOG_FILE"
+    id="$(pick_runner "${1:-}")"
+    log_file="$(runner_dir "$id")/orchestrator.log"
+    if [[ ! -f "$log_file" ]]; then
+      echo "No log yet: $log_file"
       exit 0
     fi
-    tail -n 30 -f "$LOG_FILE" | grep --line-buffered -v "permission approved"
+    tail -n 30 -f "$log_file" | grep --line-buffered -v "permission approved"
     ;;
   check|setup-board)
     wf="./WORKFLOW.md"
@@ -193,7 +315,6 @@ case "$COMMAND" in
         continue
       fi
       mkdir -p "$dest/$name"
-      # The skills refer to templates and commands by absolute path.
       sed 's|\$SYMPHONY_HOME|'"$root_escaped"'|g' "$dir/SKILL.md" > "$target"
       echo "Installed $name in $dest/$name"
     done
