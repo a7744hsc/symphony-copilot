@@ -1,0 +1,46 @@
+# AGENTS.md
+
+symphony-copilot turns GitHub Project cards into pull requests by running local GitHub Copilot agents in isolated workspaces. It is a Node.js 22.18+ TypeScript project with no build output.
+
+This file is a map: entry points and hard rules only; details live in the linked docs. When a doc and the code disagree, the code wins; fix the doc in the same pull request.
+
+## Where to start
+
+| Task | Read first |
+|---|---|
+| Any task | The issue on the board, then [README.md](README.md) |
+| Orchestration or agent lifecycle | [src/orchestrator.ts](src/orchestrator.ts), [src/runner.ts](src/runner.ts) |
+| GitHub Projects integration | [src/tracker/github-project.ts](src/tracker/github-project.ts), [docs/reference.md](docs/reference.md) |
+| Workflow configuration or policy | [src/config.ts](src/config.ts), [src/policy.ts](src/policy.ts), [schema/workflow.schema.json](schema/workflow.schema.json) |
+| CLI or setup | [src/cli.ts](src/cli.ts), [src/check.ts](src/check.ts), [docs/onboarding.md](docs/onboarding.md) |
+
+## Build and verify
+
+The workspace hook installs dependencies before an agent starts:
+
+```sh
+npm ci
+npm run typecheck
+npm test
+```
+
+| What changed | Run at least |
+|---|---|
+| TypeScript source, tests, workflow schema, or runtime behavior | `npm run typecheck` and `npm test` |
+| `WORKFLOW.md` or onboarding examples | `bin/symphony check WORKFLOW.md` |
+| Documentation only | Check links and commands against the current code; no automated command is required |
+
+Agents may only run commands listed in `copilot.shell_allow` in WORKFLOW.md; keep that list and this section in step.
+
+## Hard rules
+
+1. **Evidence first.** Never report a check you did not run as passing. Say in the pull request what you ran and what happened, and list what only a person can verify.
+2. **No push.** When symphony-copilot runs you, pushing and opening pull requests happen only through `tracker_submit_for_review`.
+3. **No network and no new dependencies** unless the issue asks for them.
+4. Keep configuration behavior, [schema/workflow.schema.json](schema/workflow.schema.json), [docs/reference.md](docs/reference.md), and the examples consistent.
+
+## Working agreement
+
+- One issue, one branch (`agent/<number>`), one pull request. The independent reviewer follows [REVIEW.md](REVIEW.md) before a person reviews.
+- When behavior or conventions change, update the docs in the same pull request.
+- Problems outside the issue become low-priority follow-up issues through `tracker_create_followup`, not drive-by fixes.
