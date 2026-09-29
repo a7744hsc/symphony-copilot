@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { createWriteStream, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { pathFromFileUrl, RunnerManager, type RunnerRecord } from "./management.ts";
+import { pathFromFileUrl, RunnerManager, startSelection, type RunnerRecord } from "./management.ts";
 
 const manager = new RunnerManager(process.env.SYMPHONY_STATE_DIR ?? `${homedir()}/symphony-workspaces`, pathFromFileUrl(new URL("./cli.ts", import.meta.url)));
 
@@ -37,9 +36,8 @@ async function main(): Promise<void> {
     const id = idIndex >= 0 ? args.splice(idIndex, 2)[1] : undefined;
     if (args.length > 1 || args[0]?.startsWith("--")) throw new Error("start/run accepts one workflow path or registered ID");
     const input = args[0] ?? process.env.SYMPHONY_WORKFLOW;
-    const registered = input ? records.find((r) => r.id === input) : records.find((r) => r.id === manager.lastId());
-    const workflow = registered?.workflow ?? (input ? resolve(input) : resolve("WORKFLOW.md"));
-    const started = await manager.start(workflow, id ?? registered?.id, command === "run");
+    const selected = startSelection(input, records, manager);
+    const started = await manager.start(selected.workflow, id ?? selected.id, command === "run");
     const { record, child } = started;
     if (command === "start") {
       await delay(500);

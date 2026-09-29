@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { RunLedger } from "../src/ledger.ts";
-import { canonicalPath, pathFromFileUrl, projectIdentity, RunnerManager, workflowId } from "../src/management.ts";
+import { canonicalPath, pathFromFileUrl, projectIdentity, RunnerManager, startSelection, workflowId } from "../src/management.ts";
 import { createLogger } from "../src/log.ts";
 import { WorkflowStore } from "../src/workflow.ts";
 
@@ -184,6 +184,24 @@ test("single-workflow default ID is stable and restart preserves the record", { 
   assert.match(status.stdout, new RegExp(`${a.record.id}: Running`));
   await manager.stop(b.record.id);
   await new Promise<void>((done) => children[1]!.once("exit", () => done()));
+});
+
+test("no-argument start migrates the legacy remembered workflow", { skip: process.platform === "win32" }, async (t) => {
+  const { dir, state, manager, children } = fixture();
+  t.after(() => { for (const child of children) if (child.exitCode === null) child.kill(); });
+  const file = workflow(dir, "legacy", 13, join(dir, "work"));
+  mkdirSync(state, { recursive: true });
+  writeFileSync(join(state, ".last-workflow"), `${file}\n`);
+
+  const selected = startSelection(undefined, manager.records(), manager, join(dir, "missing-current-workflow"));
+  assert.deepEqual(selected, { workflow: file });
+  const started = await manager.start(selected.workflow, selected.id);
+  assert.equal(started.record.workflow, canonicalPath(file));
+  assert.equal(manager.lastId(), started.record.id);
+  assert.equal(manager.isRunning(started.record), true);
+
+  await manager.stop(started.record.id);
+  await new Promise<void>((done) => children[0]!.once("exit", () => done()));
 });
 
 test("managed workflow reload refuses project or workspace changes without replacing its prompt/config", () => {

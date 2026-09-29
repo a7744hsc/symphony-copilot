@@ -52,6 +52,20 @@ export function pathFromFileUrl(url: URL): string {
   return fileURLToPath(url);
 }
 
+export function startSelection(input: string | undefined, records: RunnerRecord[], runners: RunnerManager, cwd = process.cwd()): {
+  workflow: string;
+  id?: string;
+} {
+  const registered = input ? records.find((record) => record.id === input) : records.find((record) => record.id === runners.lastId());
+  if (registered) return { workflow: registered.workflow, id: registered.id };
+  if (input) return { workflow: resolve(input) };
+  if (records.length === 0) {
+    const legacy = runners.lastWorkflow();
+    if (legacy) return { workflow: resolve(legacy) };
+  }
+  return { workflow: resolve(cwd, "WORKFLOW.md") };
+}
+
 export class RunnerManager {
   readonly root: string;
   private readonly cli: string;
@@ -133,6 +147,12 @@ export class RunnerManager {
   lastId(): string | null {
     const file = join(this.root, ".last-runner");
     return existsSync(file) ? readFileSync(file, "utf8").trim() : null;
+  }
+
+  lastWorkflow(): string | null {
+    const file = join(this.root, ".last-workflow");
+    if (!existsSync(file)) return null;
+    return readFileSync(file, "utf8").trim() || null;
   }
 
   private async locked<T>(action: () => T): Promise<T> {
