@@ -62,7 +62,7 @@ git clone https://github.com/a7744hsc/symphony-copilot.git
 cd symphony-copilot
 ```
 
-在这个仓库里运行首次设置向导：macOS/Linux 用 `bash scripts/setup.sh`，Windows PowerShell 用 `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`。它会检查 Node.js 24+、Git 2.38+、npm 和 GitHub CLI；缺少时引导使用官方安装源，然后运行 `npm ci`，通过 `gh` 登录、申请 Projects 权限，并配置 Git 凭据。不会索取或保存密码、token。完整流程见[首次设置](docs/onboarding.md#install-and-sign-in)（英文）。
+在这个仓库里运行首次设置向导：macOS/Linux 用 `./scripts/setup.sh`，Windows PowerShell 用 `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`。它会检查 Node.js 24+、Git 2.38+、npm 和 GitHub CLI；缺少时引导使用官方安装源，然后运行 `npm ci`，通过 `gh` 登录、申请 Projects 权限，并配置 Git 凭据。不会索取或保存密码、token。完整流程见[首次设置](docs/onboarding.md#install-and-sign-in)（英文）。
 
 macOS/Linux 上可以选择把 `symphony` 放到 PATH：`ln -s "$PWD/bin/symphony" /usr/local/bin/symphony`。
 

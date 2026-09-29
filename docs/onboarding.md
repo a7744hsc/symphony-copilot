@@ -20,7 +20,7 @@ Clone this repository and run the wizard from its root. It does not require Node
 ```sh
 git clone https://github.com/a7744hsc/symphony-copilot.git
 cd symphony-copilot
-bash scripts/setup.sh
+./scripts/setup.sh
 ```
 
 On Windows, run PowerShell in this repository folder:

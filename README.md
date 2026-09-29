@@ -60,7 +60,7 @@ git clone https://github.com/a7744hsc/symphony-copilot.git
 cd symphony-copilot
 ```
 
-Run the first-run wizard from this checkout: `bash scripts/setup.sh` on macOS/Linux, or `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1` on Windows. It checks Node.js 24+, Git 2.38+, npm and GitHub CLI, guides you to official installers when something is missing, runs `npm ci`, signs in through `gh`, requests the Projects scope, and configures Git credentials. It never asks for or stores your password or token. Details: [first-run setup](docs/onboarding.md#install-and-sign-in).
+Run the first-run wizard from this checkout: `./scripts/setup.sh` on macOS/Linux, or `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1` on Windows. It checks Node.js 24+, Git 2.38+, npm and GitHub CLI, guides you to official installers when something is missing, runs `npm ci`, signs in through `gh`, requests the Projects scope, and configures Git credentials. It never asks for or stores your password or token. Details: [first-run setup](docs/onboarding.md#install-and-sign-in).
 
 On macOS/Linux, optionally put `symphony` on your PATH: `ln -s "$PWD/bin/symphony" /usr/local/bin/symphony`.
 
