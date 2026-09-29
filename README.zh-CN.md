@@ -106,7 +106,7 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 | `--once` | 只轮询一次，等派发出去的 agent 结束后退出。 |
 | `--log-level` | `debug`、`info`（默认）、`warn` 或 `error`。日志是输出到 stderr 的 `key=value` 行。 |
 
-**也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，第一次用过工作流路径后就记住它，并且拒绝启动第二个调度器：
+**也可以用 `bin/symphony`**：它会使用 `SYMPHONY_GITHUB_TOKEN`，未设置时从 `gh` 获取令牌；它会记住最近使用的工作流，并允许在同一台电脑上同时运行多个相互隔离的 runner：
 
 ```sh
 symphony start ~/code/app/WORKFLOW.md --id app       # 后台运行 app
