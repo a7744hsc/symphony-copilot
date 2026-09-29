@@ -125,3 +125,9 @@ test("the PowerShell entry point exists for Windows instructions", () => {
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /GitHub CLI tested version: 2\.101\.0/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /Existing gh installations are detected, not automatically upgraded/);
 });
+
+test("Linux package installation runs directly as root and only uses sudo for non-root users", () => {
+  const source = readFileSync(setup, "utf8");
+  assert.match(source, /if \(\( EUID == 0 \)\); then\s+"\$@"\s+else[\s\S]*?sudo "\$@"/);
+  assert.doesNotMatch(source, /sudo (?:apt-get|dnf|zypper|mkdir|chmod|install|tee)/);
+});

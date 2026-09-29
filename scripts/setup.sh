@@ -86,6 +86,15 @@ detect_linux_pm() {
   fi
 }
 
+run_privileged() {
+  if (( EUID == 0 )); then
+    "$@"
+  else
+    command -v sudo >/dev/null 2>&1 || { say "This install needs administrator rights; install sudo or rerun as root."; return 1; }
+    sudo "$@"
+  fi
+}
+
 install_confirmed_tools() {
   local linux_pm="$1"
   if ! node_ok; then install_node_user || return 1; fi
@@ -103,31 +112,31 @@ install_confirmed_tools() {
     Linux)
       case "$linux_pm" in
         apt)
-          if ! git_ok; then sudo apt-get update && sudo apt-get install -y git || return 1; fi
+          if ! git_ok; then run_privileged apt-get update && run_privileged apt-get install -y git || return 1; fi
           if ! command -v gh >/dev/null 2>&1; then
-            sudo mkdir -p -m 755 /etc/apt/keyrings || return 1
-            curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null || return 1
-            sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg || return 1
-            sudo mkdir -p -m 755 /etc/apt/sources.list.d || return 1
-            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' "$(dpkg --print-architecture)" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null || return 1
-            sudo apt-get update && sudo apt-get install -y gh || return 1
+            run_privileged mkdir -p -m 755 /etc/apt/keyrings || return 1
+            curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 https://cli.github.com/packages/githubcli-archive-keyring.gpg | run_privileged tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null || return 1
+            run_privileged chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg || return 1
+            run_privileged mkdir -p -m 755 /etc/apt/sources.list.d || return 1
+            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' "$(dpkg --print-architecture)" | run_privileged tee /etc/apt/sources.list.d/github-cli.list >/dev/null || return 1
+            run_privileged apt-get update && run_privileged apt-get install -y gh || return 1
           fi
           ;;
         dnf)
-          if ! git_ok; then sudo dnf install -y git || return 1; fi
+          if ! git_ok; then run_privileged dnf install -y git || return 1; fi
           if ! command -v gh >/dev/null 2>&1; then
             local repo_file
             repo_file="$(mktemp)"
             curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 https://cli.github.com/packages/rpm/gh-cli.repo -o "$repo_file" || { rm -f "$repo_file"; return 1; }
-            sudo install -m 0644 "$repo_file" /etc/yum.repos.d/gh-cli.repo || { rm -f "$repo_file"; return 1; }
+            run_privileged install -m 0644 "$repo_file" /etc/yum.repos.d/gh-cli.repo || { rm -f "$repo_file"; return 1; }
             rm -f "$repo_file"
-            sudo dnf install -y gh || return 1
+            run_privileged dnf install -y gh || return 1
           fi
           ;;
         zypper)
-          if ! git_ok; then sudo zypper --non-interactive install git || return 1; fi
+          if ! git_ok; then run_privileged zypper --non-interactive install git || return 1; fi
           if ! command -v gh >/dev/null 2>&1; then
-            sudo zypper addrepo https://cli.github.com/packages/rpm/gh-cli.repo gh-cli && sudo zypper --non-interactive refresh gh-cli && sudo zypper --non-interactive install gh || return 1
+            run_privileged zypper addrepo https://cli.github.com/packages/rpm/gh-cli.repo gh-cli && run_privileged zypper --non-interactive refresh gh-cli && run_privileged zypper --non-interactive install gh || return 1
           fi
           ;;
         *) say "No supported official package manager detected; cannot automatically install Git/gh on this Linux distribution."; return 1 ;;
@@ -184,22 +193,27 @@ if ! missing_tools; then
     say "Install them using your distribution's official repository and the GitHub CLI maintainer instructions, then rerun."
     exit 1
   fi
+  if [[ "$OS" == Linux && "$EUID" != 0 ]] && { ! git_ok || ! command -v gh >/dev/null 2>&1; } && ! command -v sudo >/dev/null 2>&1; then
+    say "Installing Git/GitHub CLI from system repositories needs root or sudo, but sudo is not installed. Nothing has been installed."
+    say "Rerun as root (for example, inside a disposable container) or install sudo first."
+    exit 1
+  fi
   say ""
   say "The following missing tools will be installed after your confirmation:"
   ! node_ok && say "  - Node.js ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}+ LTS (official nodejs.org archive + SHA-256 check; user directory, no sudo)"
   if ! git_ok; then
     case "$OS:$linux_pm" in
       Darwin:*) say "  - Git 2.38+ via Homebrew (or Apple Command Line Tools if Homebrew is unavailable)" ;;
-      Linux:apt) say "  - Git 2.38+ via apt (sudo required)" ;;
-      Linux:dnf) say "  - Git 2.38+ via dnf (sudo required)" ;;
-      Linux:zypper) say "  - Git 2.38+ via zypper (sudo required)" ;;
+      Linux:apt) say "  - Git 2.38+ via apt ($([[ "$EUID" == 0 ]] && printf 'running as root' || printf 'sudo required'))" ;;
+      Linux:dnf) say "  - Git 2.38+ via dnf ($([[ "$EUID" == 0 ]] && printf 'running as root' || printf 'sudo required'))" ;;
+      Linux:zypper) say "  - Git 2.38+ via zypper ($([[ "$EUID" == 0 ]] && printf 'running as root' || printf 'sudo required'))" ;;
       *) say "  - Git 2.38+ (manual installation required on this platform)" ;;
     esac
   fi
   if ! command -v gh >/dev/null 2>&1; then
     case "$OS:$linux_pm" in
       Darwin:*) say "  - GitHub CLI via Homebrew" ;;
-      Linux:apt|Linux:dnf|Linux:zypper) say "  - GitHub CLI from the GitHub CLI maintainers' official repository (sudo required)" ;;
+      Linux:apt|Linux:dnf|Linux:zypper) say "  - GitHub CLI from the GitHub CLI maintainers' official repository ($([[ "$EUID" == 0 ]] && printf 'running as root' || printf 'sudo required'))" ;;
       *) say "  - GitHub CLI (manual installation required on this platform)" ;;
     esac
   fi
