@@ -198,6 +198,22 @@ node_ok() {
   [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
   (( major > MIN_NODE_MAJOR || (major == MIN_NODE_MAJOR && minor >= MIN_NODE_MINOR) ))
 }
+
+copilot_auth_status() {
+  (cd "$ROOT" && node --input-type=module -e '
+import { CopilotClient } from "@github/copilot-sdk";
+const client = new CopilotClient();
+try {
+  await client.start();
+  const status = await client.getAuthStatus();
+  if (!status.isAuthenticated) process.exitCode = 1;
+  else console.log(`${status.login ?? "signed-in account"}${status.authType ? ` via ${status.authType}` : ""}`);
+} finally {
+  await client.stop();
+}
+') 2>/dev/null
+}
+
 git_ok() {
   command -v git >/dev/null 2>&1 || return 1
   local version major minor
@@ -324,20 +340,25 @@ if ! gh auth status -h github.com; then
   exit 1
 fi
 say ""
-say "GitHub CLI authentication is complete. Choose how to authenticate Copilot CLI:"
-say "  1) Device code — visit github.com/login/device and enter the code (recommended for containers/remote shells)"
-say "  2) Browser link — open the OAuth link in a local browser"
-say "Copilot CLI uses the OS keychain when available; headless Linux without a keychain may offer plaintext storage in ~/.copilot/config.json."
-while true; do
-  if ! read -r -p "Copilot login method [1/2, default 1]: " copilot_login_method; then
-    say "No Copilot login method was selected."
-    exit 1
-  fi
-  copilot_login_method="${copilot_login_method:-1}"
-  case "$copilot_login_method" in
-    1) copilot login --device-code; break ;;
-    2) copilot login --web-flow; break ;;
-    *) say "Choose 1 for device code or 2 for browser link." ;;
-  esac
-done
+copilot_account="$(copilot_auth_status || true)"
+if [[ -n "$copilot_account" ]]; then
+  say "Copilot CLI is already authenticated as $copilot_account; skipping login."
+else
+  say "GitHub CLI authentication is complete. Choose how to authenticate Copilot CLI:"
+  say "  1) Device code — visit github.com/login/device and enter the code (recommended for containers/remote shells)"
+  say "  2) Browser link — open the OAuth link in a local browser"
+  say "Copilot CLI uses the OS keychain when available; headless Linux without a keychain may offer plaintext storage in ~/.copilot/config.json."
+  while true; do
+    if ! read -r -p "Copilot login method [1/2, default 1]: " copilot_login_method; then
+      say "No Copilot login method was selected."
+      exit 1
+    fi
+    copilot_login_method="${copilot_login_method:-1}"
+    case "$copilot_login_method" in
+      1) copilot login --device-code; break ;;
+      2) copilot login --web-flow; break ;;
+      *) say "Choose 1 for device code or 2 for browser link." ;;
+    esac
+  done
+fi
 say "Setup complete. Next: run (cd \"$ROOT\" && ./bin/symphony install-skills), then open the target repository in Copilot and run /symphony-onboard."

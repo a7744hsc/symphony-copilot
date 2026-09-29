@@ -27,16 +27,16 @@ test("the Bash wizard requests the Projects scope only when the active account l
   const dir = mkdtempSync(join(tmpdir(), "symphony-setup-test-"));
   const calls = join(dir, "calls.log");
   const bin = mockBin({
-    node: '#!/bin/sh\necho v22.18.0\n',
+    node: '#!/bin/sh\nif [ "$1" = --input-type=module ]; then printf "node auth probe\\n" >> "$GH_LOG"; if [ "$COPILOT_AUTH_STATE" = yes ]; then echo "setup-user via user"; else exit 1; fi; else echo v22.18.0; fi\n',
     git: '#!/bin/sh\necho "git version 2.50.0"\n',
     xz: '#!/bin/sh\nexit 0\n',
     gh: `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'--json hosts'*) printf '{"hosts":{"github.com":[{"active":true,"scopes":"%s"}]}}\\n' "$GH_SCOPES";; esac\ncase "$1" in --version) echo 'gh version 2.101.0';; api) echo setup-user;; esac\nexit 0\n`,
     npm: `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'@github/copilot'*) mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\\nprintf \\\"copilot %%s\\\\n\\\" \\\"$*\\\" >> \\\"$GH_LOG\\\"\\n[ \\\"$1\\\" = --version ] && echo \\\"GitHub Copilot CLI test\\\"\\nexit 0\\n' > "$HOME/.local/bin/copilot"; chmod +x "$HOME/.local/bin/copilot";; esac\nexit 0\n`,
   });
-  const runWithScopes = (scopes: string, loginMethod = "1") => spawnSync("bash", [setup], {
+  const runWithScopes = (scopes: string, loginMethod: string | null = "1", copilotAuthState = "no") => spawnSync("bash", [setup], {
     cwd: root,
-    env: { ...process.env, HOME: dir, PATH: `${bin}${delimiter}/usr/bin${delimiter}/bin`, GH_LOG: calls, GH_SCOPES: scopes },
-    input: `y\ny\ny\n${loginMethod}\n`,
+    env: { ...process.env, HOME: dir, PATH: `${bin}${delimiter}/usr/bin${delimiter}/bin`, GH_LOG: calls, GH_SCOPES: scopes, COPILOT_AUTH_STATE: copilotAuthState },
+    input: loginMethod === null ? "y\ny\ny\n" : `y\ny\ny\n${loginMethod}\n`,
     encoding: "utf8",
   });
   const result = runWithScopes("");
@@ -62,6 +62,12 @@ test("the Bash wizard requests the Projects scope only when the active account l
   assert.match(scopedResult.stdout, /already has the Projects scope; skipping authorization/);
   assert.doesNotMatch(readFileSync(calls, "utf8"), /auth refresh --hostname github\.com --scopes project/);
   assert.match(readFileSync(calls, "utf8"), /copilot login --web-flow/);
+
+  writeFileSync(calls, "");
+  const authenticatedResult = runWithScopes("gist, project, repo", null, "yes");
+  assert.equal(authenticatedResult.status, 0, `${authenticatedResult.stdout}\n${authenticatedResult.stderr}`);
+  assert.match(authenticatedResult.stdout, /Copilot CLI is already authenticated as setup-user via user; skipping login/);
+  assert.doesNotMatch(readFileSync(calls, "utf8"), /copilot login/);
 });
 
 test("a missing or too-old Node is included in the install plan; declining installs nothing", { skip: process.platform === "win32" }, () => {
@@ -166,6 +172,8 @@ test("the PowerShell entry point exists for Windows instructions", () => {
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /copilot login --device-code/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /copilot login --web-flow/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /Copilot login method \[1\/2, default 1\]/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /Get-CopilotAuthStatus/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /already authenticated as \$CopilotAccount; skipping login/);
 });
 
 test("Linux package installation runs directly as root and only uses sudo for non-root users", () => {

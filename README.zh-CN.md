@@ -62,7 +62,7 @@ git clone https://github.com/a7744hsc/symphony-copilot.git
 cd symphony-copilot
 ```
 
-在这个仓库里运行首次设置向导：macOS/Linux 用 `./scripts/setup.sh`，Windows PowerShell 用 `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`。它会检查 Node.js 22.18+、Git 2.38+、npm、GitHub CLI 和 Copilot CLI，列出缺少的工具及安装来源；你确认一次后就自动安装。Node.js 从 nodejs.org 官方归档下载并校验 SHA-256，安装到用户目录；安装官方 npm 包 `@github/copilot` 是为了使用 Copilot CLI，symphony 运行时仍使用 SDK 自带的 runtime。Git 和 GitHub CLI 使用可用的受支持包管理器。若某项无法自动安装，向导会在开始前明确说明。之后会询问是否运行 `npm ci`，然后在同一登录阶段完成 `gh` 和 Copilot CLI 登录：`gh` 用于 GitHub Projects 和 Git 推送，向导仅在当前账号缺少 Projects scope 时请求授权；Copilot CLI 则让你选择浏览器链接或 device code 登录（远程/容器默认推荐 device code）。你在浏览器或设备码页面批准。凭据由相应 CLI 管理；无系统 keychain 的 headless Linux 可能回退到 `~/.copilot/config.json` 明文保存。完整流程见[首次设置](docs/onboarding.md#install-and-sign-in)（英文）。
+在这个仓库里运行首次设置向导：macOS/Linux 用 `./scripts/setup.sh`，Windows PowerShell 用 `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`。它会检查 Node.js 22.18+、Git 2.38+、npm、GitHub CLI 和 Copilot CLI，列出缺少的工具及安装来源；你确认一次后就自动安装。Node.js 从 nodejs.org 官方归档下载并校验 SHA-256，安装到用户目录；安装官方 npm 包 `@github/copilot` 是为了使用 Copilot CLI，symphony 运行时仍使用 SDK 自带的 runtime。Git 和 GitHub CLI 使用可用的受支持包管理器。若某项无法自动安装，向导会在开始前明确说明。之后会询问是否运行 `npm ci`，然后在同一登录阶段处理 `gh` 和 Copilot CLI：`gh` 用于 GitHub Projects 和 Git 推送，向导仅在当前账号缺少 Projects scope 时请求授权；Copilot CLI 会先检查当前是否已认证，已登录就直接复用，只有未认证时才让你选择浏览器链接或 device code（远程/容器默认推荐 device code）。凭据由相应 CLI 管理；无系统 keychain 的 headless Linux 可能回退到 `~/.copilot/config.json` 明文保存。完整流程见[首次设置](docs/onboarding.md#install-and-sign-in)（英文）。
 
 本机验证使用 GitHub CLI 2.101.0。向导没有设置 `gh` 最低版本，也不会自动升级已安装的版本。
 
