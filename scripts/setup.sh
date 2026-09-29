@@ -273,6 +273,7 @@ else
 fi
 
 say ""
+say "GitHub and Copilot sign-in:"
 logged_in=0
 if gh auth status -h github.com >/dev/null 2>&1; then
   account="$(gh api user --jq .login 2>/dev/null || true)"
@@ -300,7 +301,20 @@ if ! gh auth status -h github.com; then
   exit 1
 fi
 say ""
-say "Authenticate GitHub Copilot CLI now. This may open a browser or display a device code; complete that authorization to continue."
+say "GitHub CLI authentication is complete. Choose how to authenticate Copilot CLI:"
+say "  1) Device code — visit github.com/login/device and enter the code (recommended for containers/remote shells)"
+say "  2) Browser link — open the OAuth link in a local browser"
 say "Copilot CLI uses the OS keychain when available; headless Linux without a keychain may offer plaintext storage in ~/.copilot/config.json."
-copilot login
+while true; do
+  if ! read -r -p "Copilot login method [1/2, default 1]: " copilot_login_method; then
+    say "No Copilot login method was selected."
+    exit 1
+  fi
+  copilot_login_method="${copilot_login_method:-1}"
+  case "$copilot_login_method" in
+    1) copilot login --device-code; break ;;
+    2) copilot login --web-flow; break ;;
+    *) say "Choose 1 for device code or 2 for browser link." ;;
+  esac
+done
 say "Setup complete. Next: run (cd \"$ROOT\" && ./bin/symphony install-skills), then open the target repository in Copilot and run /symphony-onboard."

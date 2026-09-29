@@ -196,6 +196,7 @@ try {
     Pop-Location
 }
 
+Write-Host 'GitHub and Copilot sign-in:'
 $LoggedIn = $false
 if (Get-Command gh -ErrorAction SilentlyContinue) {
     & gh auth status --hostname github.com *> $null
@@ -227,8 +228,16 @@ Write-Host ''
 gh auth status --hostname github.com
 if ($LASTEXITCODE -ne 0) { throw 'Authentication verification failed. Run gh auth status and fix the reported issue.' }
 Write-Host ''
-Write-Host 'Authenticate GitHub Copilot CLI now. The login flow opens a browser or displays a device code.'
+Write-Host 'GitHub CLI authentication is complete. Choose how to authenticate Copilot CLI:'
+Write-Host '  1) Device code — visit github.com/login/device and enter the code (recommended for containers/remote shells)'
+Write-Host '  2) Browser link — open the OAuth link in a local browser'
 Write-Host 'Copilot CLI stores credentials in the Windows Credential Manager.'
-copilot login
+do {
+    $CopilotLoginMethod = Read-Host 'Copilot login method [1/2, default 1]'
+    if ([string]::IsNullOrWhiteSpace($CopilotLoginMethod)) { $CopilotLoginMethod = '1' }
+    if ($CopilotLoginMethod -notin @('1', '2')) { Write-Host 'Choose 1 for device code or 2 for browser link.' }
+} while ($CopilotLoginMethod -notin @('1', '2'))
+if ($CopilotLoginMethod -eq '1') { copilot login --device-code }
+else { copilot login --web-flow }
 if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI login failed.' }
 Write-Host 'Setup complete. Next: .\bin\symphony install-skills, then open the target repository in Copilot and run /symphony-onboard.'

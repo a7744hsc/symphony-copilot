@@ -27,10 +27,10 @@ test("the Bash wizard requests the Projects scope only when the active account l
     gh: `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'--json hosts'*) printf '{"hosts":{"github.com":[{"active":true,"scopes":"%s"}]}}\\n' "$GH_SCOPES";; esac\ncase "$1" in --version) echo 'gh version 2.101.0';; api) echo setup-user;; esac\nexit 0\n`,
     npm: `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'@github/copilot'*) mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\\nprintf \\\"copilot %%s\\\\n\\\" \\\"$*\\\" >> \\\"$GH_LOG\\\"\\n[ \\\"$1\\\" = --version ] && echo \\\"GitHub Copilot CLI test\\\"\\nexit 0\\n' > "$HOME/.local/bin/copilot"; chmod +x "$HOME/.local/bin/copilot";; esac\nexit 0\n`,
   });
-  const runWithScopes = (scopes: string) => spawnSync("bash", [setup], {
+  const runWithScopes = (scopes: string, loginMethod = "1") => spawnSync("bash", [setup], {
     cwd: root,
     env: { ...process.env, HOME: dir, PATH: `${bin}${delimiter}/usr/bin${delimiter}/bin`, GH_LOG: calls, GH_SCOPES: scopes },
-    input: "y\ny\ny\n",
+    input: `y\ny\ny\n${loginMethod}\n`,
     encoding: "utf8",
   });
   const result = runWithScopes("");
@@ -43,7 +43,7 @@ test("the Bash wizard requests the Projects scope only when the active account l
   assert.match(log, /auth status --hostname github\.com --json hosts --jq/);
   assert.match(log, /auth refresh --hostname github\.com --scopes project/);
   assert.match(log, /auth setup-git --hostname github\.com/);
-  assert.match(log, /copilot login/);
+  assert.match(log, /copilot login --device-code/);
   assert.match(result.stdout, /Setup complete/);
   assert.ok(result.stdout.includes(`(cd "${root}" && ./bin/symphony install-skills)`));
   assert.match(result.stdout, /GitHub CLI tested version: 2\.101\.0/);
@@ -51,10 +51,11 @@ test("the Bash wizard requests the Projects scope only when the active account l
   assert.doesNotMatch(result.stdout, /token=[^\s]+|password=/i);
 
   writeFileSync(calls, "");
-  const scopedResult = runWithScopes("gist, project, repo");
+  const scopedResult = runWithScopes("gist, project, repo", "2");
   assert.equal(scopedResult.status, 0, `${scopedResult.stdout}\n${scopedResult.stderr}`);
   assert.match(scopedResult.stdout, /already has the Projects scope; skipping authorization/);
   assert.doesNotMatch(readFileSync(calls, "utf8"), /auth refresh --hostname github\.com --scopes project/);
+  assert.match(readFileSync(calls, "utf8"), /copilot login --web-flow/);
 });
 
 test("a missing or too-old Node is included in the install plan; declining installs nothing", { skip: process.platform === "win32" }, () => {
@@ -93,7 +94,7 @@ test("after confirmation, Node is downloaded from nodejs.org, checksum-verified 
   const result = spawnSync("bash", [setup], {
     cwd: root,
     env: { ...process.env, HOME: home, PATH: `${bin}${delimiter}/usr/bin${delimiter}/bin`, GH_LOG: calls, SHELL: "/bin/bash" },
-    input: "y\ny\ny\n",
+    input: "y\ny\ny\n1\n",
     encoding: "utf8",
   });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
@@ -153,7 +154,9 @@ test("the PowerShell entry point exists for Windows instructions", () => {
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /GitHub CLI tested version: 2\.101\.0/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /Existing gh installations are detected, not automatically upgraded/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /@github\/copilot/);
-  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /copilot login/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /copilot login --device-code/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /copilot login --web-flow/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /Copilot login method \[1\/2, default 1\]/);
 });
 
 test("Linux package installation runs directly as root and only uses sudo for non-root users", () => {
