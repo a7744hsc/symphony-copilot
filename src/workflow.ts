@@ -66,12 +66,14 @@ export class WorkflowStore {
   private debounce: NodeJS.Timeout | null = null;
   private readonly log: Logger;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly validate?: (config: ServiceConfig) => void;
   private readonly listeners: Array<(workflow: EffectiveWorkflow) => void> = [];
 
-  constructor(path: string, log: Logger, env: NodeJS.ProcessEnv = process.env) {
+  constructor(path: string, log: Logger, env: NodeJS.ProcessEnv = process.env, validate?: (config: ServiceConfig) => void) {
     this.path = resolve(path);
     this.log = log;
     this.env = env;
+    this.validate = validate;
     this.current = this.read();
   }
 
@@ -128,6 +130,7 @@ export class WorkflowStore {
     const mtimeMs = statSync(this.path, { throwIfNoEntry: false })?.mtimeMs ?? 0;
     const definition = loadWorkflow(this.path);
     const config = buildConfig(definition.config, this.path, this.env);
+    this.validate?.(config);
     this.lastMtimeMs = mtimeMs;
     return { definition, config, loadedAt: new Date() };
   }

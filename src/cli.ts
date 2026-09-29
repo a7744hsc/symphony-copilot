@@ -9,6 +9,7 @@ import { runAgentAttempt } from "./runner.ts";
 import { createTracker } from "./tracker/index.ts";
 import { WorkflowStore } from "./workflow.ts";
 import { WorkspaceManager } from "./workspace.ts";
+import { projectIdentity, canonicalPath } from "./management.ts";
 
 const USAGE = `Usage: symphony [path/to/WORKFLOW.md] [--dry-run] [--once] [--log-level debug|info|warn|error]
 
@@ -46,7 +47,12 @@ function main(): Promise<number> | number {
   let store: WorkflowStore;
   let ledger: RunLedger;
   try {
-    store = new WorkflowStore(args.positionals[0] ?? "WORKFLOW.md", log);
+    store = new WorkflowStore(args.positionals[0] ?? "WORKFLOW.md", log, process.env, (config) => {
+      if (process.env.SYMPHONY_RUNNER_PROJECT && (
+        projectIdentity(config) !== process.env.SYMPHONY_RUNNER_PROJECT
+        || canonicalPath(config.workspace.root) !== process.env.SYMPHONY_RUNNER_WORKSPACE
+      )) throw new Error("managed runner cannot change project or workspace.root while running; stop and restart it");
+    });
     ledger = new RunLedger(join(store.workflow.config.workspace.root, ".symphony-ledger.json"), { readOnly: dryRun });
   } catch (error) {
     log.error("startup failed", { error: (error as Error).message });
