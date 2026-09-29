@@ -131,6 +131,8 @@ Then add a Board view to see the columns, and compare the board with `WORKFLOW.m
 symphony check --online
 ```
 
+The `symphony` wrapper gets its token from `gh auth token`. Before running the direct `node` command below, set the token in the current shell: use `export SYMPHONY_GITHUB_TOKEN="$(gh auth token)"` in Bash, or `$env:SYMPHONY_GITHUB_TOKEN = gh auth token` in PowerShell. The direct Node.js invocation does not load the GitHub token automatically.
+
 ## 4. Write the first card and run
 
 Run `/symphony-write-card` and describe the task. The skill drafts an issue with a goal, acceptance criteria, how to verify it, and what is out of scope, then creates it and adds it to the board. It only adds the `agent` label and moves the card to an active column if you want the agent to start now. Pick something small the first time.

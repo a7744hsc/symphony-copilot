@@ -5,7 +5,7 @@ tracker:
   provider:
     owner: a7744hsc
     owner_type: user
-    project_number:
+    project_number: 2
     repo: a7744hsc/symphony-copilot
     token: $SYMPHONY_GITHUB_TOKEN
     status_field: Status

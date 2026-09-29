@@ -117,7 +117,7 @@ Show the user what you wrote, then list the next steps. They need the user's Git
 
 1. Commit and push the files; agents clone the repository, so the files must be on the default branch.
 2. `gh auth refresh -s project`, then `$SYMPHONY_HOME/bin/symphony setup-board WORKFLOW.md`: it creates the board, writes `project_number`, and explains that GitHub Project workflows are separate, cannot be configured through the public API, and do not need changes for onboarding. If card statuses later change unexpectedly or skip a Symphony stage, inspect enabled workflows on the project's Workflows page. Commit the number.
-3. `$SYMPHONY_HOME/bin/symphony check WORKFLOW.md --online`, then a dry run: `node $SYMPHONY_HOME/src/cli.ts WORKFLOW.md --dry-run --once`.
+3. Before either verification command, set `SYMPHONY_GITHUB_TOKEN` in the current shell. In Bash, use `export SYMPHONY_GITHUB_TOKEN="$(gh auth token)"`; in PowerShell, use `$env:SYMPHONY_GITHUB_TOKEN = gh auth token`. Then run `$SYMPHONY_HOME/bin/symphony check WORKFLOW.md --online` and the read-only dry run `node $SYMPHONY_HOME/src/cli.ts WORKFLOW.md --dry-run --once`. The `symphony` wrapper can load the token itself, but the direct `node` command cannot.
 4. Write the first card with the symphony-write-card skill.
 
 Do not create the board, push, or change GitHub settings yourself.
