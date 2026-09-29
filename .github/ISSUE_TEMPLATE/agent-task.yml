@@ -1,0 +1,38 @@
+# This form deliberately adds no labels. A maintainer adds the dispatch label after review,
+# so creating an issue does not start an agent.
+name: Agent task
+description: A change small enough for one pull request, written so an agent can do it and prove it.
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be different when this is done, and why.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable results, one per line, each checkable by running or looking at something.
+      value: |
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: verify
+    attributes:
+      label: How to verify
+      description: Commands to run, screens to look at, and what only a person can check.
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What not to change, even if it looks related.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Links, related issues, constraints, where to start.
