@@ -49,6 +49,13 @@ function Get-ToolState {
         Write-Host '  - GitHub CLI (gh)'
         $Missing.Add('GitHub CLI')
     }
+    if (Get-Command copilot -ErrorAction SilentlyContinue) {
+        $CopilotVersion = (& copilot --version 2>$null | Select-Object -First 1).Trim()
+        Write-Host "  ✓ Copilot CLI $CopilotVersion"
+    } else {
+        Write-Host '  - GitHub Copilot CLI (copilot)'
+        $Missing.Add('Copilot CLI')
+    }
     if (Get-Command npm -ErrorAction SilentlyContinue) {
         Write-Host "  ✓ npm $(& npm --version)"
     } else {
@@ -108,6 +115,16 @@ function Install-NodeUser {
 
 function Install-ConfirmedTools([string[]] $Missing) {
     if ($Missing -contains 'Node.js') { Install-NodeUser }
+    if ($Missing -contains 'Copilot CLI') {
+        $CopilotPrefix = Join-Path $env:LOCALAPPDATA 'Programs\symphony-copilot-tools'
+        $PreviousIgnoreScripts = $env:npm_config_ignore_scripts
+        $env:npm_config_ignore_scripts = 'false'
+        npm install --global --prefix $CopilotPrefix '@github/copilot'
+        $env:npm_config_ignore_scripts = $PreviousIgnoreScripts
+        if ($LASTEXITCODE -ne 0) { throw 'npm failed to install @github/copilot.' }
+        [Environment]::SetEnvironmentVariable('Path', "$CopilotPrefix;$([Environment]::GetEnvironmentVariable('Path', 'User'))", 'User')
+        $env:Path = "$CopilotPrefix;$env:Path"
+    }
     foreach ($Package in @(
         @{ Name = 'Git'; Id = 'Git.Git' },
         @{ Name = 'GitHub CLI'; Id = 'GitHub.cli' }
@@ -130,9 +147,9 @@ function Install-ConfirmedTools([string[]] $Missing) {
 }
 
 Write-Host 'symphony-copilot setup — Windows'
-Write-Host "This wizard checks Node.js $MinimumNodeMajor.$MinimumNodeMinor+, Git and GitHub CLI, signs in through gh, then installs this checkout's npm dependencies."
+Write-Host "This wizard checks Node.js $MinimumNodeMajor.$MinimumNodeMinor+, Git, GitHub CLI and Copilot CLI, signs in to both services, then installs this checkout's npm dependencies."
 Write-Host 'GitHub CLI tested version: 2.101.0 (2026-09-29). Existing gh installations are detected, not automatically upgraded.'
-Write-Host 'It does not ask for, print or save your password or token.'
+Write-Host 'The wizard does not handle tokens directly; gh and Copilot CLI store credentials using their normal auth flows.'
 Write-Host ''
 Write-Host 'Checking prerequisites:'
 $Missing = Get-ToolState
@@ -142,6 +159,7 @@ if ($Missing.Count -gt 0) {
     Write-Host ''
     Write-Host 'The following missing tools will be installed after your confirmation:'
     if ($Missing -contains 'Node.js') { Write-Host "  - Node.js $MinimumNodeMajor.$MinimumNodeMinor+ LTS from nodejs.org; verify official SHA-256; install under your user profile, no admin required" }
+    if ($Missing -contains 'Copilot CLI') { Write-Host '  - GitHub Copilot CLI from the official npm package @github/copilot (user-local prefix; no admin required)' }
     if ($Missing -contains 'Git') { Write-Host '  - Git for Windows using the official WinGet source (admin approval may be requested)' }
     if ($Missing -contains 'GitHub CLI') { Write-Host '  - GitHub CLI using the maintainer-supported WinGet package (GitHub.cli)' }
     if (-not $CanInstall) {
@@ -203,4 +221,8 @@ Write-Host ''
 gh auth status --hostname github.com
 if ($LASTEXITCODE -ne 0) { throw 'Authentication verification failed. Run gh auth status and fix the reported issue.' }
 Write-Host ''
+Write-Host 'Authenticate GitHub Copilot CLI now. The login flow opens a browser or displays a device code.'
+Write-Host 'Copilot CLI stores credentials in the Windows Credential Manager.'
+copilot login
+if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI login failed.' }
 Write-Host 'Setup complete. Next: .\bin\symphony install-skills, then open the target repository in Copilot and run /symphony-onboard.'

@@ -25,21 +25,23 @@ test("the Bash wizard runs npm ci and requests browser auth, project scope and g
     node: '#!/bin/sh\necho v22.18.0\n',
     git: '#!/bin/sh\necho "git version 2.50.0"\n',
     gh: `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_LOG"\ncase "$1" in --version) echo 'gh version 2.101.0';; api) echo setup-user;; esac\nexit 0\n`,
-    npm: `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> "$GH_LOG"\nexit 0\n`,
+    npm: `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'@github/copilot'*) mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\\nprintf \\\"copilot %%s\\\\n\\\" \\\"$*\\\" >> \\\"$GH_LOG\\\"\\n[ \\\"$1\\\" = --version ] && echo \\\"GitHub Copilot CLI test\\\"\\nexit 0\\n' > "$HOME/.local/bin/copilot"; chmod +x "$HOME/.local/bin/copilot";; esac\nexit 0\n`,
   });
   const result = spawnSync("bash", [setup], {
     cwd: root,
-    env: { ...process.env, PATH: `${bin}${delimiter}/usr/bin${delimiter}/bin`, GH_LOG: calls },
-    input: "y\ny\n",
+    env: { ...process.env, HOME: dir, PATH: `${bin}${delimiter}/usr/bin${delimiter}/bin`, GH_LOG: calls },
+    input: "y\ny\ny\n",
     encoding: "utf8",
   });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   const log = readFileSync(calls, "utf8");
   assert.match(log, /npm ci/);
+  assert.match(log, /npm install --global --prefix .*\.local @github\/copilot/);
   assert.match(log, /auth status/);
   assert.match(log, /api user --jq \.login/);
   assert.match(log, /auth refresh --hostname github\.com --scopes project/);
   assert.match(log, /auth setup-git --hostname github\.com/);
+  assert.match(log, /copilot login/);
   assert.match(result.stdout, /Setup complete/);
   assert.ok(result.stdout.includes(`(cd "${root}" && ./bin/symphony install-skills)`));
   assert.match(result.stdout, /GitHub CLI tested version: 2\.101\.0/);
@@ -71,6 +73,7 @@ test("after confirmation, Node is downloaded from nodejs.org, checksum-verified 
   const bin = mockBin({
     uname: '#!/bin/sh\n[ "$1" = -m ] && echo aarch64 || echo Linux\n',
     "apt-get": '#!/bin/sh\nexit 0\n',
+    copilot: '#!/bin/sh\nprintf "copilot %s\\n" "$*" >> "$GH_LOG"\n[ "$1" = --version ] && echo "GitHub Copilot CLI test"\nexit 0\n',
     node: '#!/bin/sh\necho v20.0.0\n',
     git: '#!/bin/sh\necho "git version 2.50.0"\n',
     gh: `#!/bin/sh\nprintf 'gh %s\\n' "$*" >> "$GH_LOG"\ncase "$1" in --version) echo 'gh version 2.80.0';; api) echo setup-user;; esac\nexit 0\n`,
@@ -123,8 +126,11 @@ test("the PowerShell entry point exists for Windows instructions", () => {
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /nodejs\.org\/dist\/latest-v/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /\$MinimumNodeMinor = 18/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /WinGet failed to install/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /npm install --global --prefix \$CopilotPrefix '@github\/copilot'/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /GitHub CLI tested version: 2\.101\.0/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /Existing gh installations are detected, not automatically upgraded/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /@github\/copilot/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /copilot login/);
 });
 
 test("Linux package installation runs directly as root and only uses sudo for non-root users", () => {

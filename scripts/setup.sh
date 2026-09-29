@@ -98,6 +98,20 @@ run_privileged() {
 install_confirmed_tools() {
   local linux_pm="$1"
   if ! node_ok; then install_node_user || return 1; fi
+  if ! command -v copilot >/dev/null 2>&1; then
+    mkdir -p "$HOME/.local/bin"
+    npm_config_ignore_scripts=false npm install --global --prefix "$HOME/.local" @github/copilot || return 1
+    PATH="$HOME/.local/bin:$PATH"
+    export PATH
+    shell_name="$(basename "${SHELL:-sh}")"
+    case "$shell_name" in
+      zsh) rc_file="$HOME/.zprofile" ;;
+      bash) rc_file="$HOME/.bash_profile"; [[ -f "$rc_file" ]] || rc_file="$HOME/.profile" ;;
+      *) rc_file="$HOME/.profile" ;;
+    esac
+    export_line='export PATH="$HOME/.local/bin:$PATH"'
+    if [[ ! -f "$rc_file" ]] || ! grep -Fq "$export_line" "$rc_file"; then printf '\n%s\n' "$export_line" >> "$rc_file"; fi
+  fi
   case "$OS" in
     Darwin)
       if ! git_ok; then
@@ -170,14 +184,15 @@ missing_tools() {
   if ! node_ok; then say "  - Node.js ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}+ (required)"; missing=1; else say "  ✓ Node.js $(node --version)"; fi
   if ! git_ok; then say "  - Git 2.${MIN_GIT_MINOR}+ (required for merge-tree conflict checks)"; missing=1; else say "  ✓ Git $(git --version | awk '{print $3}')"; fi
   if command -v gh >/dev/null 2>&1; then say "  ✓ GitHub CLI $(gh --version | head -n 1 | awk '{print $3}')"; else say "  - GitHub CLI (gh)"; missing=1; fi
+  if command -v copilot >/dev/null 2>&1; then say "  ✓ Copilot CLI $(copilot --version 2>/dev/null | head -n 1)"; else say "  - GitHub Copilot CLI (copilot)"; missing=1; fi
   if command -v npm >/dev/null 2>&1; then say "  ✓ npm $(npm --version)"; else say "  - npm (bundled with Node.js)"; missing=1; fi
   return "$missing"
 }
 
 say "symphony-copilot setup — $OS"
-say "This wizard checks Node.js 22.18+, Git and GitHub CLI, signs in through gh, then installs this checkout's npm dependencies."
+say "This wizard checks Node.js 22.18+, Git, GitHub CLI and Copilot CLI, signs in to both services, then installs this checkout's npm dependencies."
 say "GitHub CLI tested version: 2.101.0 (2026-09-29). Existing gh installations are detected, not automatically upgraded."
-say "It does not ask for, print or save your password or token."
+say "The wizard does not handle tokens directly; gh and Copilot CLI store credentials using their normal auth flows."
 say ""
 say "Checking prerequisites:"
 if ! missing_tools; then
@@ -216,6 +231,9 @@ if ! missing_tools; then
       Linux:apt|Linux:dnf|Linux:zypper) say "  - GitHub CLI from the GitHub CLI maintainers' official repository ($([[ "$EUID" == 0 ]] && printf 'running as root' || printf 'sudo required'))" ;;
       *) say "  - GitHub CLI (manual installation required on this platform)" ;;
     esac
+  fi
+  if ! command -v copilot >/dev/null 2>&1; then
+    say "  - GitHub Copilot CLI from official npm package @github/copilot (user-local prefix; no sudo)"
   fi
   if [[ "$OS" != Darwin && "$OS" != Linux ]]; then say "This platform is not supported by the Unix installer; use scripts/setup.ps1 on Windows."; exit 1; fi
   if ask_yes "Proceed with these installations?"; then
@@ -269,4 +287,7 @@ if ! gh auth status -h github.com; then
   exit 1
 fi
 say ""
+say "Authenticate GitHub Copilot CLI now. This may open a browser or display a device code; complete that authorization to continue."
+say "Copilot CLI uses the OS keychain when available; headless Linux without a keychain may offer plaintext storage in ~/.copilot/config.json."
+copilot login
 say "Setup complete. Next: run (cd \"$ROOT\" && ./bin/symphony install-skills), then open the target repository in Copilot and run /symphony-onboard."
