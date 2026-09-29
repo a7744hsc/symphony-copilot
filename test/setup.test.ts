@@ -41,6 +41,7 @@ test("the Bash wizard runs npm ci and requests browser auth, project scope and g
   assert.match(log, /auth refresh --hostname github\.com --scopes project/);
   assert.match(log, /auth setup-git --hostname github\.com/);
   assert.match(result.stdout, /Setup complete/);
+  assert.ok(result.stdout.includes(`(cd "${root}" && ./bin/symphony install-skills)`));
   assert.match(result.stdout, /GitHub CLI tested version: 2\.101\.0/);
   assert.match(result.stdout, /Existing gh installations are detected, not automatically upgraded/);
   assert.doesNotMatch(result.stdout, /token=[^\s]+|password=/i);

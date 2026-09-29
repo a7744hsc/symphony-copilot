@@ -269,4 +269,4 @@ if ! gh auth status -h github.com; then
   exit 1
 fi
 say ""
-say 'Setup complete. Next: `symphony install-skills`, then open the target repository in Copilot and run /symphony-onboard.'
+say "Setup complete. Next: run (cd \"$ROOT\" && ./bin/symphony install-skills), then open the target repository in Copilot and run /symphony-onboard."
