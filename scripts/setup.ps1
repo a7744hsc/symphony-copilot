@@ -1,7 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $MinimumNodeMajor = 22
 $MinimumNodeMinor = 18
-$NodeDistBase = "https://nodejs.org/dist/latest-v$MinimumNodeMajor.x"
+$NodeInstallMajor = 24
+$NodeDistBase = "https://nodejs.org/dist/latest-v$NodeInstallMajor.x"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 function Confirm-Step([string] $Message) {
@@ -73,13 +74,13 @@ function Get-NodeArchive {
         default { throw "Node.js official Windows archives do not support architecture '$Architecture'." }
     }
     $Manifest = Invoke-RestMethod -Uri "$NodeDistBase/SHASUMS256.txt" -Method Get
-    $Pattern = "^(node-v$MinimumNodeMajor\.\d+\.\d+-win-$NodeArchitecture\.zip)\s+(.+)$"
+    $Pattern = "^(node-v$NodeInstallMajor\.\d+\.\d+-win-$NodeArchitecture\.zip)\s+(.+)$"
     foreach ($Line in ($Manifest -split "`n")) {
         if ($Line.Trim() -match $Pattern) {
             return @{ Name = $Matches[1]; Hash = $Matches[2].Trim() }
         }
     }
-    throw "No official Node.js $MinimumNodeMajor archive found for Windows $NodeArchitecture."
+    throw "No official Node.js $NodeInstallMajor LTS archive found for Windows $NodeArchitecture."
 }
 
 function Install-NodeUser {
@@ -87,7 +88,7 @@ function Install-NodeUser {
     $TempDir = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
     $ZipPath = Join-Path $TempDir $ArchiveInfo.Name
     $ExtractDir = Join-Path $TempDir 'unpacked'
-    $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\symphony-node-v$MinimumNodeMajor"
+    $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\symphony-node-v$NodeInstallMajor"
     New-Item -ItemType Directory -Path $TempDir, $ExtractDir -Force | Out-Null
     try {
         Invoke-WebRequest -Uri "$NodeDistBase/$($ArchiveInfo.Name)" -OutFile $ZipPath
@@ -106,7 +107,7 @@ function Install-NodeUser {
             [Environment]::SetEnvironmentVariable('Path', ((@($InstallDir) + $PathEntries) -join ';'), 'User')
         }
         $env:Path = "$InstallDir;$env:Path"
-        Write-Host "Installed $(& (Join-Path $InstallDir 'node.exe') --version) from nodejs.org; SHA-256 verified."
+        Write-Host "Installed $(& (Join-Path $InstallDir 'node.exe') --version) from the official Node.js LTS archive; SHA-256 verified."
         Write-Host "Added $InstallDir to the user PATH. New terminals will pick it up too."
     } finally {
         Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -158,7 +159,7 @@ if ($Missing.Count -gt 0) {
                   ($Missing -notcontains 'Git' -or (Get-Command winget -ErrorAction SilentlyContinue))
     Write-Host ''
     Write-Host 'The following missing tools will be installed after your confirmation:'
-    if ($Missing -contains 'Node.js') { Write-Host "  - Node.js $MinimumNodeMajor.$MinimumNodeMinor+ LTS from nodejs.org; verify official SHA-256; install under your user profile, no admin required" }
+    if ($Missing -contains 'Node.js') { Write-Host "  - Current Node.js LTS (Node $NodeInstallMajor; satisfies minimum $MinimumNodeMajor.$MinimumNodeMinor) from nodejs.org; verify official SHA-256; install under your user profile, no admin required" }
     if ($Missing -contains 'Copilot CLI') { Write-Host '  - GitHub Copilot CLI from the official npm package @github/copilot (user-local prefix; no admin required)' }
     if ($Missing -contains 'Git') { Write-Host '  - Git for Windows using the official WinGet source (admin approval may be requested)' }
     if ($Missing -contains 'GitHub CLI') { Write-Host '  - GitHub CLI using the maintainer-supported WinGet package (GitHub.cli)' }
@@ -211,9 +212,14 @@ if (-not $LoggedIn) {
 }
 
 Write-Host ''
-Write-Host 'Grant the GitHub Projects scope. GitHub will ask you to approve it in the browser.'
-gh auth refresh --hostname github.com --scopes project
-if ($LASTEXITCODE -ne 0) { throw 'Could not grant the project scope.' }
+$ProjectScopes = (& gh auth status --hostname github.com --json hosts --jq '.hosts["github.com"][] | select(.active) | .scopes // ""' 2>$null) -join ','
+if ($LASTEXITCODE -eq 0 -and (($ProjectScopes -split ',') | ForEach-Object { $_.Trim() }) -contains 'project') {
+    Write-Host 'The active GitHub account already has the Projects scope; skipping authorization.'
+} else {
+    Write-Host 'Grant the GitHub Projects scope. GitHub will ask you to approve it in the browser.'
+    gh auth refresh --hostname github.com --scopes project
+    if ($LASTEXITCODE -ne 0) { throw 'Could not grant the project scope.' }
+}
 Write-Host 'Configure Git to use GitHub CLI credentials for pushing agent branches.'
 gh auth setup-git --hostname github.com
 if ($LASTEXITCODE -ne 0) { throw 'Could not configure Git credentials.' }

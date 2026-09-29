@@ -3,8 +3,9 @@ set -euo pipefail
 
 MIN_NODE_MAJOR=22
 MIN_NODE_MINOR=18
+NODE_INSTALL_MAJOR=24
 MIN_GIT_MINOR=38
-NODE_DIST_BASE="https://nodejs.org/dist/latest-v${MIN_NODE_MAJOR}.x"
+NODE_DIST_BASE="https://nodejs.org/dist/latest-v${NODE_INSTALL_MAJOR}.x"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OS="$(uname -s)"
 
@@ -28,6 +29,7 @@ node_archive_platform() {
 
 install_node_user() {
   local platform sums archive expected actual home_bin install_dir temp_dir shell_name rc_file export_line hash_cmd
+  local -a rc_files
   platform="$(node_archive_platform)" || { say "Unsupported Node.js architecture: $OS/$(uname -m)"; return 1; }
   for tool in curl tar; do command -v "$tool" >/dev/null 2>&1 || { say "Cannot install Node.js automatically: missing $tool."; return 1; }; done
   if command -v shasum >/dev/null 2>&1; then
@@ -43,7 +45,7 @@ install_node_user() {
     rm -f "$sums"
     return 1
   fi
-  archive="$(awk -v p="$platform" -v major="$MIN_NODE_MAJOR" '$2 ~ ("^node-v" major "\\.[0-9]+\\.[0-9]+-" p "\\.tar\\.xz$") {print $2; exit}' "$sums")"
+  archive="$(awk -v p="$platform" -v major="$NODE_INSTALL_MAJOR" '$2 ~ ("^node-v" major "\\.[0-9]+\\.[0-9]+-" p "\\.tar\\.xz$") {print $2; exit}' "$sums")"
   if [[ -z "$archive" ]]; then rm -f "$sums"; say "No official Node.js archive for $platform."; return 1; fi
   expected="$(awk -v f="$archive" '$2 == f {print $1; exit}' "$sums")"
   temp_dir="$(mktemp -d)"
@@ -54,7 +56,7 @@ install_node_user() {
   rm -f "$sums"
   if [[ "$actual" != "$expected" ]]; then rm -rf "$temp_dir"; say "Node.js archive checksum mismatch; refusing to install."; return 1; fi
   home_bin="$HOME/.local/bin"
-  install_dir="$HOME/.local/share/symphony/node-v${MIN_NODE_MAJOR}"
+  install_dir="$HOME/.local/share/symphony/node-v${NODE_INSTALL_MAJOR}"
   mkdir -p "$home_bin" "$(dirname "$install_dir")"
   tar -xJf "$temp_dir/$archive" -C "$temp_dir" --strip-components=1
   rm -f "$temp_dir/$archive"
@@ -66,16 +68,18 @@ install_node_user() {
   export PATH="$home_bin:$PATH"
   shell_name="$(basename "${SHELL:-sh}")"
   case "$shell_name" in
-    zsh) rc_file="$HOME/.zprofile" ;;
-    bash) rc_file="$HOME/.bash_profile"; [[ -f "$rc_file" ]] || rc_file="$HOME/.profile" ;;
-    *) rc_file="$HOME/.profile" ;;
+    zsh) rc_files=("$HOME/.zprofile" "$HOME/.zshrc") ;;
+    bash) rc_files=("$HOME/.bash_profile" "$HOME/.profile" "$HOME/.bashrc") ;;
+    *) rc_files=("$HOME/.profile") ;;
   esac
   export_line='export PATH="$HOME/.local/bin:$PATH"'
-  if [[ ! -f "$rc_file" ]] || ! grep -Fq "$export_line" "$rc_file"; then printf '\n%s\n' "$export_line" >> "$rc_file"; fi
+  for rc_file in "${rc_files[@]}"; do
+    if [[ ! -f "$rc_file" ]] || ! grep -Fq "$export_line" "$rc_file"; then printf '\n%s\n' "$export_line" >> "$rc_file"; fi
+  done
   PATH="$home_bin:$PATH"
   export PATH
-  say "Installed $("$home_bin/node" --version) from nodejs.org and verified its SHA-256."
-  say "Added $home_bin to PATH in $rc_file (new shells will pick it up)."
+  say "Installed $("$home_bin/node" --version) from the official Node.js LTS archive and verified its SHA-256."
+  say "Added $home_bin to PATH in ${rc_files[*]} (new login and interactive shells will pick it up)."
 }
 
 detect_linux_pm() {
@@ -97,6 +101,8 @@ run_privileged() {
 
 install_confirmed_tools() {
   local linux_pm="$1"
+  local shell_name rc_file export_line
+  local -a rc_files
   if ! node_ok; then install_node_user || return 1; fi
   if ! command -v copilot >/dev/null 2>&1; then
     mkdir -p "$HOME/.local/bin"
@@ -105,12 +111,14 @@ install_confirmed_tools() {
     export PATH
     shell_name="$(basename "${SHELL:-sh}")"
     case "$shell_name" in
-      zsh) rc_file="$HOME/.zprofile" ;;
-      bash) rc_file="$HOME/.bash_profile"; [[ -f "$rc_file" ]] || rc_file="$HOME/.profile" ;;
-      *) rc_file="$HOME/.profile" ;;
+      zsh) rc_files=("$HOME/.zprofile" "$HOME/.zshrc") ;;
+      bash) rc_files=("$HOME/.bash_profile" "$HOME/.profile" "$HOME/.bashrc") ;;
+      *) rc_files=("$HOME/.profile") ;;
     esac
     export_line='export PATH="$HOME/.local/bin:$PATH"'
-    if [[ ! -f "$rc_file" ]] || ! grep -Fq "$export_line" "$rc_file"; then printf '\n%s\n' "$export_line" >> "$rc_file"; fi
+    for rc_file in "${rc_files[@]}"; do
+      if [[ ! -f "$rc_file" ]] || ! grep -Fq "$export_line" "$rc_file"; then printf '\n%s\n' "$export_line" >> "$rc_file"; fi
+    done
   fi
   case "$OS" in
     Darwin)
@@ -215,7 +223,7 @@ if ! missing_tools; then
   fi
   say ""
   say "The following missing tools will be installed after your confirmation:"
-  ! node_ok && say "  - Node.js ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}+ LTS (official nodejs.org archive + SHA-256 check; user directory, no sudo)"
+  ! node_ok && say "  - Current Node.js LTS (Node ${NODE_INSTALL_MAJOR}; satisfies minimum ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}+) from official nodejs.org archive + SHA-256 check; user directory, no sudo)"
   if ! git_ok; then
     case "$OS:$linux_pm" in
       Darwin:*) say "  - Git 2.38+ via Homebrew (or Apple Command Line Tools if Homebrew is unavailable)" ;;
@@ -277,8 +285,13 @@ if (( ! logged_in )); then
 fi
 
 say ""
-say "Grant the GitHub Projects scope. GitHub will ask you to approve it in the browser."
-gh auth refresh --hostname github.com --scopes project
+project_scopes="$(gh auth status --hostname github.com --json hosts --jq '.hosts["github.com"][] | select(.active) | .scopes // ""' 2>/dev/null || true)"
+if printf '%s\n' "$project_scopes" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq project; then
+  say "The active GitHub account already has the Projects scope; skipping authorization."
+else
+  say "Grant the GitHub Projects scope. GitHub will ask you to approve it in the browser."
+  gh auth refresh --hostname github.com --scopes project
+fi
 say "Configure Git to use GitHub CLI credentials for pushing agent branches."
 gh auth setup-git --hostname github.com
 say ""

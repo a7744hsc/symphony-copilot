@@ -51,7 +51,7 @@ flowchart LR
 
 ## Quick start
 
-You need Node.js 22.18 or later (it runs the TypeScript directly), git 2.38 or later, the [GitHub CLI](https://cli.github.com/), and a GitHub account with a Copilot plan. It is developed on macOS, and CI runs Node 22.18 and 24 on Linux and macOS. Windows is untested.
+You need Node.js 22.18 or later (it runs the TypeScript directly), git 2.38 or later, the [GitHub CLI](https://cli.github.com/), and a GitHub account with a Copilot plan. Fresh setup installs the latest Node 24 LTS by default. CI tests Node 22.18 and 24 on Linux and macOS. Windows is untested.
 
 **1. Install and sign in.**
 
@@ -60,7 +60,7 @@ git clone https://github.com/a7744hsc/symphony-copilot.git
 cd symphony-copilot
 ```
 
-Run the first-run wizard from this checkout: `./scripts/setup.sh` on macOS/Linux, or `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1` on Windows. It checks Node.js 22.18+, Git 2.38+, npm, GitHub CLI and Copilot CLI, lists the missing tools and sources, then installs them after one confirmation. Node.js comes from the official nodejs.org archive, is SHA-256 checked, and is installed under your user profile. Copilot CLI is installed from `@github/copilot` for its interactive `copilot login` command; symphony still launches the runtime bundled with the SDK. Git and GitHub CLI use the available supported package manager. The wizard then offers `npm ci`, signs in to GitHub with `gh` (you approve in a browser), requests the Projects scope, configures Git credentials, and runs `copilot login` for Copilot authentication. You approve that OAuth/device-code flow yourself; the CLIs store their own credentials (a headless Linux system without a keychain may use `~/.copilot/config.json`). Details: [first-run setup](docs/onboarding.md#install-and-sign-in).
+Run the first-run wizard from this checkout: `./scripts/setup.sh` on macOS/Linux, or `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1` on Windows. It checks Node.js 22.18+, Git 2.38+, npm, GitHub CLI and Copilot CLI, lists the missing tools and sources, then installs them after one confirmation. Node.js comes from the official nodejs.org archive, is SHA-256 checked, and is installed under your user profile. Copilot CLI is installed from `@github/copilot` for its interactive `copilot login` command; symphony still launches the runtime bundled with the SDK. Git and GitHub CLI use the available supported package manager. The wizard then offers `npm ci`, signs in to GitHub with `gh` (you approve in a browser), checks the active account for the Projects scope and requests it only if missing, configures Git credentials, and runs `copilot login` for Copilot authentication. You approve any OAuth/device-code flow yourself; the CLIs store their own credentials (a headless Linux system without a keychain may use `~/.copilot/config.json`). Details: [first-run setup](docs/onboarding.md#install-and-sign-in).
 
 The setup has been exercised with GitHub CLI 2.101.0. The wizard does not enforce a `gh` minimum version and does not automatically upgrade an existing installation.
 
