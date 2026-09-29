@@ -64,12 +64,14 @@ The skills refer to templates in your symphony-copilot folder by absolute path, 
 
 ## 2. Write WORKFLOW.md, AGENTS.md and REVIEW.md
 
-Open the repository in VS Code (or start `copilot` in it) and run `/symphony-onboard`. The skill:
+Open the repository in VS Code (or start `copilot` in it) and run `/symphony-onboard`. You do not need to know or preselect board columns. The skill first inspects the repository, then asks which operating capabilities you want:
 
-1. works out the clone URL, default branch, and build and test commands from the repository and its CI;
-2. asks what it cannot find out: who owns the board, the column names, whether a second agent reviews each change, the models, and the limits per card;
-3. writes the three files from the templates in [examples/](../examples/);
-4. runs `symphony check` until there are no errors.
+1. Whether an independent AI reviewer should check each submission before it reaches you (human approval before merge is always retained).
+2. Whether to automatically detect merge conflicts on PRs waiting for a person and send them back to the implementer.
+3. Whether to show a Blocked lane for run limits and work that needs human input.
+4. Whether agents may file low-priority, unlabelled follow-up issues for unrelated problems.
+
+It recommends defaults, explains the cost/behavior tradeoffs, and also asks for model and run limits. It infers board owner, language, build/test commands and default branch from the repository where possible. From those capability choices, it derives the columns and shows you the resulting lane plan; it does **not** expect you to invent a state machine. For example, independent AI review adds AI Review and Rework; turning it off removes both and sends submissions directly to Human Review. Human Review remains the final person-owned step. After the choices, the skill writes `WORKFLOW.md`, `AGENTS.md`, and `REVIEW.md` only if AI review is enabled, then runs `symphony check` until there are no errors.
 
 | File | Purpose | Template |
 |---|---|---|
@@ -90,15 +92,16 @@ Commit and push the files. Agents work in fresh clones, so they only see what is
 
 ### Columns
 
-Each column plays one of these roles. The names are yours; these are the template's:
+Each column has a role derived from the selected behavior. The names are localized to your conversation language by default; you can ask to rename them, but do not need to design the workflow yourself:
 
 | Column | Listed in | Who works on it |
 |---|---|---|
-| Todo, In Progress, Rework | `tracker.active_states` | The implementer, on cards with the `agent` label |
-| AI Review | `tracker.active_states`, `review.states`, `handoff_state` | The review agent |
-| Human Review | `review.pass_state`, `merge_conflicts.states` | You |
-| Blocked | `blocked_state`, `agent_states` | You; agents and run limits put cards here |
-| Done, Canceled | `tracker.terminal_states` | Nobody; the workspace is deleted |
+| Todo, In Progress | Always active | The implementer, on cards with the `agent` label |
+| Rework | Active when independent AI review or conflict recovery is on | The implementer addresses review requests and/or merge-conflict returns |
+| AI Review | Only when independent AI review is on | The independent reviewer |
+| Human Review | Always a waiting/handoff lane | You review and merge the PR; conflicts are monitored here if selected |
+| Blocked | Only when the visible blocked-lane capability is on | You unblock it; the agent or run limits can move cards here. With this lane off, the agent comments and stops without changing status |
+| Done, Canceled | Terminal | Nobody; the workspace is deleted |
 
 ## 3. Create the board
 

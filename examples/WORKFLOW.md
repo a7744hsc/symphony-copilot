@@ -2,6 +2,9 @@
 # symphony-copilot reads this file on every poll, so edits apply without a restart.
 # Put it at the root of the repository the agents work on. Every key is described in
 # schema/workflow.schema.json of symphony-copilot; check the file with `symphony check`.
+# This is a full-capability reference profile: independent AI review, conflict return,
+# a visible Blocked lane, and follow-up issues are all enabled. The symphony-onboard
+# skill asks which capabilities you want and derives a smaller set of columns when off.
 tracker:
   kind: github_project
   provider:
@@ -12,7 +15,7 @@ tracker:
     token: $SYMPHONY_GITHUB_TOKEN
     status_field: Status
     priority_field: Priority         # single select like P1, P2, ... (lower runs first)
-    agent_states: [In Progress, Blocked]
+    agent_states: [In Progress, Blocked] # only statuses agents may set directly
     handoff_state: AI Review         # where tracker_submit_for_review puts the card
     blocked_state: Blocked           # where the orchestrator puts cards that reach a run limit
     followups:                       # agents file out-of-scope problems as new issues
