@@ -149,3 +149,19 @@ symphony logs
 ```
 
 After every session the orchestrator comments on the issue with what the session did and used. When the agent submits, the card moves to AI Review, then to Human Review for you. Merge the pull request, or move the card to Rework with your comments.
+
+### Running more than one workflow
+
+Give each workflow a memorable ID and a different `workspace.root`, then start one isolated runner per file:
+
+```sh
+symphony start ~/code/mobile/WORKFLOW.md --id mobile
+symphony start ~/code/backend/WORKFLOW.md --id backend
+symphony status --all
+symphony logs backend
+symphony stop mobile       # backend keeps running
+```
+
+The ID is optional; without it, Symphony derives a stable ID from the workflow's absolute path. `status`, `logs`, and `stop` accept an ID and otherwise target the last selected runner, preserving the single-workflow command style. Each runner has separate workflow configuration, PID, and log files under `SYMPHONY_STATE_DIR/runners/<id>`, while its workspaces and `.symphony-ledger.json` stay under that workflow's `workspace.root`. Startup rejects colliding roots or ledgers before the process starts.
+
+Two live runners cannot target the same GitHub Project. They could otherwise fetch and claim the same card before either observes the other, so startup reports the conflicting runner and project instead. Coordinated shared-project claiming is not supported.

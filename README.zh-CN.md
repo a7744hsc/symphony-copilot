@@ -109,14 +109,16 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 **也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，第一次用过工作流路径后就记住它，并且拒绝启动第二个调度器：
 
 ```sh
-symphony start ~/code/your-repo/WORKFLOW.md   # 后台运行；之后直接 `symphony start`
-symphony status                               # 有没有在跑、最近一次轮询和最近的事件
-symphony logs                                 # 实时看日志
-symphony stop                                 # 停止 agent 和调度器，工作区保留
-symphony run                                  # 在当前终端前台运行，Ctrl-C 停止
+symphony start ~/code/app/WORKFLOW.md --id app       # 后台运行 app
+symphony start ~/code/service/WORKFLOW.md --id api   # 同时运行另一个隔离实例
+symphony status --all                                # 查看所有 runner
+symphony status app                                  # 只查看 app
+symphony logs api                                    # 只跟踪 api 的日志
+symphony stop app                                    # 只停止 app，保留工作区
+symphony run ~/code/app/WORKFLOW.md --id app         # 前台运行，Ctrl-C 停止
 ```
 
-后台运行的日志在 `~/symphony-workspaces/logs/orchestrator.log`；设置 `SYMPHONY_STATE_DIR` 可以把日志和 PID 文件放到别处。在 macOS 上，`start` 还会在调度器运行期间阻止 Mac 自动休眠。
+`--id` 可省略；默认 ID 根据工作流的绝对路径稳定生成。不带 ID 的 `status`、`logs` 和 `stop` 会操作最近选择的 runner，因此原来的单工作流用法保持不变。每个 runner 的元数据、PID 和日志位于 `~/symphony-workspaces/runners/<id>/`；工作区和运行账本仍位于各自的 `workspace.root`。启动前会拒绝重复 ID、相同工作区/账本路径，以及指向同一个 GitHub Project 的两个 runner。多个 runner 共享项目目前不安全，因为它们之间没有协调卡片认领。在 macOS 上，`start` 还会在对应 runner 运行期间阻止 Mac 自动休眠。
 
 ## 配置
 

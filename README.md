@@ -104,17 +104,19 @@ Then write a card with `/symphony-write-card` (or label an issue `agent` and mov
 | `--once` | Polls once, waits for dispatched agents to finish, then exits. |
 | `--log-level` | `debug`, `info` (default), `warn` or `error`. Logs are `key=value` lines on stderr. |
 
-**Or use `bin/symphony`**, which fetches the token from `gh`, remembers the workflow path after the first use, and refuses to start a second orchestrator:
+**Or use `bin/symphony`**, which fetches the token from `gh` and manages independently isolated workflow runners:
 
 ```sh
-symphony start ~/code/your-repo/WORKFLOW.md   # background; later just `symphony start`
-symphony status                               # running? last poll and recent events
-symphony logs                                 # follow the log
-symphony stop                                 # stop agents and the orchestrator; workspaces are kept
-symphony run                                  # foreground in this terminal; Ctrl-C stops it
+symphony start ~/code/app/WORKFLOW.md --id app       # background runner "app"
+symphony start ~/code/service/WORKFLOW.md --id api   # another isolated runner
+symphony status --all                                # list every runner
+symphony status app                                  # last poll and recent events for "app"
+symphony logs api                                    # follow only "api"
+symphony stop app                                    # stop only "app"; workspaces are kept
+symphony run ~/code/app/WORKFLOW.md --id app         # foreground; Ctrl-C stops it
 ```
 
-The background log is `~/symphony-workspaces/logs/orchestrator.log`; set `SYMPHONY_STATE_DIR` to keep the log and PID file elsewhere. On macOS, `start` also keeps the Mac from idle-sleeping while the orchestrator runs.
+`--id` is optional: the default is a stable ID derived from the absolute workflow path. Commands without an ID use the last selected runner, so existing single-workflow usage (`symphony start WORKFLOW.md`, then `status`, `logs`, or `stop`) still works. Runner metadata, PID, and log are under `~/symphony-workspaces/runners/<id>/`; set `SYMPHONY_STATE_DIR` to move them. The workflow's own `workspace.root` contains its workspaces and run ledger, and must differ from every running workflow's root. Startup rejects reused IDs, workflow paths, workspace/ledger paths, and two runners targeting the same GitHub Project. Sharing a project is intentionally unsupported because card claiming is not coordinated across runners. On macOS, `start` also keeps the Mac from idle-sleeping while that runner runs.
 
 ## Configuration
 
