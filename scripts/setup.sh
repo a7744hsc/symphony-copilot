@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MIN_NODE_MAJOR=24
+MIN_NODE_MAJOR=22
+MIN_NODE_MINOR=18
 MIN_GIT_MINOR=38
+NODE_DIST_BASE="https://nodejs.org/dist/latest-v${MIN_NODE_MAJOR}.x"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OS="$(uname -s)"
 
@@ -12,19 +14,137 @@ ask_yes() {
   read -r -p "$1 [y/N] " answer
   [[ "$answer" == [yY] || "$answer" == [yY][eE][sS] ]]
 }
-open_url() {
+node_archive_platform() {
+  local arch
+  arch="$(uname -m)"
+  case "$OS:$arch" in
+    Darwin:arm64|Darwin:aarch64) printf 'darwin-arm64' ;;
+    Darwin:x86_64) printf 'darwin-x64' ;;
+    Linux:aarch64|Linux:arm64) printf 'linux-arm64' ;;
+    Linux:x86_64|Linux:amd64) printf 'linux-x64' ;;
+    *) return 1 ;;
+  esac
+}
+
+install_node_user() {
+  local platform sums archive expected actual home_bin install_dir temp_dir shell_name rc_file export_line hash_cmd
+  platform="$(node_archive_platform)" || { say "Unsupported Node.js architecture: $OS/$(uname -m)"; return 1; }
+  for tool in curl tar; do command -v "$tool" >/dev/null 2>&1 || { say "Cannot install Node.js automatically: missing $tool."; return 1; }; done
+  if command -v shasum >/dev/null 2>&1; then
+    hash_cmd=shasum
+  elif command -v sha256sum >/dev/null 2>&1; then
+    hash_cmd=sha256sum
+  else
+    say "Cannot verify the official Node.js checksum: install shasum/sha256sum first."
+    return 1
+  fi
+  sums="$(mktemp)"
+  if ! curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 "$NODE_DIST_BASE/SHASUMS256.txt" -o "$sums"; then
+    rm -f "$sums"
+    return 1
+  fi
+  archive="$(awk -v p="$platform" -v major="$MIN_NODE_MAJOR" '$2 ~ ("^node-v" major "\\.[0-9]+\\.[0-9]+-" p "\\.tar\\.xz$") {print $2; exit}' "$sums")"
+  if [[ -z "$archive" ]]; then rm -f "$sums"; say "No official Node.js archive for $platform."; return 1; fi
+  expected="$(awk -v f="$archive" '$2 == f {print $1; exit}' "$sums")"
+  temp_dir="$(mktemp -d)"
+  if ! curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 "$NODE_DIST_BASE/$archive" -o "$temp_dir/$archive"; then
+    rm -rf "$temp_dir"; rm -f "$sums"; return 1
+  fi
+  if [[ "$hash_cmd" == shasum ]]; then actual="$(shasum -a 256 "$temp_dir/$archive" | awk '{print $1}')"; else actual="$(sha256sum "$temp_dir/$archive" | awk '{print $1}')"; fi
+  rm -f "$sums"
+  if [[ "$actual" != "$expected" ]]; then rm -rf "$temp_dir"; say "Node.js archive checksum mismatch; refusing to install."; return 1; fi
+  home_bin="$HOME/.local/bin"
+  install_dir="$HOME/.local/share/symphony/node-v${MIN_NODE_MAJOR}"
+  mkdir -p "$home_bin" "$(dirname "$install_dir")"
+  tar -xJf "$temp_dir/$archive" -C "$temp_dir" --strip-components=1
+  rm -f "$temp_dir/$archive"
+  rm -rf "$install_dir"
+  mv "$temp_dir" "$install_dir"
+  ln -sf "$install_dir/bin/node" "$home_bin/node"
+  ln -sf "$install_dir/bin/npm" "$home_bin/npm"
+  ln -sf "$install_dir/bin/npx" "$home_bin/npx"
+  export PATH="$home_bin:$PATH"
+  shell_name="$(basename "${SHELL:-sh}")"
+  case "$shell_name" in
+    zsh) rc_file="$HOME/.zprofile" ;;
+    bash) rc_file="$HOME/.bash_profile"; [[ -f "$rc_file" ]] || rc_file="$HOME/.profile" ;;
+    *) rc_file="$HOME/.profile" ;;
+  esac
+  export_line='export PATH="$HOME/.local/bin:$PATH"'
+  if [[ ! -f "$rc_file" ]] || ! grep -Fq "$export_line" "$rc_file"; then printf '\n%s\n' "$export_line" >> "$rc_file"; fi
+  PATH="$home_bin:$PATH"
+  export PATH
+  say "Installed $("$home_bin/node" --version) from nodejs.org and verified its SHA-256."
+  say "Added $home_bin to PATH in $rc_file (new shells will pick it up)."
+}
+
+detect_linux_pm() {
+  if command -v apt-get >/dev/null 2>&1; then printf apt
+  elif command -v dnf >/dev/null 2>&1; then printf dnf
+  elif command -v zypper >/dev/null 2>&1; then printf zypper
+  else printf unsupported
+  fi
+}
+
+install_confirmed_tools() {
+  local linux_pm="$1"
+  if ! node_ok; then install_node_user || return 1; fi
   case "$OS" in
-    Darwin) open "$1" >/dev/null 2>&1 || true ;;
-    Linux) command -v xdg-open >/dev/null 2>&1 && xdg-open "$1" >/dev/null 2>&1 || true ;;
+    Darwin)
+      if ! git_ok; then
+        if command -v brew >/dev/null 2>&1; then brew install git || return 1
+        else say "Automatic Git install requires Homebrew; please install Git from Apple Command Line Tools and rerun."; return 1; fi
+      fi
+      if ! command -v gh >/dev/null 2>&1; then
+        if command -v brew >/dev/null 2>&1; then brew install gh || return 1
+        else say "Automatic GitHub CLI install requires Homebrew; please install gh per https://github.com/cli/cli/blob/trunk/docs/install_macos.md and rerun."; return 1; fi
+      fi
+      ;;
+    Linux)
+      case "$linux_pm" in
+        apt)
+          if ! git_ok; then sudo apt-get update && sudo apt-get install -y git || return 1; fi
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo mkdir -p -m 755 /etc/apt/keyrings || return 1
+            curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null || return 1
+            sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg || return 1
+            sudo mkdir -p -m 755 /etc/apt/sources.list.d || return 1
+            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' "$(dpkg --print-architecture)" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null || return 1
+            sudo apt-get update && sudo apt-get install -y gh || return 1
+          fi
+          ;;
+        dnf)
+          if ! git_ok; then sudo dnf install -y git || return 1; fi
+          if ! command -v gh >/dev/null 2>&1; then
+            local repo_file
+            repo_file="$(mktemp)"
+            curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 https://cli.github.com/packages/rpm/gh-cli.repo -o "$repo_file" || { rm -f "$repo_file"; return 1; }
+            sudo install -m 0644 "$repo_file" /etc/yum.repos.d/gh-cli.repo || { rm -f "$repo_file"; return 1; }
+            rm -f "$repo_file"
+            sudo dnf install -y gh || return 1
+          fi
+          ;;
+        zypper)
+          if ! git_ok; then sudo zypper --non-interactive install git || return 1; fi
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo zypper addrepo https://cli.github.com/packages/rpm/gh-cli.repo gh-cli && sudo zypper --non-interactive refresh gh-cli && sudo zypper --non-interactive install gh || return 1
+          fi
+          ;;
+        *) say "No supported official package manager detected; cannot automatically install Git/gh on this Linux distribution."; return 1 ;;
+      esac
+      ;;
   esac
 }
 
 node_ok() {
   command -v node >/dev/null 2>&1 || return 1
-  local version major
+  local version major minor
   version="$(node --version 2>/dev/null | sed 's/^v//')"
   major="${version%%.*}"
-  [[ "$major" =~ ^[0-9]+$ ]] && (( major >= MIN_NODE_MAJOR ))
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  (( major > MIN_NODE_MAJOR || (major == MIN_NODE_MAJOR && minor >= MIN_NODE_MINOR) ))
 }
 git_ok() {
   command -v git >/dev/null 2>&1 || return 1
@@ -38,7 +158,7 @@ git_ok() {
 }
 missing_tools() {
   local missing=0
-  if ! node_ok; then say "  - Node.js ${MIN_NODE_MAJOR}+ (required)"; missing=1; else say "  ✓ Node.js $(node --version)"; fi
+  if ! node_ok; then say "  - Node.js ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}+ (required)"; missing=1; else say "  ✓ Node.js $(node --version)"; fi
   if ! git_ok; then say "  - Git 2.${MIN_GIT_MINOR}+ (required for merge-tree conflict checks)"; missing=1; else say "  ✓ Git $(git --version | awk '{print $3}')"; fi
   if command -v gh >/dev/null 2>&1; then say "  ✓ GitHub CLI $(gh --version | head -n 1 | awk '{print $3}')"; else say "  - GitHub CLI (gh)"; missing=1; fi
   if command -v npm >/dev/null 2>&1; then say "  ✓ npm $(npm --version)"; else say "  - npm (bundled with Node.js)"; missing=1; fi
@@ -46,55 +166,52 @@ missing_tools() {
 }
 
 say "symphony-copilot setup — $OS"
-say "This wizard checks Node.js 24+, Git and GitHub CLI, signs in through gh, then installs this checkout's npm dependencies."
+say "This wizard checks Node.js 22.18+, Git and GitHub CLI, signs in through gh, then installs this checkout's npm dependencies."
 say "It does not ask for, print or save your password or token."
 say ""
 say "Checking prerequisites:"
 if ! missing_tools; then
+  linux_pm=unsupported
+  [[ "$OS" != Linux ]] || linux_pm="$(detect_linux_pm)"
+  if [[ "$OS" == Darwin ]] && ! command -v brew >/dev/null 2>&1 && { ! git_ok || ! command -v gh >/dev/null 2>&1; }; then
+    say "This Mac has no Homebrew, so the wizard cannot automatically install the missing Git/GitHub CLI tools. Nothing has been installed."
+    say "Install Homebrew from https://brew.sh (if you choose), or use Apple's Command Line Tools for Git and the GitHub CLI maintainer instructions for gh; then rerun."
+    exit 1
+  fi
+  if [[ "$OS" == Linux && "$linux_pm" == unsupported ]] && { ! git_ok || ! command -v gh >/dev/null 2>&1; }; then
+    say "No supported official apt/dnf/zypper package manager was detected for the missing Git/GitHub CLI tools. Nothing has been installed."
+    say "Install them using your distribution's official repository and the GitHub CLI maintainer instructions, then rerun."
+    exit 1
+  fi
   say ""
-  case "$OS" in
-    Darwin)
-      say "Official installers:"
-      say "  Node.js: https://nodejs.org/en/download (LTS .pkg)"
-      say '  Git: Apple Command Line Tools (xcode-select --install) or https://git-scm.com/download/mac'
-      say "  GitHub CLI: https://github.com/cli/cli/blob/trunk/docs/install_macos.md"
-      if command -v brew >/dev/null 2>&1 && ask_yes "Install GitHub CLI using the GitHub CLI maintainers' Homebrew formula?"; then
-        brew install gh || true
-      fi
-      if ! node_ok && ask_yes "Open the official Node.js download page now?"; then open_url "https://nodejs.org/en/download"; fi
-      if ! command -v git >/dev/null 2>&1 && ask_yes "Run Apple's Command Line Tools installer? A macOS dialog will open."; then
-        xcode-select --install || true
-      fi
-      if ask_yes "Open the official Node.js, Git and GitHub CLI installation pages?"; then
-        open_url "https://nodejs.org/en/download"
-        open_url "https://git-scm.com/download/mac"
-        open_url "https://github.com/cli/cli/blob/trunk/docs/install_macos.md"
-      fi
-      ;;
-    Linux)
-      say "Use your distribution's official repository for Git, and GitHub CLI maintainers' instructions for gh:"
-      say "  Node.js: https://nodejs.org/en/download (official LTS binaries; choose your architecture)"
-      say "  Git: https://git-scm.com/download/linux"
-      say "  GitHub CLI: https://github.com/cli/cli/blob/trunk/docs/install_linux.md"
-      if ask_yes "Open the official install pages in your browser?"; then
-        open_url "https://nodejs.org/en/download"
-        open_url "https://git-scm.com/download/linux"
-        open_url "https://github.com/cli/cli/blob/trunk/docs/install_linux.md"
-      fi
-      ;;
-    *)
-      say "Unsupported Unix platform. Install from the official sources, then rerun this wizard:"
-      say "  Node.js: https://nodejs.org/en/download"
-      say "  Git: https://git-scm.com/downloads"
-      say "  GitHub CLI: https://github.com/cli/cli/releases/latest"
-      ;;
-  esac
-  say ""
-  say "Install the missing tools from the official source above, then return here."
-  read -r -p "Press Enter to check again, or Ctrl-C to stop. " _
+  say "The following missing tools will be installed after your confirmation:"
+  ! node_ok && say "  - Node.js ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}+ LTS (official nodejs.org archive + SHA-256 check; user directory, no sudo)"
+  if ! git_ok; then
+    case "$OS:$linux_pm" in
+      Darwin:*) say "  - Git 2.38+ via Homebrew (or Apple Command Line Tools if Homebrew is unavailable)" ;;
+      Linux:apt) say "  - Git 2.38+ via apt (sudo required)" ;;
+      Linux:dnf) say "  - Git 2.38+ via dnf (sudo required)" ;;
+      Linux:zypper) say "  - Git 2.38+ via zypper (sudo required)" ;;
+      *) say "  - Git 2.38+ (manual installation required on this platform)" ;;
+    esac
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    case "$OS:$linux_pm" in
+      Darwin:*) say "  - GitHub CLI via Homebrew" ;;
+      Linux:apt|Linux:dnf|Linux:zypper) say "  - GitHub CLI from the GitHub CLI maintainers' official repository (sudo required)" ;;
+      *) say "  - GitHub CLI (manual installation required on this platform)" ;;
+    esac
+  fi
+  if [[ "$OS" != Darwin && "$OS" != Linux ]]; then say "This platform is not supported by the Unix installer; use scripts/setup.ps1 on Windows."; exit 1; fi
+  if ask_yes "Proceed with these installations?"; then
+    install_confirmed_tools "$linux_pm"
+  else
+    say "Cancelled before installing anything."
+    exit 1
+  fi
   say "Checking prerequisites again:"
   if ! missing_tools; then
-    say "Prerequisites are still missing. Nothing was installed from an unverified source. Rerun after installing them."
+    say "Some prerequisites are still missing. Fix the reported package-manager error and rerun this wizard."
     exit 1
   fi
 fi

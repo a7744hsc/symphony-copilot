@@ -1,5 +1,7 @@
 $ErrorActionPreference = 'Stop'
-$MinimumNodeMajor = 24
+$MinimumNodeMajor = 22
+$MinimumNodeMinor = 18
+$NodeDistBase = "https://nodejs.org/dist/latest-v$MinimumNodeMajor.x"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 function Confirm-Step([string] $Message) {
@@ -12,15 +14,17 @@ function Get-ToolState {
     $Node = Get-Command node -ErrorAction SilentlyContinue
     if ($Node) {
         $VersionText = (& node --version 2>$null).Trim() -replace '^v', ''
+        $VersionParts = $VersionText -split '\.'
         $Major = 0
-        if ([int]::TryParse(($VersionText -split '\.')[0], [ref]$Major) -and $Major -ge $MinimumNodeMajor) {
+        $Minor = 0
+        if ($VersionParts.Count -ge 2 -and [int]::TryParse($VersionParts[0], [ref]$Major) -and [int]::TryParse($VersionParts[1], [ref]$Minor) -and ($Major -gt $MinimumNodeMajor -or ($Major -eq $MinimumNodeMajor -and $Minor -ge $MinimumNodeMinor))) {
             Write-Host "  ✓ Node.js v$VersionText"
         } else {
-            Write-Host "  - Node.js $MinimumNodeMajor+ required (found v$VersionText)"
+            Write-Host "  - Node.js $MinimumNodeMajor.$MinimumNodeMinor+ required (found v$VersionText)"
             $Missing.Add('Node.js')
         }
     } else {
-        Write-Host "  - Node.js $MinimumNodeMajor+ required"
+        Write-Host "  - Node.js $MinimumNodeMajor.$MinimumNodeMinor+ required"
         $Missing.Add('Node.js')
     }
     if (Get-Command git -ErrorAction SilentlyContinue) {
@@ -54,41 +58,102 @@ function Get-ToolState {
     return $Missing.ToArray()
 }
 
+function Get-NodeArchive {
+    $Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    $NodeArchitecture = switch ($Architecture) {
+        'arm64' { 'arm64' }
+        'x64' { 'x64' }
+        default { throw "Node.js official Windows archives do not support architecture '$Architecture'." }
+    }
+    $Manifest = Invoke-RestMethod -Uri "$NodeDistBase/SHASUMS256.txt" -Method Get
+    $Pattern = "^(node-v$MinimumNodeMajor\.\d+\.\d+-win-$NodeArchitecture\.zip)\s+(.+)$"
+    foreach ($Line in ($Manifest -split "`n")) {
+        if ($Line.Trim() -match $Pattern) {
+            return @{ Name = $Matches[1]; Hash = $Matches[2].Trim() }
+        }
+    }
+    throw "No official Node.js $MinimumNodeMajor archive found for Windows $NodeArchitecture."
+}
+
+function Install-NodeUser {
+    $ArchiveInfo = Get-NodeArchive
+    $TempDir = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+    $ZipPath = Join-Path $TempDir $ArchiveInfo.Name
+    $ExtractDir = Join-Path $TempDir 'unpacked'
+    $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\symphony-node-v$MinimumNodeMajor"
+    New-Item -ItemType Directory -Path $TempDir, $ExtractDir -Force | Out-Null
+    try {
+        Invoke-WebRequest -Uri "$NodeDistBase/$($ArchiveInfo.Name)" -OutFile $ZipPath
+        $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash
+        if ($ActualHash -ne $ArchiveInfo.Hash) { throw 'Node.js archive SHA-256 did not match the official SHASUMS256.txt; refusing to install.' }
+        Expand-Archive -LiteralPath $ZipPath -DestinationPath $ExtractDir -Force
+        $ExtractedRoot = Get-ChildItem -LiteralPath $ExtractDir -Directory | Select-Object -First 1
+        if (-not $ExtractedRoot) { throw 'The official Node.js archive was empty.' }
+        New-Item -ItemType Directory -Path (Split-Path $InstallDir -Parent) -Force | Out-Null
+        if (Test-Path $InstallDir) { Remove-Item -LiteralPath $InstallDir -Recurse -Force }
+        Move-Item -LiteralPath $ExtractedRoot.FullName -Destination $InstallDir
+
+        $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $PathEntries = @($UserPath -split ';' | Where-Object { $_ })
+        if ($PathEntries -notcontains $InstallDir) {
+            [Environment]::SetEnvironmentVariable('Path', ((@($InstallDir) + $PathEntries) -join ';'), 'User')
+        }
+        $env:Path = "$InstallDir;$env:Path"
+        Write-Host "Installed $(& (Join-Path $InstallDir 'node.exe') --version) from nodejs.org; SHA-256 verified."
+        Write-Host "Added $InstallDir to the user PATH. New terminals will pick it up too."
+    } finally {
+        Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Install-ConfirmedTools([string[]] $Missing) {
+    if ($Missing -contains 'Node.js') { Install-NodeUser }
+    foreach ($Package in @(
+        @{ Name = 'Git'; Id = 'Git.Git' },
+        @{ Name = 'GitHub CLI'; Id = 'GitHub.cli' }
+    )) {
+        if ($Missing -contains $Package.Name) {
+            $CommandName = 'gh'
+            if ($Package.Name -eq 'Git') { $CommandName = 'git' }
+            $Installed = Get-Command $CommandName -ErrorAction SilentlyContinue
+            if ($Installed) {
+                winget upgrade --id $Package.Id --source winget --accept-source-agreements --accept-package-agreements
+            } else {
+                winget install --id $Package.Id --source winget --accept-source-agreements --accept-package-agreements
+            }
+            if ($LASTEXITCODE -ne 0) { throw "WinGet failed to install/update $($Package.Name)." }
+        }
+    }
+    $MachinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = "$MachinePath;$UserPath;$env:Path"
+}
+
 Write-Host 'symphony-copilot setup — Windows'
-Write-Host "This wizard checks Node.js $MinimumNodeMajor+, Git and GitHub CLI, signs in through gh, then installs this checkout's npm dependencies."
+Write-Host "This wizard checks Node.js $MinimumNodeMajor.$MinimumNodeMinor+, Git and GitHub CLI, signs in through gh, then installs this checkout's npm dependencies."
 Write-Host 'It does not ask for, print or save your password or token.'
 Write-Host ''
 Write-Host 'Checking prerequisites:'
 $Missing = Get-ToolState
 if ($Missing.Count -gt 0) {
+    $CanInstall = ($Missing -notcontains 'GitHub CLI' -or (Get-Command winget -ErrorAction SilentlyContinue)) -and
+                  ($Missing -notcontains 'Git' -or (Get-Command winget -ErrorAction SilentlyContinue))
     Write-Host ''
-    Write-Host 'Official/recommended sources:'
-    Write-Host '  Node.js LTS installer (MSI): https://nodejs.org/en/download'
-    Write-Host '  Git for Windows: https://git-scm.com/download/win'
-    Write-Host '  GitHub CLI: https://github.com/cli/cli/blob/trunk/docs/install_windows.md'
-    if ($Missing -contains 'GitHub CLI' -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-        if (Confirm-Step "Install GitHub CLI using its maintainer-recommended WinGet package (GitHub.cli)?") {
-            winget install --id GitHub.cli --source winget
-            if ($LASTEXITCODE -ne 0) { Write-Warning 'WinGet did not install GitHub CLI; continue with the official installer page.' }
-        }
+    Write-Host 'The following missing tools will be installed after your confirmation:'
+    if ($Missing -contains 'Node.js') { Write-Host "  - Node.js $MinimumNodeMajor.$MinimumNodeMinor+ LTS from nodejs.org; verify official SHA-256; install under your user profile, no admin required" }
+    if ($Missing -contains 'Git') { Write-Host '  - Git for Windows using the official WinGet source (admin approval may be requested)' }
+    if ($Missing -contains 'GitHub CLI') { Write-Host '  - GitHub CLI using the maintainer-supported WinGet package (GitHub.cli)' }
+    if (-not $CanInstall) {
+        Write-Host 'WinGet is unavailable, so Git/GitHub CLI cannot be installed automatically. Install them from:'
+        Write-Host '  https://git-scm.com/download/win'
+        Write-Host '  https://github.com/cli/cli/blob/trunk/docs/install_windows.md'
+        throw 'Cannot install all missing prerequisites automatically without WinGet.'
     }
-    if (Confirm-Step 'Open the official/recommended installation pages?') {
-        Start-Process 'https://nodejs.org/en/download'
-        Start-Process 'https://git-scm.com/download/win'
-        Start-Process 'https://github.com/cli/cli/blob/trunk/docs/install_windows.md'
-    }
-    Write-Host ''
-    Write-Host 'Install any remaining tools from the sources above. Windows may ask for administrator approval.'
-    [void](Read-Host 'Press Enter to check again, or Ctrl-C to stop')
-    $MachinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $env:Path = "$MachinePath;$UserPath;$env:Path"
+    if (-not (Confirm-Step 'Proceed with these installations?')) { throw 'Cancelled before installing anything.' }
+    Install-ConfirmedTools $Missing
     Write-Host 'Checking prerequisites again:'
     $Missing = Get-ToolState
-    if ($Missing.Count -gt 0) {
-        Write-Error "Still missing: $($Missing -join ', '). Nothing was installed from an unverified source. Rerun after installing them."
-        exit 1
-    }
+    if ($Missing.Count -gt 0) { throw "Some prerequisites remain missing: $($Missing -join ', ')." }
 }
 
 Write-Host ''

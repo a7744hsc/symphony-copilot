@@ -51,7 +51,7 @@ flowchart LR
 
 ## Quick start
 
-You need Node.js 24 or later (it runs the TypeScript directly), git, the [GitHub CLI](https://cli.github.com/), and a GitHub account with a Copilot plan. It is developed on macOS, and CI also runs the tests on Linux. Windows is untested.
+You need Node.js 22.18 or later (it runs the TypeScript directly), git 2.38 or later, the [GitHub CLI](https://cli.github.com/), and a GitHub account with a Copilot plan. It is developed on macOS, and CI runs Node 22.18 and 24 on Linux and macOS. Windows is untested.
 
 **1. Install and sign in.**
 
@@ -60,7 +60,7 @@ git clone https://github.com/a7744hsc/symphony-copilot.git
 cd symphony-copilot
 ```
 
-Run the first-run wizard from this checkout: `./scripts/setup.sh` on macOS/Linux, or `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1` on Windows. It checks Node.js 24+, Git 2.38+, npm and GitHub CLI, guides you to official installers when something is missing, runs `npm ci`, signs in through `gh`, requests the Projects scope, and configures Git credentials. It never asks for or stores your password or token. Details: [first-run setup](docs/onboarding.md#install-and-sign-in).
+Run the first-run wizard from this checkout: `./scripts/setup.sh` on macOS/Linux, or `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1` on Windows. It checks Node.js 22.18+, Git 2.38+, npm and GitHub CLI, lists the missing tools and sources, then installs them after one confirmation. Node.js comes from the official nodejs.org archive, is SHA-256 checked, and is installed under your user profile. Git and GitHub CLI use the available supported package manager (Homebrew, distro repositories, or WinGet); if one is unavailable, the wizard says what cannot be automated before proceeding. It then offers `npm ci`, signs in through `gh` (you approve in a browser), requests the Projects scope, and configures Git credentials. It never asks for or stores your password or token. Details: [first-run setup](docs/onboarding.md#install-and-sign-in).
 
 On macOS/Linux, optionally put `symphony` on your PATH: `ln -s "$PWD/bin/symphony" /usr/local/bin/symphony`.
 

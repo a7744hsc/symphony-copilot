@@ -29,15 +29,17 @@ On Windows, run PowerShell in this repository folder:
 powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
 ```
 
-The wizard checks Node.js 24+, Git 2.38+ (for the merge-conflict check), npm and GitHub CLI, then installs this checkout's dependencies with `npm ci`. If a tool is missing, it gives you the platform's official/recommended source, lets you open the installer page, and checks again after you install it. The supported paths are:
+The wizard checks Node.js 22.18+, Git 2.38+ (for the merge-conflict check), npm and GitHub CLI. It lists every missing tool, its source and whether administrator approval may be requested, then asks once before installing. Node.js is downloaded as an official Node.js 22 LTS archive, checked against the official `SHASUMS256.txt`, and installed under your user profile (no administrator access); the wizard adds its bin directory to your user PATH. Git and GitHub CLI are installed through the platform's supported package manager when available. If a package manager is unavailable, the wizard says which tools need manual installation before it starts. After prerequisites pass, the wizard separately asks before running `npm ci` in this checkout.
 
 | Platform | Node.js | Git | GitHub CLI |
 |---|---|---|---|
-| macOS | Official LTS `.pkg` from [nodejs.org](https://nodejs.org/en/download) | Apple Command Line Tools or [git-scm.com](https://git-scm.com/download/mac) | GitHub CLI maintainers' [Homebrew formula or release binaries](https://github.com/cli/cli/blob/trunk/docs/install_macos.md) |
-| Linux | Official LTS binaries from [nodejs.org](https://nodejs.org/en/download) | The distribution's official repository | GitHub CLI maintainers' [official repositories](https://github.com/cli/cli/blob/trunk/docs/install_linux.md) |
-| Windows | Official LTS `.msi` from [nodejs.org](https://nodejs.org/en/download) | [Git for Windows](https://git-scm.com/download/win) | GitHub CLI maintainers' [WinGet package or release binaries](https://github.com/cli/cli/blob/trunk/docs/install_windows.md) |
+| macOS | Official Node 22 LTS archive from [nodejs.org](https://nodejs.org/en/download), SHA-256 checked, user-local | Homebrew when installed | GitHub CLI maintainers' Homebrew formula when Homebrew is installed |
+| Debian/Ubuntu | Official Node 22 LTS archive from [nodejs.org](https://nodejs.org/en/download), SHA-256 checked, user-local | Distribution's official `apt` repository | GitHub CLI maintainers' official apt repository |
+| Fedora/RHEL | Official Node 22 LTS archive from [nodejs.org](https://nodejs.org/en/download), SHA-256 checked, user-local | Distribution's official `dnf` repository | GitHub CLI maintainers' official RPM repository |
+| openSUSE | Official Node 22 LTS archive from [nodejs.org](https://nodejs.org/en/download), SHA-256 checked, user-local | Distribution's official `zypper` repository | GitHub CLI maintainers' official RPM repository |
+| Windows | Official Node 22 LTS archive from [nodejs.org](https://nodejs.org/en/download), SHA-256 checked, user-local | Microsoft's WinGet `Git.Git` package | GitHub CLI maintainers' WinGet `GitHub.cli` package |
 
-Installers may ask for administrator approval. The wizard does not run downloaded scripts or silently elevate privileges. It can install GitHub CLI through the maintainer-supported Homebrew formula on macOS or WinGet package on Windows when you confirm; other missing tools use the official installer instructions above.
+Package managers may ask for administrator approval (for example via `sudo` or a Windows elevation prompt); the wizard only starts them after you approve its install plan. The Node.js installer itself needs no administrator privileges. It downloads only official archives and checks the published SHA-256; it does not pipe network scripts into a shell. On macOS without Homebrew, Git and GitHub CLI need manual installation from Apple's Command Line Tools and the [GitHub CLI maintainer instructions](https://github.com/cli/cli/blob/trunk/docs/install_macos.md). Unsupported Linux distributions are reported rather than guessing a package command. GitHub sign-in is completed by you in the browser when `gh auth login` opens it; the wizard does not automate that security approval.
 
 If needed, it signs in through `gh auth login` using the browser, requests the `project` scope with `gh auth refresh`, and configures Git with `gh auth setup-git`. It never asks for or writes your password or token into a file. If `gh` is already signed in, it asks whether to reuse that account.
 
