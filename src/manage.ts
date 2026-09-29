@@ -3,9 +3,9 @@ import { createWriteStream, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { RunnerManager, type RunnerRecord } from "./management.ts";
+import { pathFromFileUrl, RunnerManager, type RunnerRecord } from "./management.ts";
 
-const manager = new RunnerManager(process.env.SYMPHONY_STATE_DIR ?? `${homedir()}/symphony-workspaces`, new URL("./cli.ts", import.meta.url).pathname);
+const manager = new RunnerManager(process.env.SYMPHONY_STATE_DIR ?? `${homedir()}/symphony-workspaces`, pathFromFileUrl(new URL("./cli.ts", import.meta.url)));
 
 function chosen(value: string | undefined, records: RunnerRecord[]): string | null {
   if (value) return value;

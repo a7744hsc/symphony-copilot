@@ -25,6 +25,7 @@ function main(): Promise<number> | number {
         "dry-run": { type: "boolean", default: false },
         once: { type: "boolean", default: false },
         "log-level": { type: "string", default: "info" },
+        "symphony-runner-instance": { type: "string" },
         help: { type: "boolean", short: "h", default: false },
       },
     });

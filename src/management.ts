@@ -1,7 +1,8 @@
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ServiceConfig } from "./config.ts";
 import { createLogger } from "./log.ts";
 import { WorkflowStore } from "./workflow.ts";
@@ -12,6 +13,7 @@ export interface RunnerRecord {
   workspace: string;
   project: string;
   pid: number;
+  instance?: string;
 }
 
 export function canonicalPath(path: string): string {
@@ -46,32 +48,38 @@ export function validId(id: string): boolean {
   return /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id);
 }
 
+export function pathFromFileUrl(url: URL): string {
+  return fileURLToPath(url);
+}
+
 export class RunnerManager {
   readonly root: string;
   private readonly cli: string;
   private readonly alive: (record: RunnerRecord) => boolean;
-  private readonly launch: (workflow: string, env: NodeJS.ProcessEnv, log: string, foreground: boolean) => ChildProcess;
+  private readonly launch: (workflow: string, env: NodeJS.ProcessEnv, log: string, foreground: boolean, instance: string) => ChildProcess;
 
   constructor(root: string, cli: string, options: {
     alive?: (record: RunnerRecord) => boolean;
-    launch?: (workflow: string, env: NodeJS.ProcessEnv, log: string, foreground: boolean) => ChildProcess;
+    launch?: (workflow: string, env: NodeJS.ProcessEnv, log: string, foreground: boolean, instance: string) => ChildProcess;
   } = {}) {
     this.root = canonicalPath(root);
     this.cli = canonicalPath(cli);
     this.alive = options.alive ?? ((record) => {
       try {
+        if (!record.instance) return false;
         process.kill(record.pid, 0);
-        const command = execFileSync("ps", ["-p", String(record.pid), "-o", "command="], { encoding: "utf8" });
-        return command.includes(this.cli) && command.includes(record.workflow);
+        const command = execFileSync("ps", ["-ww", "-p", String(record.pid), "-o", "command="], { encoding: "utf8" });
+        return command.split(/\s+/).includes(`--symphony-runner-instance=${record.instance}`);
       } catch {
         return false;
       }
     });
-    this.launch = options.launch ?? ((workflow, env, log, foreground) => {
-      if (foreground) return spawn(process.execPath, [this.cli, workflow], { env, stdio: ["inherit", "pipe", "pipe"] });
+    this.launch = options.launch ?? ((workflow, env, log, foreground, instance) => {
+      const args = [this.cli, workflow, `--symphony-runner-instance=${instance}`];
+      if (foreground) return spawn(process.execPath, args, { env, stdio: ["inherit", "pipe", "pipe"] });
       const fd = openSync(log, "a");
       try {
-        const child = spawn(process.execPath, [this.cli, workflow], { env, stdio: ["ignore", fd, fd], detached: true });
+        const child = spawn(process.execPath, args, { env, stdio: ["ignore", fd, fd], detached: true });
         child.on("error", (error) => console.error(`runner launch failed: ${error.message}`));
         child.unref();
         if (process.platform === "darwin" && child.pid) {
@@ -105,7 +113,8 @@ export class RunnerManager {
         if (!existsSync(file)) return [];
         const record = JSON.parse(readFileSync(file, "utf8")) as RunnerRecord;
         if (record.id !== entry.name || !Number.isInteger(record.pid) || typeof record.workflow !== "string"
-          || typeof record.workspace !== "string" || typeof record.project !== "string") {
+          || typeof record.workspace !== "string" || typeof record.project !== "string"
+          || (record.instance !== undefined && typeof record.instance !== "string")) {
           throw new Error(`invalid runner record: ${file}`);
         }
         return [record];
@@ -176,14 +185,15 @@ export class RunnerManager {
       const state = join(this.root, "runners", id);
       if (overlaps(state, workspace)) throw new Error(`workspace.root ${workspace} overlaps runner state ${state}`);
       mkdirSync(dirname(this.logPath(id)), { recursive: true });
+      const instance = randomUUID();
       const child = this.launch(workflow, {
         ...process.env, SYMPHONY_RUNNER_PROJECT: project, SYMPHONY_RUNNER_WORKSPACE: workspace,
-      }, this.logPath(id), foreground);
+      }, this.logPath(id), foreground, instance);
       if (!child.pid) {
         child.on("error", (error) => console.error(`could not launch runner ${id}: ${error.message}`));
         throw new Error(`could not launch runner ${id}`);
       }
-      const next = { id, workflow, workspace, project, pid: child.pid };
+      const next = { id, workflow, workspace, project, pid: child.pid, instance };
       try {
         writeFileSync(this.recordPath(id), `${JSON.stringify(next, null, 2)}\n`);
         writeFileSync(join(this.root, ".last-runner"), `${id}\n`);

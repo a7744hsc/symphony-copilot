@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { RunLedger } from "../src/ledger.ts";
-import { canonicalPath, projectIdentity, RunnerManager, workflowId } from "../src/management.ts";
+import { canonicalPath, pathFromFileUrl, projectIdentity, RunnerManager, workflowId } from "../src/management.ts";
 import { createLogger } from "../src/log.ts";
 import { WorkflowStore } from "../src/workflow.ts";
 
@@ -38,8 +38,8 @@ function fixture() {
   const state = join(dir, "state");
   const children: ChildProcess[] = [];
   const manager = new RunnerManager(state, cli, {
-    launch: (wf, env) => {
-      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", cli, wf], { stdio: "ignore", env });
+    launch: (wf, env, _log, _foreground, instance) => {
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", cli, wf, `--symphony-runner-instance=${instance}`], { stdio: "ignore", env });
       children.push(child);
       return child;
     },
@@ -101,6 +101,43 @@ test("two live workflows retain separate prompts, ledgers, logs and targeted lif
   assert.equal(manager.isRunning(b.record), true);
   assert.equal(await manager.stop("beta"), true);
   await new Promise<void>((done) => children[1]!.once("exit", () => done()));
+});
+
+test("a stale record cannot stop a runner whose workflow path shares its prefix", { skip: process.platform === "win32" }, async (t) => {
+  const { dir, manager, children } = fixture();
+  t.after(() => { for (const child of children) if (child.exitCode === null) child.kill(); });
+  const staleWorkflow = workflow(dir, "workflow", 20, join(dir, "stale-work"));
+  const liveWorkflow = workflow(dir, "workflow-other", 21, join(dir, "live-work"));
+  const live = await manager.start(liveWorkflow, "live");
+  const stale = {
+    ...live.record,
+    id: "stale",
+    workflow: staleWorkflow,
+    instance: live.record.instance!.slice(0, -1),
+  };
+  mkdirSync(join(manager.root, "runners", stale.id), { recursive: true });
+  writeFileSync(join(manager.root, "runners", stale.id, "runner.json"), `${JSON.stringify(stale)}\n`);
+
+  assert.equal(await manager.stop("stale"), false);
+  assert.equal(manager.isRunning(live.record), true);
+  assert.equal(await manager.stop("live"), true);
+  await new Promise<void>((done) => children[0]!.once("exit", () => done()));
+});
+
+test("default launch accepts a CLI path containing spaces", { skip: process.platform === "win32" }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "symphony manager-"));
+  const scriptUrl = new URL("runner%20checkout/cli.mjs", new URL(`file://${dir}/`));
+  const script = pathFromFileUrl(scriptUrl);
+  mkdirSync(join(dir, "runner checkout"), { recursive: true });
+  writeFileSync(script, "setInterval(() => {}, 1000);\n");
+  const manager = new RunnerManager(join(dir, "state"), script);
+  const file = workflow(dir, "spaced", 22, join(dir, "work"));
+  const started = await manager.start(file, "spaced");
+  t.after(() => { if (started.child.exitCode === null) started.child.kill(); });
+
+  assert.equal(manager.isRunning(started.record), true);
+  assert.equal(await manager.stop("spaced"), true);
+  await new Promise<void>((done) => started.child.once("exit", () => done()));
 });
 
 test("reject duplicate projects, overlapping workspace roots, aliases and IDs before launch", { skip: process.platform === "win32" }, async (t) => {
