@@ -31,6 +31,8 @@ powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
 
 The wizard checks Node.js 22.18+, Git 2.38+ (for the merge-conflict check), npm and GitHub CLI. It lists every missing tool, its source and whether administrator approval may be requested, then asks once before installing. Node.js is downloaded as an official Node.js 22 LTS archive, checked against the official `SHASUMS256.txt`, and installed under your user profile (no administrator access); the wizard adds its bin directory to your user PATH. Git and GitHub CLI are installed through the platform's supported package manager when available. If a package manager is unavailable, the wizard says which tools need manual installation before it starts. After prerequisites pass, the wizard separately asks before running `npm ci` in this checkout.
 
+The setup has been exercised on this development machine with GitHub CLI `2.101.0` (2026-09-29). The wizard does not enforce a minimum `gh` version; it checks only that the command exists. It never automatically upgrades an already-installed `gh`, so an older CLI may fail later if it lacks a command or option this workflow uses. Upgrade it yourself with its package manager if needed.
+
 | Platform | Node.js | Git | GitHub CLI |
 |---|---|---|---|
 | macOS | Official Node 22 LTS archive from [nodejs.org](https://nodejs.org/en/download), SHA-256 checked, user-local | Homebrew when installed | GitHub CLI maintainers' Homebrew formula when Homebrew is installed |

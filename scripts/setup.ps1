@@ -131,6 +131,7 @@ function Install-ConfirmedTools([string[]] $Missing) {
 
 Write-Host 'symphony-copilot setup — Windows'
 Write-Host "This wizard checks Node.js $MinimumNodeMajor.$MinimumNodeMinor+, Git and GitHub CLI, signs in through gh, then installs this checkout's npm dependencies."
+Write-Host 'GitHub CLI tested version: 2.101.0 (2026-09-29). Existing gh installations are detected, not automatically upgraded.'
 Write-Host 'It does not ask for, print or save your password or token.'
 Write-Host ''
 Write-Host 'Checking prerequisites:'

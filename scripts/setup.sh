@@ -167,6 +167,7 @@ missing_tools() {
 
 say "symphony-copilot setup — $OS"
 say "This wizard checks Node.js 22.18+, Git and GitHub CLI, signs in through gh, then installs this checkout's npm dependencies."
+say "GitHub CLI tested version: 2.101.0 (2026-09-29). Existing gh installations are detected, not automatically upgraded."
 say "It does not ask for, print or save your password or token."
 say ""
 say "Checking prerequisites:"

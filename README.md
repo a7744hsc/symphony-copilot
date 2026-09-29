@@ -62,6 +62,8 @@ cd symphony-copilot
 
 Run the first-run wizard from this checkout: `./scripts/setup.sh` on macOS/Linux, or `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1` on Windows. It checks Node.js 22.18+, Git 2.38+, npm and GitHub CLI, lists the missing tools and sources, then installs them after one confirmation. Node.js comes from the official nodejs.org archive, is SHA-256 checked, and is installed under your user profile. Git and GitHub CLI use the available supported package manager (Homebrew, distro repositories, or WinGet); if one is unavailable, the wizard says what cannot be automated before proceeding. It then offers `npm ci`, signs in through `gh` (you approve in a browser), requests the Projects scope, and configures Git credentials. It never asks for or stores your password or token. Details: [first-run setup](docs/onboarding.md#install-and-sign-in).
 
+The setup has been exercised with GitHub CLI 2.101.0. The wizard does not enforce a `gh` minimum version and does not automatically upgrade an existing installation.
+
 On macOS/Linux, optionally put `symphony` on your PATH: `ln -s "$PWD/bin/symphony" /usr/local/bin/symphony`.
 
 **2. Set up your repository.** One file at the root of the repository the agents work on, `WORKFLOW.md`, describes everything: the board and its columns, how a workspace is prepared, which commands agents may run, and the agents' prompt. You write it first, and the board is created from it. [docs/onboarding.md](docs/onboarding.md) walks through it:

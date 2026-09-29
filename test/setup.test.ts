@@ -24,7 +24,7 @@ test("the Bash wizard runs npm ci and requests browser auth, project scope and g
   const bin = mockBin({
     node: '#!/bin/sh\necho v22.18.0\n',
     git: '#!/bin/sh\necho "git version 2.50.0"\n',
-    gh: `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_LOG"\ncase "$1" in --version) echo 'gh version 2.80.0';; api) echo setup-user;; esac\nexit 0\n`,
+    gh: `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_LOG"\ncase "$1" in --version) echo 'gh version 2.101.0';; api) echo setup-user;; esac\nexit 0\n`,
     npm: `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> "$GH_LOG"\nexit 0\n`,
   });
   const result = spawnSync("bash", [setup], {
@@ -41,6 +41,8 @@ test("the Bash wizard runs npm ci and requests browser auth, project scope and g
   assert.match(log, /auth refresh --hostname github\.com --scopes project/);
   assert.match(log, /auth setup-git --hostname github\.com/);
   assert.match(result.stdout, /Setup complete/);
+  assert.match(result.stdout, /GitHub CLI tested version: 2\.101\.0/);
+  assert.match(result.stdout, /Existing gh installations are detected, not automatically upgraded/);
   assert.doesNotMatch(result.stdout, /token=[^\s]+|password=/i);
 });
 
@@ -120,4 +122,6 @@ test("the PowerShell entry point exists for Windows instructions", () => {
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /nodejs\.org\/dist\/latest-v/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /\$MinimumNodeMinor = 18/);
   assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /WinGet failed to install/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /GitHub CLI tested version: 2\.101\.0/);
+  assert.match(readFileSync(join(root, "scripts", "setup.ps1"), "utf8"), /Existing gh installations are detected, not automatically upgraded/);
 });

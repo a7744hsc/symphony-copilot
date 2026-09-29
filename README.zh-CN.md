@@ -64,6 +64,8 @@ cd symphony-copilot
 
 在这个仓库里运行首次设置向导：macOS/Linux 用 `./scripts/setup.sh`，Windows PowerShell 用 `powershell -ExecutionPolicy Bypass -File scripts/setup.ps1`。它会检查 Node.js 22.18+、Git 2.38+、npm 和 GitHub CLI，列出缺少的工具及安装来源；你确认一次后就自动安装。Node.js 从 nodejs.org 官方归档下载并校验 SHA-256，安装到用户目录；Git 和 GitHub CLI 使用可用的受支持包管理器（Homebrew、发行版软件源或 WinGet）。若某项无法自动安装，向导会在开始前明确说明。之后会询问是否运行 `npm ci`；登录由 `gh` 启动浏览器，你在网页批准即可。随后申请 Projects 权限并配置 Git 凭据。不会索取或保存密码、token。完整流程见[首次设置](docs/onboarding.md#install-and-sign-in)（英文）。
 
+本机验证使用 GitHub CLI 2.101.0。向导没有设置 `gh` 最低版本，也不会自动升级已安装的版本。
+
 macOS/Linux 上可以选择把 `symphony` 放到 PATH：`ln -s "$PWD/bin/symphony" /usr/local/bin/symphony`。
 
 **2. 配置你的仓库。** agent 要处理的仓库根目录里放一个 `WORKFLOW.md`，它描述所有配置：看板和各列、工作区怎么准备、agent 能运行哪些命令、给 agent 的提示词。先写好它，再按它建看板。完整步骤见 [docs/onboarding.md](docs/onboarding.md)（英文）：
