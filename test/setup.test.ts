@@ -31,7 +31,22 @@ test("the Bash wizard requests the Projects scope only when the active account l
     git: '#!/bin/sh\necho "git version 2.50.0"\n',
     xz: '#!/bin/sh\nexit 0\n',
     gh: `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'--json hosts'*) printf '{"hosts":{"github.com":[{"active":true,"scopes":"%s"}]}}\\n' "$GH_SCOPES";; esac\ncase "$1" in --version) echo 'gh version 2.101.0';; api) echo setup-user;; esac\nexit 0\n`,
-    npm: `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> "$GH_LOG"\ncase "$*" in *'@github/copilot'*) mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\\nprintf \\\"copilot %%s\\\\n\\\" \\\"$*\\\" >> \\\"$GH_LOG\\\"\\n[ \\\"$1\\\" = --version ] && echo \\\"GitHub Copilot CLI test\\\"\\nexit 0\\n' > "$HOME/.local/bin/copilot"; chmod +x "$HOME/.local/bin/copilot";; esac\nexit 0\n`,
+    npm: String.raw`#!/bin/sh
+printf 'npm %s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  *'@github/copilot'*)
+    mkdir -p "$HOME/.local/bin"
+    cat > "$HOME/.local/bin/copilot" <<'COPILOT'
+#!/bin/sh
+printf 'copilot %s\n' "$*" >> "$GH_LOG"
+[ "$1" = --version ] && echo "GitHub Copilot CLI test"
+exit 0
+COPILOT
+    chmod +x "$HOME/.local/bin/copilot"
+    ;;
+esac
+exit 0
+`,
   });
   const runWithScopes = (scopes: string, loginMethod: string | null = "1", copilotAuthState = "no") => spawnSync("bash", [setup], {
     cwd: root,
