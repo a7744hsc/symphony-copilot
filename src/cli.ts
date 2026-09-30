@@ -5,6 +5,7 @@ import { scrubEnvironment } from "./env.ts";
 import { RunLedger } from "./ledger.ts";
 import { createLogger } from "./log.ts";
 import { Orchestrator } from "./orchestrator.ts";
+import { assertUnchanged, register, runnerId, type RunnerRecord } from "./registry.ts";
 import { runAgentAttempt } from "./runner.ts";
 import { createTracker } from "./tracker/index.ts";
 import { WorkflowStore } from "./workflow.ts";
@@ -24,6 +25,7 @@ function main(): Promise<number> | number {
         "dry-run": { type: "boolean", default: false },
         once: { type: "boolean", default: false },
         "log-level": { type: "string", default: "info" },
+        "runner-id": { type: "string" },
         help: { type: "boolean", short: "h", default: false },
       },
     });
@@ -45,8 +47,14 @@ function main(): Promise<number> | number {
 
   let store: WorkflowStore;
   let ledger: RunLedger;
+  let entry: RunnerRecord | undefined;
   try {
     store = new WorkflowStore(args.positionals[0] ?? "WORKFLOW.md", log);
+    if (!dryRun) {
+      entry = register(args.values["runner-id"] ?? runnerId(store.path), store.path, store.workflow.config);
+      const registered = entry;
+      store.onValidate((next) => assertUnchanged(next.config, registered));
+    }
     ledger = new RunLedger(join(store.workflow.config.workspace.root, ".symphony-ledger.json"), { readOnly: dryRun });
   } catch (error) {
     log.error("startup failed", { error: (error as Error).message });

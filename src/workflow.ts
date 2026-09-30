@@ -67,6 +67,7 @@ export class WorkflowStore {
   private readonly log: Logger;
   private readonly env: NodeJS.ProcessEnv;
   private readonly listeners: Array<(workflow: EffectiveWorkflow) => void> = [];
+  private readonly validators: Array<(workflow: EffectiveWorkflow) => void> = [];
 
   constructor(path: string, log: Logger, env: NodeJS.ProcessEnv = process.env) {
     this.path = resolve(path);
@@ -88,6 +89,10 @@ export class WorkflowStore {
     this.listeners.push(listener);
   }
 
+  onValidate(validator: (workflow: EffectiveWorkflow) => void): void {
+    this.validators.push(validator);
+  }
+
   /** Re-reads the file if it changed since the last load; safe to call before every dispatch. */
   refresh(): EffectiveWorkflow {
     let mtimeMs: number;
@@ -99,7 +104,9 @@ export class WorkflowStore {
     }
     if (mtimeMs === this.lastMtimeMs) return this.current;
     try {
-      this.current = this.read();
+      const next = this.read();
+      for (const validator of this.validators) validator(next);
+      this.current = next;
       this.lastError = null;
       this.log.info("workflow reloaded", { path: this.path });
       for (const listener of this.listeners) listener(this.current);
