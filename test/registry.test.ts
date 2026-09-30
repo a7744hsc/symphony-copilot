@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -141,6 +141,90 @@ test("duplicate project, nested/symlink roots and duplicate workflow are rejecte
     }
   } finally {
     if (child?.exitCode === null) child.kill("SIGTERM");
+  }
+});
+
+test("filesystem-equivalent workflow and workspace paths share ownership without conflating case-sensitive paths", () => {
+  for (const initiallyExists of [false, true]) {
+    const dir = base();
+    const env = environment(dir);
+    const previousState = process.env.SYMPHONY_STATE_DIR;
+    const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+    process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+    try {
+      const upperRoot = join(dir, "Workspace");
+      const lowerRoot = join(dir, "workspace");
+      if (initiallyExists) mkdirSync(upperRoot);
+      const insensitive = initiallyExists
+        ? existsSync(lowerRoot)
+        : (() => {
+            mkdirSync(upperRoot);
+            const result = existsSync(lowerRoot);
+            rmSync(upperRoot, { recursive: true });
+            return result;
+          })();
+      const firstWorkflow = join(dir, "first.md");
+      const secondWorkflow = join(dir, "second.md");
+      writeFileSync(firstWorkflow, "prompt");
+      writeFileSync(secondWorkflow, "prompt");
+      register("upper", firstWorkflow, config(firstWorkflow, upperRoot, 20));
+      const rootAttempt = () => register("lower", secondWorkflow, config(secondWorkflow, lowerRoot, 21));
+      if (insensitive) assert.throws(rootAttempt, /workspace root .*overlaps/);
+      else assert.doesNotThrow(rootAttempt);
+
+      const upperWorkflow = join(dir, "Flow.md");
+      const lowerWorkflow = join(dir, "flow.md");
+      writeFileSync(upperWorkflow, "prompt");
+      register("flow-upper", upperWorkflow, config(upperWorkflow, join(dir, "flow-upper-root"), 22));
+      const workflowAttempt = () => register("flow-lower", lowerWorkflow, config(lowerWorkflow, join(dir, "flow-lower-root"), 23));
+      if (insensitive) assert.throws(workflowAttempt, /workflow .*already running/);
+      else assert.doesNotThrow(workflowAttempt);
+    } finally {
+      if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+      else process.env.SYMPHONY_STATE_DIR = previousState;
+      if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+      else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
+    }
+  }
+});
+
+test("managed state writes cannot enter another runner workspace in either startup order", async () => {
+  const dir = base();
+  const normal = environment(dir, "shared-state");
+  const rootA = join(dir, "alpha-workspaces");
+  const nested = environment(dir, join("alpha-workspaces", "GH-1"));
+  const a = join(dir, "a.md"), b = join(dir, "b.md");
+  const rootB = join(dir, "beta-workspaces");
+  writeFileSync(a, workflowText(rootA, 30, "prompt a"));
+  writeFileSync(b, workflowText(rootB, 31, "prompt b"));
+  let first: ChildProcess | undefined;
+  try {
+    first = await launch(normal, "alpha", a, rootA, 1);
+    const result = command(nested, "run", "--id", "beta", b);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /managed state .* overlaps .* workspace/);
+    assert.equal(existsSync(join(rootA, "GH-1")), false, "rejected start must not create an issue workspace");
+  } finally {
+    if (first?.exitCode === null) first.kill("SIGTERM");
+  }
+
+  const reverse = base();
+  const reverseNormal = environment(reverse, "shared-state");
+  const reverseRootA = join(reverse, "alpha-workspaces");
+  const reverseNested = environment(reverse, join("alpha-workspaces", "GH-1"));
+  const reverseA = join(reverse, "a.md"), reverseB = join(reverse, "b.md");
+  const reverseRootB = join(reverse, "beta-workspaces");
+  writeFileSync(reverseA, workflowText(reverseRootA, 32, "prompt a"));
+  writeFileSync(reverseB, workflowText(reverseRootB, 33, "prompt b"));
+  let second: ChildProcess | undefined;
+  try {
+    second = await launch(reverseNested, "beta", reverseB, reverseRootB, 1);
+    const result = command(reverseNormal, "run", "--id", "alpha", reverseA);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /managed state .* overlaps .* workspace/);
+  } finally {
+    if (second?.exitCode === null) second.kill("SIGTERM");
   }
 });
 

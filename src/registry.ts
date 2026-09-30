@@ -57,6 +57,73 @@ export function canonical(path: string): string {
   }
 }
 
+const caseSensitivity = new Map<number, boolean>();
+
+function toggledCase(name: string): string | null {
+  const index = name.search(/[a-zA-Z]/);
+  if (index < 0) return null;
+  const character = name[index]!;
+  const toggled = character === character.toLowerCase() ? character.toUpperCase() : character.toLowerCase();
+  return name.slice(0, index) + toggled + name.slice(index + 1);
+}
+
+function isCaseInsensitive(path: string): boolean {
+  let current = path;
+  while (true) {
+    try {
+      const stats = statSync(current);
+      const cached = caseSensitivity.get(stats.dev);
+      if (cached !== undefined) return cached;
+      current = stats.isDirectory() ? current : dirname(current);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(current);
+      if (parent === current) return process.platform === "win32";
+      current = parent;
+    }
+  }
+
+  const device = statSync(current).dev;
+  while (true) {
+    try {
+      for (const name of readdirSync(current)) {
+        const alternate = toggledCase(name);
+        if (!alternate || alternate === name) continue;
+        try {
+          const original = lstatSync(join(current, name));
+          const toggled = lstatSync(join(current, alternate));
+          const insensitive = original.dev === toggled.dev && original.ino === toggled.ino;
+          caseSensitivity.set(device, insensitive);
+          return insensitive;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+          caseSensitivity.set(device, false);
+          return false;
+        }
+      }
+    } catch {
+      // Try an accessible ancestor on the same filesystem.
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    try {
+      if (statSync(parent).dev !== device) break;
+    } catch {
+      break;
+    }
+    current = parent;
+  }
+  const fallback = process.platform === "win32";
+  caseSensitivity.set(device, fallback);
+  return fallback;
+}
+
+function pathKey(path: string): string {
+  const resolved = canonical(path);
+  return isCaseInsensitive(resolved) ? resolved.toLowerCase() : resolved;
+}
+
 export function projectKey(config: ServiceConfig): string {
   if (config.tracker.kind !== "github_project") throw new Error(`unsupported tracker ${config.tracker.kind}`);
   const p = config.tracker.provider;
@@ -102,8 +169,16 @@ export function record(id: string): RunnerRecord | undefined {
 }
 
 function overlaps(a: string, b: string): boolean {
-  const rel = relative(a, b);
+  const rel = relative(pathKey(a), pathKey(b));
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function pathsOverlap(a: string, b: string): boolean {
+  return overlaps(a, b) || overlaps(b, a);
+}
+
+function managedPaths(state: string): string[] {
+  return [join(state, "logs"), join(state, ".last-workflow")];
 }
 
 function reservationFile(dir: string, id: string): string {
@@ -136,13 +211,21 @@ function assertAvailable(
   claimToken?: string,
 ): void {
   for (const existing of [...activeRecords, ...activeReservations.filter((entry) => entry.token !== claimToken)]) {
-    if (existing.id === next.id && existing.workflow !== next.workflow) {
+    if (existing.id === next.id && pathKey(existing.workflow) !== pathKey(next.workflow)) {
       throw new Error(`runner ID "${next.id}" belongs to ${existing.workflow}; choose a different ID for ${next.workflow}`);
     }
     if (existing.id === next.id) throw new Error(`runner "${next.id}" is already running or starting`);
-    if (existing.workflow === next.workflow) throw new Error(`workflow ${next.workflow} is already running as "${existing.id}"`);
-    if (overlaps(existing.root, next.root) || overlaps(next.root, existing.root)) {
+    if (pathKey(existing.workflow) === pathKey(next.workflow)) {
+      throw new Error(`workflow ${next.workflow} is already running as "${existing.id}"`);
+    }
+    if (pathsOverlap(existing.root, next.root)) {
       throw new Error(`workspace root ${next.root} overlaps runner "${existing.id}" (${existing.root}); set a separate workspace.root`);
+    }
+    if (
+      managedPaths(next.state).some((path) => pathsOverlap(path, existing.root))
+      || managedPaths(existing.state).some((path) => pathsOverlap(path, next.root))
+    ) {
+      throw new Error(`managed state for runner "${next.id}" overlaps runner "${existing.id}" workspace; set SYMPHONY_STATE_DIR outside runner workspaces`);
     }
     if (existing.project === next.project) {
       throw new Error(`GitHub Project ${next.project} is already managed by runner "${existing.id}"; shared-card claiming is not supported`);
@@ -151,7 +234,7 @@ function assertAvailable(
 }
 
 function assertIdOwnership(next: Omit<RunnerRecord, "pid" | "started">, existing: RunnerRecord[]): void {
-  const owner = existing.find((entry) => entry.id === next.id && entry.workflow !== next.workflow);
+  const owner = existing.find((entry) => entry.id === next.id && pathKey(entry.workflow) !== pathKey(next.workflow));
   if (owner) throw new Error(`runner ID "${next.id}" belongs to ${owner.workflow}; choose a different ID for ${next.workflow}`);
 }
 
@@ -218,8 +301,9 @@ export function register(id: string, workflow: string, config: ServiceConfig, pi
     const allReservations = reservations(dir);
     if (reservationToken) {
       const claimed = allReservations.find((entry) => entry.token === reservationToken);
-      if (!claimed || claimed.id !== next.id || claimed.workflow !== next.workflow || claimed.root !== next.root
-        || claimed.project !== next.project || claimed.state !== next.state || !reservationLive(claimed)) {
+      if (!claimed || claimed.id !== next.id || pathKey(claimed.workflow) !== pathKey(next.workflow)
+        || pathKey(claimed.root) !== pathKey(next.root) || claimed.project !== next.project
+        || pathKey(claimed.state) !== pathKey(next.state) || !reservationLive(claimed)) {
         throw new Error(`runner reservation for "${next.id}" is missing, expired, or does not match its workflow`);
       }
     }
@@ -232,7 +316,7 @@ export function register(id: string, workflow: string, config: ServiceConfig, pi
 }
 
 export function assertUnchanged(config: ServiceConfig, entry: RunnerRecord): void {
-  if (canonical(config.workspace.root) !== entry.root || projectKey(config) !== entry.project) {
+  if (pathKey(config.workspace.root) !== pathKey(entry.root) || projectKey(config) !== entry.project) {
     throw new Error("workspace.root and tracker project cannot change while a runner is active; stop it before changing either");
   }
 }
