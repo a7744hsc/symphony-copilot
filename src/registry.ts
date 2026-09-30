@@ -257,8 +257,27 @@ function runnerLog(entry: Pick<RunnerRecord, "id" | "state"> & Partial<Pick<Runn
   return entry.log ?? canonical(join(entry.state, "logs", `${entry.id}.log`));
 }
 
-function managedFiles(entry: Pick<RunnerRecord, "id" | "state"> & Partial<Pick<RunnerRecord, "log">>): string[] {
-  return [runnerLog(entry), join(entry.state, ".last-workflow")];
+type OwnedFileKind = "log" | "preference" | "ledger" | "ledger-temp";
+
+function writableFiles(
+  entry: Pick<RunnerRecord, "id" | "state" | "root"> & Partial<Pick<RunnerRecord, "log">>,
+): Array<{ kind: OwnedFileKind; path: string }> {
+  const ledger = join(entry.root, ".symphony-ledger.json");
+  return [
+    { kind: "log", path: runnerLog(entry) },
+    { kind: "preference", path: join(entry.state, ".last-workflow") },
+    { kind: "ledger", path: ledger },
+    { kind: "ledger-temp", path: `${ledger}.tmp` },
+  ];
+}
+
+function writableAlias(
+  first: Pick<RunnerRecord, "id" | "state" | "root"> & Partial<Pick<RunnerRecord, "log">>,
+  second: Pick<RunnerRecord, "id" | "state" | "root"> & Partial<Pick<RunnerRecord, "log">>,
+): boolean {
+  return writableFiles(first).some((left) => writableFiles(second).some((right) =>
+    !(left.kind === "preference" && right.kind === "preference") && samePath(left.path, right.path)
+  ));
 }
 
 function reservationFile(dir: string, id: string): string {
@@ -293,14 +312,29 @@ function assertSelfContained(next: Omit<RunnerRecord, "pid" | "started">): void 
   if (inputPaths(next).some((path) => overlaps(next.root, path))) {
     throw new Error(`configuration input for runner "${next.id}" overlaps its workspace; keep workflow and prompt files outside runner workspaces`);
   }
-  if (inputPaths(next).some((path) => managedFiles(next).some((managed) => samePath(path, managed)))) {
+  if (inputPaths(next).some((path) => writableFiles(next).some((managed) => samePath(path, managed.path)))) {
     throw new Error(`configuration input for runner "${next.id}" aliases its managed state; keep workflow and prompt files separate from runner logs and state`);
+  }
+  const writable = writableFiles(next);
+  if (writable.some((left, index) => writable.slice(index + 1).some((right) => samePath(left.path, right.path)))) {
+    throw new Error(`managed state for runner "${next.id}" aliases another managed file; remove the alias or choose a different state directory`);
   }
   if (
     managedPaths(next.state).some((path) => pathsOverlap(path, next.root))
     || pathsOverlap(runnerLog(next), next.root)
   ) {
     throw new Error(`managed state for runner "${next.id}" overlaps its workspace; set SYMPHONY_STATE_DIR outside runner workspaces`);
+  }
+}
+
+function assertHostRegistrySafe(next: Omit<RunnerRecord, "pid" | "started">, dir: string): void {
+  const owned = [...inputPaths(next), ...writableFiles(next).map((entry) => entry.path)];
+  if (pathsOverlap(next.root, dir) || owned.some((path) => pathsOverlap(path, dir))) {
+    throw new Error(`runner "${next.id}" state overlaps the host runner registry; keep workflows, workspaces and managed state outside ${dir}`);
+  }
+  const controls = readdirSync(dir).map((name) => join(dir, name));
+  if (owned.some((path) => controls.some((control) => samePath(path, control)))) {
+    throw new Error(`runner "${next.id}" state aliases the host runner registry; remove the alias or choose a different state directory`);
   }
 }
 
@@ -333,8 +367,8 @@ function assertAvailable(
       throw new Error(`configuration input for runner "${next.id}" overlaps runner "${existing.id}" workspace; keep workflow and prompt files outside runner workspaces`);
     }
     if (
-      nextInputs.some((path) => managedFiles(existing).some((managed) => samePath(path, managed)))
-      || existingInputs.some((path) => managedFiles(next).some((managed) => samePath(path, managed)))
+      nextInputs.some((path) => writableFiles(existing).some((managed) => samePath(path, managed.path)))
+      || existingInputs.some((path) => writableFiles(next).some((managed) => samePath(path, managed.path)))
     ) {
       throw new Error(`configuration input for runner "${next.id}" aliases runner "${existing.id}" managed state; keep workflow and prompt files separate from runner logs and state`);
     }
@@ -348,6 +382,9 @@ function assertAvailable(
     }
     if (samePath(runnerLog(existing), runnerLog(next))) {
       throw new Error(`log for runner "${next.id}" aliases runner "${existing.id}" log; remove the alias or choose a different state directory`);
+    }
+    if (writableAlias(existing, next)) {
+      throw new Error(`managed state for runner "${next.id}" aliases runner "${existing.id}" managed state; remove the alias or choose a different state directory`);
     }
     if (existing.project === next.project) {
       throw new Error(`GitHub Project ${next.project} is already managed by runner "${existing.id}"; shared-card claiming is not supported`);
@@ -397,6 +434,7 @@ export function reserve(id: string, workflow: string, config: ServiceConfig): Ru
     const activeRecords = allRecords.filter(live);
     const allReservations = reservations(dir);
     const activeReservations = allReservations.filter(reservationLive);
+    assertHostRegistrySafe(next, dir);
     assertIdOwnership(next, allRecords);
     assertAvailable(next, activeRecords, activeReservations);
     for (const stale of allReservations.filter((entry) => !reservationLive(entry))) rmSync(reservationFile(dir, stale.id), { force: true });
@@ -421,6 +459,7 @@ export function register(id: string, workflow: string, config: ServiceConfig, pi
   return locked((dir) => {
     const allRecords = records();
     const allReservations = reservations(dir);
+    assertHostRegistrySafe(next, dir);
     if (reservationToken) {
       const claimed = allReservations.find((entry) => entry.token === reservationToken);
       if (!claimed || claimed.id !== next.id || !samePath(claimed.workflow, next.workflow)
@@ -443,6 +482,7 @@ export function register(id: string, workflow: string, config: ServiceConfig, pi
 export function assertUnchanged(config: ServiceConfig, entry: RunnerRecord): void {
   const next = candidate(entry.id, entry.workflow, config, entry.state);
   locked((dir) => {
+    assertHostRegistrySafe(next, dir);
     if (pathKey(next.root) !== pathKey(entry.root) || next.project !== entry.project) {
       throw new Error("workspace.root and tracker project cannot change while a runner is active; stop it before changing either");
     }

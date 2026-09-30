@@ -538,6 +538,86 @@ test("an aliased runner log is rejected before startup writes to its owner", asy
   }
 });
 
+test("runner logs cannot alias another runner ledger", async () => {
+  const dir = base();
+  const env = environment(dir);
+  const alpha = join(dir, "ledger-alpha.md");
+  const beta = join(dir, "ledger-beta.md");
+  const rootA = join(dir, "ledger-alpha-workspaces");
+  writeFileSync(alpha, workflowText(rootA, 47, "prompt alpha"));
+  writeFileSync(beta, workflowText(join(dir, "ledger-beta-workspaces"), 48, "prompt beta").replace(", repo: fixture/repo", ""));
+  let child: ChildProcess | undefined;
+  try {
+    child = await launch(env, "ledger-alpha", alpha, rootA, 3);
+    const ledger = join(rootA, ".symphony-ledger.json");
+    const original = readFileSync(ledger, "utf8");
+    const betaLog = join(env.SYMPHONY_STATE_DIR!, "logs", "ledger-beta.log");
+    mkdirSync(join(env.SYMPHONY_STATE_DIR!, "logs"), { recursive: true });
+    linkSync(ledger, betaLog);
+
+    const result = command(env, "run", "--id", "ledger-beta", beta);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /managed state for runner "ledger-beta" aliases runner "ledger-alpha" managed state/);
+    assert.equal(readFileSync(ledger, "utf8"), original);
+    assert.equal(new RunLedger(ledger).get("shared-item")?.sessions, 3);
+  } finally {
+    if (child?.exitCode === null) child.kill("SIGTERM");
+  }
+});
+
+test("last-workflow preference cannot alias a live runner log", async () => {
+  const dir = base();
+  const env = environment(dir);
+  const alpha = join(dir, "preference-alpha.md");
+  const beta = join(dir, "preference-beta.md");
+  const rootA = join(dir, "preference-alpha-workspaces");
+  writeFileSync(alpha, workflowText(rootA, 49, "prompt alpha"));
+  writeFileSync(beta, workflowText(join(dir, "preference-beta-workspaces"), 50, "prompt beta").replace(", repo: fixture/repo", ""));
+  let child: ChildProcess | undefined;
+  try {
+    child = await launch(env, "preference-alpha", alpha, rootA, 1);
+    const logs = join(env.SYMPHONY_STATE_DIR!, "logs");
+    const alphaLog = join(logs, "preference-alpha.log");
+    mkdirSync(logs, { recursive: true });
+    writeFileSync(alphaLog, "alpha-only\n");
+    symlinkSync(alphaLog, join(env.SYMPHONY_STATE_DIR!, ".last-workflow"));
+
+    const result = command(env, "run", "--id", "preference-beta", beta);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /managed state for runner "preference-beta" aliases runner "preference-alpha" managed state/);
+    assert.equal(readFileSync(alphaLog, "utf8"), "alpha-only\n");
+  } finally {
+    if (child?.exitCode === null) child.kill("SIGTERM");
+  }
+});
+
+test("runner state cannot alias the host registry", async () => {
+  const dir = base();
+  const env = environment(dir);
+  const alpha = join(dir, "registry-alpha.md");
+  const beta = join(dir, "registry-beta.md");
+  const rootA = join(dir, "registry-alpha-workspaces");
+  writeFileSync(alpha, workflowText(rootA, 51, "prompt alpha"));
+  writeFileSync(beta, workflowText(join(dir, "registry-beta-workspaces"), 52, "prompt beta").replace(", repo: fixture/repo", ""));
+  let child: ChildProcess | undefined;
+  try {
+    child = await launch(env, "registry-alpha", alpha, rootA, 1);
+    const alphaRecord = join(env.SYMPHONY_TEST_HOST_STATE_DIR!, "registry-alpha.json");
+    const original = readFileSync(alphaRecord, "utf8");
+    const betaLog = join(env.SYMPHONY_STATE_DIR!, "logs", "registry-beta.log");
+    mkdirSync(join(env.SYMPHONY_STATE_DIR!, "logs"), { recursive: true });
+    symlinkSync(alphaRecord, betaLog);
+
+    const result = command(env, "run", "--id", "registry-beta", beta);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /state (aliases|overlaps) the host runner registry/);
+    assert.equal(readFileSync(alphaRecord, "utf8"), original);
+    assert.match(command(env, "status", "registry-alpha").stdout, /registry-alpha: Running/);
+  } finally {
+    if (child?.exitCode === null) child.kill("SIGTERM");
+  }
+});
+
 test("managed foreground and background startup failures retain targeted logs", async () => {
   const dir = base();
   const env = environment(dir);
