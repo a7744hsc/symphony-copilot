@@ -118,7 +118,7 @@ symphony run --id jobs ~/code/jobs/WORKFLOW.md  # foreground; Ctrl-C stops it
 
 The workflow path may be omitted to reuse the last-started workflow. `status` without an ID lists all runners. With only one registered runner, `logs` and `stop` may omit the ID for compatibility; otherwise they require an ID rather than guessing. On macOS, `start` also keeps the Mac from idle-sleeping while its runner is active.
 
-Each runner has its own configuration process, run ledger under its `workspace.root`, log at `~/symphony-workspaces/logs/<id>.log`, and workspaces. Set `SYMPHONY_STATE_DIR` to move the runner registry and logs. Active runners must have non-overlapping workspace roots and different IDs. Two runners cannot manage the same GitHub Project: without distributed card claiming they could both dispatch the same card, so startup rejects the second runner with the ID of the conflicting runner. Stop the first runner or point the second workflow at a different project.
+Each runner has its own configuration process, run ledger under its `workspace.root`, log at `~/symphony-workspaces/logs/<id>.log`, and workspaces. Set `SYMPHONY_STATE_DIR` to move logs and the last-workflow preference; the host-wide ownership registry remains under the OS user's home directory so changing the state directory cannot bypass collision checks. IDs are case-insensitive. Active runners must have non-overlapping workspace roots and different IDs. Two runners cannot manage the same GitHub Project: without distributed card claiming they could both dispatch the same card, so startup rejects the second runner with the ID of the conflicting runner. Stop the first runner or point the second workflow at a different project.
 
 ## Configuration
 
