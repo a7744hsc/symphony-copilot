@@ -189,6 +189,98 @@ test("filesystem-equivalent workflow and workspace paths share ownership without
   }
 });
 
+test("Unicode-equivalent workspace paths cannot share a ledger on normalization-insensitive filesystems", () => {
+  for (const initiallyExists of [false, true]) {
+    const dir = base();
+    const env = environment(dir);
+    const previousState = process.env.SYMPHONY_STATE_DIR;
+    const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+    process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+    try {
+      const composedRoot = join(dir, "caf\u00e9");
+      const decomposedRoot = join(dir, "cafe\u0301");
+      if (initiallyExists) mkdirSync(composedRoot);
+      const insensitive = initiallyExists
+        ? existsSync(decomposedRoot)
+        : (() => {
+            mkdirSync(composedRoot);
+            const result = existsSync(decomposedRoot);
+            rmSync(composedRoot, { recursive: true });
+            return result;
+          })();
+      const firstWorkflow = join(dir, "unicode-first.md");
+      const secondWorkflow = join(dir, "unicode-second.md");
+      writeFileSync(firstWorkflow, "prompt");
+      writeFileSync(secondWorkflow, "prompt");
+      register("unicode-first", firstWorkflow, config(firstWorkflow, composedRoot, 24));
+      mkdirSync(composedRoot, { recursive: true });
+      const firstLedger = new RunLedger(join(composedRoot, ".symphony-ledger.json"));
+      firstLedger.open("shared-item", "first-issue", new Date(0)).sessions = 3;
+      firstLedger.save();
+
+      const secondRegistration = () =>
+        register("unicode-second", secondWorkflow, config(secondWorkflow, decomposedRoot, 25));
+      if (insensitive) {
+        assert.throws(secondRegistration, /workspace root .*overlaps/);
+        assert.equal(new RunLedger(join(composedRoot, ".symphony-ledger.json")).get("shared-item")?.sessions, 3);
+      } else {
+        assert.doesNotThrow(secondRegistration);
+      }
+
+      const composedWorkflow = join(dir, "fl\u00f3w.md");
+      const decomposedWorkflow = join(dir, "flo\u0301w.md");
+      writeFileSync(composedWorkflow, "prompt");
+      register("unicode-flow-first", composedWorkflow, config(composedWorkflow, join(dir, "unicode-flow-first"), 28));
+      const workflowRegistration = () =>
+        register("unicode-flow-second", decomposedWorkflow, config(decomposedWorkflow, join(dir, "unicode-flow-second"), 29));
+      if (insensitive) assert.throws(workflowRegistration, /workflow .*already running/);
+      else assert.doesNotThrow(workflowRegistration);
+    } finally {
+      if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+      else process.env.SYMPHONY_STATE_DIR = previousState;
+      if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+      else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
+    }
+  }
+});
+
+test("workflow files cannot be owned inside another runner workspace in either startup order", () => {
+  for (const workspaceRunnerFirst of [true, false]) {
+    const dir = base();
+    const env = environment(dir);
+    const previousState = process.env.SYMPHONY_STATE_DIR;
+    const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+    process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+    try {
+      const rootA = join(dir, "alpha-workspaces");
+      const issueWorkspace = join(rootA, "GH-1");
+      const workflowA = join(dir, "alpha.md");
+      const workflowB = join(issueWorkspace, "WORKFLOW.md");
+      mkdirSync(issueWorkspace, { recursive: true });
+      writeFileSync(workflowA, "prompt a");
+      writeFileSync(workflowB, "prompt b");
+      const registerAlpha = () => register("alpha", workflowA, config(workflowA, rootA, 26));
+      const registerBeta = () => register("beta", workflowB, config(workflowB, join(dir, "beta-workspaces"), 27));
+
+      if (workspaceRunnerFirst) {
+        registerAlpha();
+        assert.throws(registerBeta, /workflow path .* overlaps .* workspace/);
+      } else {
+        registerBeta();
+        assert.throws(registerAlpha, /workflow path .* overlaps .* workspace/);
+      }
+      assert.equal(readFileSync(workflowB, "utf8"), "prompt b");
+    } finally {
+      if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+      else process.env.SYMPHONY_STATE_DIR = previousState;
+      if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+      else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
+    }
+  }
+});
+
 test("managed state writes cannot enter another runner workspace in either startup order", async () => {
   const dir = base();
   const normal = environment(dir, "shared-state");

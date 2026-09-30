@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ServiceConfig } from "./config.ts";
@@ -58,6 +58,7 @@ export function canonical(path: string): string {
 }
 
 const caseSensitivity = new Map<number, boolean>();
+const normalizationSensitivity = new Map<number, boolean>();
 
 function toggledCase(name: string): string | null {
   const index = name.search(/[a-zA-Z]/);
@@ -119,9 +120,62 @@ function isCaseInsensitive(path: string): boolean {
   return fallback;
 }
 
+function isNormalizationInsensitive(path: string): boolean {
+  let current = path;
+  while (true) {
+    try {
+      const stats = statSync(current);
+      const cached = normalizationSensitivity.get(stats.dev);
+      if (cached !== undefined) return cached;
+      current = stats.isDirectory() ? current : dirname(current);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(current);
+      if (parent === current) return process.platform === "darwin";
+      current = parent;
+    }
+  }
+
+  const device = statSync(current).dev;
+  while (true) {
+    let probe: string | undefined;
+    try {
+      probe = mkdtempSync(join(current, ".symphony-fs-"));
+      const composed = join(probe, "\u00e9");
+      const decomposed = join(probe, "e\u0301");
+      mkdirSync(composed);
+      const original = lstatSync(composed);
+      const alternate = lstatSync(decomposed);
+      const insensitive = original.dev === alternate.dev && original.ino === alternate.ino;
+      normalizationSensitivity.set(device, insensitive);
+      return insensitive;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && probe) {
+        normalizationSensitivity.set(device, false);
+        return false;
+      }
+    } finally {
+      if (probe) rmSync(probe, { recursive: true, force: true });
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    try {
+      if (statSync(parent).dev !== device) break;
+    } catch {
+      break;
+    }
+    current = parent;
+  }
+  const fallback = process.platform === "darwin";
+  normalizationSensitivity.set(device, fallback);
+  return fallback;
+}
+
 function pathKey(path: string): string {
   const resolved = canonical(path);
-  return isCaseInsensitive(resolved) ? resolved.toLowerCase() : resolved;
+  const normalized = isNormalizationInsensitive(resolved) ? resolved.normalize("NFC") : resolved;
+  return isCaseInsensitive(resolved) ? normalized.toLowerCase() : normalized;
 }
 
 export function projectKey(config: ServiceConfig): string {
@@ -220,6 +274,9 @@ function assertAvailable(
     }
     if (pathsOverlap(existing.root, next.root)) {
       throw new Error(`workspace root ${next.root} overlaps runner "${existing.id}" (${existing.root}); set a separate workspace.root`);
+    }
+    if (overlaps(existing.root, next.workflow) || overlaps(next.root, existing.workflow)) {
+      throw new Error(`workflow path for runner "${next.id}" overlaps runner "${existing.id}" workspace; keep workflow files outside runner workspaces`);
     }
     if (
       managedPaths(next.state).some((path) => pathsOverlap(path, existing.root))
