@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { live, record, records, runnerId, stateDir, validateId, type RunnerRecord } from "./registry.ts";
+import { buildConfig } from "./config.ts";
+import {
+  live, normalizeId, record, records, releaseReservation, reserve, runnerId, stateDir, type RunnerRecord,
+} from "./registry.ts";
+import { loadWorkflow } from "./workflow.ts";
 
 const cli = fileURLToPath(new URL("./cli.ts", import.meta.url));
 const home = stateDir();
@@ -19,8 +23,10 @@ function workflow(path?: string): string {
   return result;
 }
 
-function logFile(id: string): string {
-  return join(home, "logs", `${id}.log`);
+function logFile(entry: RunnerRecord | string): string {
+  const id = typeof entry === "string" ? entry : entry.id;
+  const state = typeof entry === "string" ? home : entry.state ?? home;
+  return join(state, "logs", `${id}.log`);
 }
 
 function select(id?: string): RunnerRecord | undefined {
@@ -36,7 +42,7 @@ function select(id?: string): RunnerRecord | undefined {
 function details(entry: RunnerRecord): void {
   if (live(entry)) console.log(`${entry.id}: Running (pid ${entry.pid}) with ${entry.workflow}`);
   else console.log(`${entry.id}: Not running (${entry.workflow})`);
-  const file = logFile(entry.id);
+  const file = logFile(entry);
   if (!existsSync(file)) return;
   const lines = readFileSync(file, "utf8").split("\n");
   const tick = lines.filter((line) => line.includes("msg=tick")).at(-1);
@@ -56,16 +62,41 @@ async function main(): Promise<number> {
     if (argv.length > 1) throw new Error(`Usage: symphony ${command} [--id ID] [path/to/WORKFLOW.md]`);
     const path = workflow(argv[0]);
     id ??= runnerId(path);
-    validateId(id);
-    const args = [cli, path, "--runner-id", id];
+    id = normalizeId(id);
+    const definition = loadWorkflow(path);
+    const reservation = reserve(id, path, buildConfig(definition.config, path, process.env));
+    const args = [cli, path, "--runner-id", id, "--reservation", reservation.token];
     if (command === "run") {
-      const child = spawn(process.execPath, args, { stdio: "inherit" });
+      mkdirSync(dirname(logFile(id)), { recursive: true });
+      const fd = openSync(logFile(id), "a", 0o600);
+      let child;
+      try {
+        child = spawn(process.execPath, args, { stdio: ["inherit", "pipe", "pipe"] });
+      } catch (error) {
+        closeSync(fd);
+        releaseReservation(reservation.token);
+        throw error;
+      }
+      child.stdout!.on("data", (chunk: Buffer) => {
+        writeSync(fd, chunk);
+        process.stdout.write(chunk);
+      });
+      child.stderr!.on("data", (chunk: Buffer) => {
+        writeSync(fd, chunk);
+        process.stderr.write(chunk);
+      });
       process.on("SIGINT", () => {});
       process.on("SIGTERM", () => child.kill("SIGTERM"));
-      const code = await new Promise<number>((resolveExit, reject) => {
-        child.once("error", reject);
-        child.once("exit", (status, signal) => resolveExit(status ?? (signal ? 1 : 0)));
-      });
+      let code: number;
+      try {
+        code = await new Promise<number>((resolveExit, reject) => {
+          child.once("error", reject);
+          child.once("close", (status, signal) => resolveExit(status ?? (signal ? 1 : 0)));
+        });
+      } finally {
+        closeSync(fd);
+        releaseReservation(reservation.token);
+      }
       if (code === 0) {
         mkdirSync(home, { recursive: true });
         writeFileSync(lastFile, path + "\n");
@@ -74,7 +105,14 @@ async function main(): Promise<number> {
     }
     mkdirSync(dirname(logFile(id)), { recursive: true });
     const fd = openSync(logFile(id), "a", 0o600);
-    const child = spawn(process.execPath, args, { detached: true, stdio: ["ignore", fd, fd] });
+    let child;
+    try {
+      child = spawn(process.execPath, args, { detached: true, stdio: ["ignore", fd, fd] });
+    } catch (error) {
+      closeSync(fd);
+      releaseReservation(reservation.token);
+      throw error;
+    }
     closeSync(fd);
     child.unref();
     for (let i = 0; i < 30; i++) {
@@ -93,6 +131,7 @@ async function main(): Promise<number> {
       }
       if (child.exitCode !== null) break;
     }
+    releaseReservation(reservation.token);
     console.error(`Runner ${id} did not start. Last log lines:\n${readFileSync(logFile(id), "utf8").split("\n").slice(-15).join("\n")}`);
     return 1;
   }
@@ -118,7 +157,7 @@ async function main(): Promise<number> {
       return 0;
     }
     if (command === "logs") {
-      const path = logFile(entry.id);
+      const path = logFile(entry);
       if (!existsSync(path)) { console.log(`No log yet: ${path}`); return 0; }
       const child = spawn("tail", ["-n", "30", "-f", path], { stdio: "inherit" });
       process.on("SIGINT", () => child.kill("SIGINT"));

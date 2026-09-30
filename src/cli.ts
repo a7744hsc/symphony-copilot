@@ -26,6 +26,7 @@ function main(): Promise<number> | number {
         once: { type: "boolean", default: false },
         "log-level": { type: "string", default: "info" },
         "runner-id": { type: "string" },
+        reservation: { type: "string" },
         help: { type: "boolean", short: "h", default: false },
       },
     });
@@ -51,7 +52,13 @@ function main(): Promise<number> | number {
   try {
     store = new WorkflowStore(args.positionals[0] ?? "WORKFLOW.md", log);
     if (!dryRun) {
-      entry = register(args.values["runner-id"] ?? runnerId(store.path), store.path, store.workflow.config);
+      entry = register(
+        args.values["runner-id"] ?? runnerId(store.path),
+        store.path,
+        store.workflow.config,
+        process.pid,
+        args.values.reservation,
+      );
       const registered = entry;
       store.onValidate((next) => assertUnchanged(next.config, registered));
     }
