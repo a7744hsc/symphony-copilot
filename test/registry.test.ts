@@ -396,6 +396,52 @@ test("configuration inputs cannot alias another runner input or managed log", ()
   }
 });
 
+test("a runner cannot place its own configuration or managed state in its workspace", () => {
+  const dir = base();
+  const env = environment(dir);
+  const previousState = process.env.SYMPHONY_STATE_DIR;
+  const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+  process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+  process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+  try {
+    const inputRoot = join(dir, "input-root");
+    const nestedWorkflow = join(inputRoot, "WORKFLOW.md");
+    mkdirSync(inputRoot, { recursive: true });
+    writeFileSync(nestedWorkflow, workflowText(inputRoot, 44, "nested workflow"));
+    assert.throws(
+      () => register("self-input", nestedWorkflow, buildConfig(loadWorkflow(nestedWorkflow).config, nestedWorkflow)),
+      /configuration input .* overlaps its workspace/,
+    );
+
+    const stateRoot = join(dir, "state-root");
+    const stateWorkflow = join(dir, "state-workflow.md");
+    writeFileSync(stateWorkflow, workflowText(stateRoot, 45, "state prompt"));
+    process.env.SYMPHONY_STATE_DIR = join(stateRoot, "GH-1");
+    assert.throws(
+      () => register("self-state", stateWorkflow, buildConfig(loadWorkflow(stateWorkflow).config, stateWorkflow)),
+      /managed state .* overlaps its workspace/,
+    );
+    assert.equal(existsSync(join(stateRoot, "GH-1")), false);
+
+    process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+    const logPromptWorkflow = join(dir, "self-log-workflow.md");
+    const ownLog = join(env.SYMPHONY_STATE_DIR!, "logs", "self-log.log");
+    writeFileSync(logPromptWorkflow, reviewWorkflowText(join(dir, "self-log-root"), 46, ownLog));
+    mkdirSync(join(env.SYMPHONY_STATE_DIR!, "logs"), { recursive: true });
+    writeFileSync(ownLog, "review prompt");
+    assert.throws(
+      () => register("self-log", logPromptWorkflow, buildConfig(loadWorkflow(logPromptWorkflow).config, logPromptWorkflow)),
+      /configuration input .* aliases its managed state/,
+    );
+    assert.equal(readFileSync(ownLog, "utf8"), "review prompt");
+  } finally {
+    if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+    else process.env.SYMPHONY_STATE_DIR = previousState;
+    if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
+  }
+});
+
 test("managed state writes cannot enter another runner workspace in either startup order", async () => {
   const dir = base();
   const normal = environment(dir, "shared-state");

@@ -120,7 +120,7 @@ symphony run --id jobs ~/code/jobs/WORKFLOW.md  # 前台运行，Ctrl-C 停止
 
 省略工作流路径时会复用最近启动的工作流。`status` 不带 ID 时会列出所有 runner。只有一个 runner 正在运行，或没有 runner 运行且只有一个已注册 runner 时，`logs` 和 `stop` 可以省略 ID，以兼容原来的单工作流用法；否则必须指定 ID。在 macOS 上，`start` 还会在对应 runner 运行期间阻止 Mac 自动休眠。
 
-每个 runner 都有独立的配置进程、位于 `workspace.root` 的运行账本、`~/symphony-workspaces/logs/<id>.log` 日志和工作区。设置 `SYMPHONY_STATE_DIR` 可以移动日志和最近工作流记录；主机级所有权注册表仍保存在操作系统用户的主目录下，因此更改状态目录无法绕过冲突检查。ID 不区分大小写。正在运行的 runner 必须使用文件系统层面不同的配置输入（`WORKFLOW.md` 和 `review.prompt_file`）及实际日志文件，并使用互不重叠的工作区路径；配置输入和托管状态不能位于其他 runner 的工作区内，配置输入也不能指向其他 runner 的托管日志或状态文件。互不相关的 runner 仍可共享常规状态/日志目录。两个 runner 不能管理同一个 GitHub Project：在没有安全的共享卡片认领机制时，它们可能重复派发同一张卡片，所以第二个 runner 会在启动时被拒绝，并说明冲突 runner 的 ID。请先停止第一个 runner，或让第二个工作流使用其他 Project。
+每个 runner 都有独立的配置进程、位于 `workspace.root` 的运行账本、`~/symphony-workspaces/logs/<id>.log` 日志和工作区。设置 `SYMPHONY_STATE_DIR` 可以移动日志和最近工作流记录；主机级所有权注册表仍保存在操作系统用户的主目录下，因此更改状态目录无法绕过冲突检查。ID 不区分大小写。正在运行的 runner 必须使用文件系统层面不同的配置输入（`WORKFLOW.md` 和 `review.prompt_file`）及实际日志文件，并使用互不重叠的工作区路径；配置输入和托管状态不能位于任何 runner（包括自身）的工作区内，配置输入也不能指向任何 runner 的托管日志或状态文件。互不相关的 runner 仍可共享常规状态/日志目录。两个 runner 不能管理同一个 GitHub Project：在没有安全的共享卡片认领机制时，它们可能重复派发同一张卡片，所以第二个 runner 会在启动时被拒绝，并说明冲突 runner 的 ID。请先停止第一个 runner，或让第二个工作流使用其他 Project。
 
 ## 配置
 

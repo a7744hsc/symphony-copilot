@@ -276,7 +276,7 @@ function reservationLive(entry: RunnerReservation): boolean {
 
 function candidate(id: string, workflow: string, config: ServiceConfig, state = stateDir()): Omit<RunnerRecord, "pid" | "started"> {
   const normalizedId = normalizeId(id);
-  return {
+  const next = {
     id: normalizedId,
     workflow: canonical(workflow),
     inputs: [workflow, ...(config.review ? [config.review.promptFile] : [])].map(canonical),
@@ -285,6 +285,23 @@ function candidate(id: string, workflow: string, config: ServiceConfig, state = 
     state,
     log: canonical(join(state, "logs", `${normalizedId}.log`)),
   };
+  assertSelfContained(next);
+  return next;
+}
+
+function assertSelfContained(next: Omit<RunnerRecord, "pid" | "started">): void {
+  if (inputPaths(next).some((path) => overlaps(next.root, path))) {
+    throw new Error(`configuration input for runner "${next.id}" overlaps its workspace; keep workflow and prompt files outside runner workspaces`);
+  }
+  if (inputPaths(next).some((path) => managedFiles(next).some((managed) => samePath(path, managed)))) {
+    throw new Error(`configuration input for runner "${next.id}" aliases its managed state; keep workflow and prompt files separate from runner logs and state`);
+  }
+  if (
+    managedPaths(next.state).some((path) => pathsOverlap(path, next.root))
+    || pathsOverlap(runnerLog(next), next.root)
+  ) {
+    throw new Error(`managed state for runner "${next.id}" overlaps its workspace; set SYMPHONY_STATE_DIR outside runner workspaces`);
+  }
 }
 
 function assertAvailable(
