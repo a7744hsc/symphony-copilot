@@ -15,8 +15,8 @@ macOS/Linux 上可以选择把 `symphony` 放到 PATH：`ln -s "$PWD/bin/symphon
 ln -s "$PWD/bin/symphony" /usr/local/bin/symphony   # 可选：把 symphony 命令放到 PATH 上
 ```
 - **本地运行。** agent 就在你电脑上的目录里干活，用你的编译器、SDK、模拟器、数据库和有授权的工具。不用准备容器、虚拟机或 runner。
-- **零额外成本。** 不要 API key，不要云主机，不耗 Actions 分钟数。会话走你现有的 Copilot 套餐，和 Copilot CLI 一样计量；每张卡片有[运行上限](#运行上限)，花费有封顶。[^cost]
-- **看板就是界面。** 把卡片拖到 Todo，PR 就会出现，卡片同时移到 Human Review。拖到 Rework，agent 会读审核意见接着改。
+- **使用现有 Copilot 套餐。** 不要 API key，不要云主机，不耗 Actions 分钟数。会话和 Copilot CLI 一样计量；每张卡片的[运行上限](#运行上限)限制启动会话数，不保证费用或总耗时封顶。[^cost]
+- **看板就是界面。** 从 Todo 开始，拿回等待人工审核的 PR，也可先经过独立 AI 审核。需要继续修改时，留言后把等待中的卡片放回 Todo。
 - **默认有护栏。** 只能写工作区内的文件；shell 命令要在白名单里；不能联网；令牌不交给 agent；推送只能通过调度器的 `tracker_submit_for_review` 工具。
 - **小而易读。** 约 2400 行 TypeScript，不用编译，60 多个单元测试。
 
@@ -30,15 +30,17 @@ flowchart LR
   B --> C["每个 Issue 一个工作区<br/>克隆 + 分支 agent/N"]
   C --> D["Copilot 会话<br/>多轮"]
   D -->|tracker_submit_for_review| E["推送分支<br/>开 PR"]
-  E --> F[卡片：Human Review]
+  E --> R[可选 AI Review]
+  R -->|通过或未启用审核| F[卡片：Human Review]
+  R -->|经 Rework 继续| D
   F -->|你合并| G[Done]
-  F -->|你拖回 Rework| D
+  F -->|你放回 Todo| A
 ```
 
-1. 给 Issue 打上 `agent` 标签，把卡片放进活跃列（比如 Todo）。
+1. 给 Issue 打上 `agent` 标签，把卡片放进 `tracker.provider.start_state`（比如 Todo），不按活跃列的排列顺序推断入口。
 2. symphony-copilot 领取卡片，为它建工作区（示例工作流里，`after_create` hook 会克隆仓库并切到 `agent/<编号>`），然后用 `WORKFLOW.md` 里的提示词启动 Copilot 会话。
-3. agent 干活、跑检查、提交，然后调用 `tracker_submit_for_review`。调度器推送分支，开一个会关闭该 Issue 的 PR，把卡片移到 Human Review。
-4. 你来审核。合并后卡片进入 Done；或者拖回 Rework，agent 会在同一个工作区里带着你的审核意见继续。
+3. agent 干活、跑检查、提交，然后调用 `tracker_submit_for_review`。调度器推送分支，开一个会关闭该 Issue 的 PR，把完整交接记录写进 Issue；启用独立审核时进入 AI Review，否则进入 Human Review。
+4. 你来审核。合并 PR 或关闭 Issue 才算完成。需要继续工作时，留言后把等待中的卡片放回 Todo，保留工作区和历史、重新获得会话额度。In Progress、Rework、AI Review 由调度器管理，不要手动移入或移出。
 
 ## 对比
 
@@ -81,11 +83,14 @@ symphony setup-board      # 按 WORKFLOW.md 新建看板，并把看板编号写
 
 | 状态 | 含义 |
 |---|---|
-| Todo、In Progress、Rework | 活跃：调度器会在这些卡片上运行 agent |
-| AI Review | 活跃：另一个 agent 审核 PR（见[独立审核](#独立审核)） |
+| Todo | 明确的启动／重新授权入口（`start_state`） |
+| In Progress、Rework | 调度器管理的实现和自动返工；In Progress 对应必填 `working_state` |
+| AI Review | 调度器管理的独立审核（见[独立审核](#独立审核)） |
 | Human Review | 交接：等你处理 |
-| Blocked | agent 需要帮助，会先在 Issue 下留言 |
-| Done、Canceled | 终止：删除工作区；如果 agent 还在运行就立即删，否则在调度器下次启动时删 |
+| Blocked | 必需的等待列（`blocked_state`）：需要人工、启动失败、无进展或会话耗尽，Issue 中保留原因 |
+| Done、Canceled | 人工合并／关闭后的终态；按终态清理工作区，AI 批准不是终态 |
+
+状态归属是接入时的工作约定，不是 GitHub 权限锁。人工只从等待列（Human Review／Blocked）移回 Todo 重新授权；其他看板自动化不得替人把已有卡片送回 Todo。
 
 GitHub Project workflows（项目工作流）独立于 `WORKFLOW.md`，也可能自动改变卡片状态。由于 GitHub 没有公开 API 可供 `setup-board` 配置或启用这些 workflow，上手时不需要修改它们。如果卡片状态意外变化或跳过了 Symphony 阶段，可以到项目网页的 **Workflows** 页面检查已启用的 workflow；它可能是原因之一。
 
@@ -126,15 +131,13 @@ symphony run                                  # 在当前终端前台运行，Ct
 
 - `agent.continuation_prompt`：之后每一轮开头发送的消息，可用变量 `issue`、`turn`、`max_turns`。
 - `agent.max_sessions`：见[运行上限](#运行上限)。
-- `agent.usage_comments`（默认 `true`）：每个会话结束后，调度器在 Issue 下留言，写明结果、模型和调用次数、轮次、耗时、改动行数、AI credits（本会话和本次运行）以及 token。同样的摘要总会以 `session summary` 写进日志。
+- `agent.usage_comments`（默认 `true`）：尽力在本次 Issue 结果消息末尾补一行，不另发纯用量评论：`用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx`。显示本会话 AI credits、已启动会话序号／上限和实际模型（可多个），不是配置中的 `auto` 或累计费用。指标缺失、更新失败时可以没有尾行，不做持久化补写队列。详细指标仍记入 `session summary` 日志；关闭尾行不影响必要的失败说明。
 
 `copilot` 块是本实现特有的：
 
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `model`、`reasoning_effort` | 运行时默认 | 传给 Copilot 会话 |
-| `max_ai_credits_per_issue` | 无上限 | 每张卡片每次运行的 AI credits 预算，由调度器执行，见[运行上限](#运行上限) |
-| `max_ai_credits` | 无上限 | 由 Copilot 运行时执行的单个会话上限。运行时会把用量告诉模型，测试中模型因此偷工；建议改用 `max_ai_credits_per_issue`。 |
 | `shell_allow` | 内置列表 | 在内置的 git 和文件工具**之外**额外允许的命令 |
 | `shell_deny` | 内置列表 | 在内置列表之外额外禁止的命令；禁止优先 |
 | `read_allow` | 无 | 工作区之外允许 agent 读取的目录 |
@@ -151,16 +154,21 @@ GitHub Project 适配器的设置、agent 工具、错误分类，以及规范�
 
 ## 运行上限
 
-“一次运行”指一张卡片的一段连续工作：从卡片被派发开始，到调度器看到卡片离开活跃列为止（交接审核、受阻、完成，或被你移走）。按规范，只要卡片还在活跃列就会不断开新会话，一张始终不交接的卡片可能无限花钱。所以调度器对每次运行设两个上限：
+一次授权覆盖同一 Issue 的实现、审核和自动返工，也包括进入人工审核后的自动冲突退回。只有一个共享会话上限：
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `agent.max_sessions` | 5 | 每次运行最多几个 Copilot 会话。一个会话在跑满 `max_turns` 轮或 agent 停下时结束。 |
-| `copilot.max_ai_credits_per_issue` | 无上限 | 每次运行的 AI credits，按每次模型调用实时累计，一到预算就停下会话。 |
+| `agent.max_sessions` | 20 | 每次 Issue 授权内成功创建的 SDK 会话总数，实现者与审核者合计；不是 20 对实现／审核，也不是模型请求数或会话内 turn 数 |
 
-碰到上限时，调度器停下 agent，在 Issue 下留言说明这次运行用了多少，如果设了 `tracker.provider.blocked_state` 就把卡片移过去。工作区保留。把卡片拖回活跃列就开始新的一次运行，上限重新计算；交接后返工也一样。
+每次 `createSession` 成功扣一次，即使首条提示随后失败也计数。创建会话前的工作区准备、hook 或启动失败，会记录阶段和错误并暂停到必填的 `tracker.provider.blocked_state`，不扣次数、不无限重试；启动结果不确定则暂停核对，不猜作免费。最后一次已启动会话可以完成，但不会超额再启动；实现提交后若没有审核额度，会明确标为未审核并进入 Blocked，不冒充通过。
 
-模型永远看不到这两个上限。用量保存在 `workspace.root` 下的 `.symphony-ledger.json`，重启调度器不会清零。无人值守运行时，请两个上限和 `blocked_state` 都设上。
+人工把等待中的卡片（Blocked／Human Review）移回 `start_state`（Todo）才重新授权：重置会话额度和无进展计数，不丢弃分支、工作区、Issue 历史或累计用量。自动 Rework／冲突退回、暂停和重启都不重置。控制状态保存在 `workspace.root` 下的 `.symphony-ledger.json`。
+
+启动结果不确定是普通看板恢复的例外：移回 Todo 或重启宿主不能证明旧 runtime 已停止。只有原运行器确认启动请求已结束、清理成功后才解除持久化保护。若宿主在此前崩溃，任务保持暂停，需要核实残留 runtime 和账本后人工恢复；不要删除账本来绕过保护。
+
+费用只记录给人看，不作为停止阈值。没有绝对总耗时上限；启动和静默超时仍用于运行保护。接入默认显式设并发为 1、模型为 `auto`；提高并发可能增加用量。
+
+**旧工作流迁移：** 补齐 `tracker.provider.start_state`、`working_state`、`blocked_state`；删除 `copilot.max_ai_credits`、`copilot.max_ai_credits_per_issue`、`review.max_rounds`（现在会报配置错误），从审核模板删除 `max_review_rounds`。详见[参考文档](docs/reference.md#prompt-templates)。
 
 ## 独立审核
 
@@ -169,20 +177,21 @@ GitHub Project 适配器的设置、agent 工具、错误分类，以及规范�
 ```yaml
 review:
   states: [AI 审查]
-  prompt_file: REVIEW.md      # Liquid 模板；变量 issue、attempt、review_round、max_review_rounds、implementer_workspace
-  model: gpt-6-sol            # 最好和实现者不是同一家模型
+  prompt_file: REVIEW.md      # Liquid 模板；变量 issue、attempt、review_round、implementer_workspace
+  model: auto                # 固定 ID 仅用用户提供或已验证账号可用的值
   pass_state: 待验证
   fail_state: 返工
-  max_rounds: 3               # 最后一轮仍不通过，卡片进 pass_state，由人决定
 ```
 
 审核者：
 
 - 每次都是新会话，看不到实现者的思考过程；
 - 在自己的工作区（`<issue>-review`）里工作。`SYMPHONY_ROLE` 为 `review` 时，由你的 `before_run` hook 把它重置到已推送的分支；可以读实现者的工作区，但不能改；
-- 不能推送、不能开 PR，只能用 `tracker_submit_review` 结束：在 PR 和 Issue 上发出结论，并移动卡片。
+- 不能 commit、推送或开 PR，只能用 `tracker_submit_review` 结束：先保存完整 Issue 记录，再镜像到 PR 并交接。
 
-卡片在实现和审核之间切换时，正在跑的会话会结束，另一个角色在新会话里开始。整个“实现—审核”来回算一次运行，[运行上限](#运行上限)同样管得住。GitHub 不允许 PR 的作者批准或要求修改自己的 PR，所以结论体现在卡片状态和评论式审核里。
+审核者提供被检查的 SHA、有证据的进展判断和具体下一步。批准进入 Human Review；首次发现可修问题或返工有进展可以继续，首次经审核的无进展返工要换方法，连续两次则暂停到 Blocked。只有正式提交且实际审核过的返工才计数，初审问题和基础设施失败不算停滞。缺少验证条件时用 `unable_to_verify` 明确交给人工并进入 Blocked，不当作批准或无进展。调度器执行这些规则及剩余会话额度，不设独立审核轮数上限。
+
+换角色会启动新会话，消耗一个共享名额。`review_round` 只是审核序号，与 SDK turn 和会话总次数分开。GitHub 不允许 PR 作者批准或要求修改自己的 PR，所以结论体现在卡片状态和评论式审核里。两个角色都要把处理过的人工 PR 意见及关键约束写进 Issue 交接；这不代表系统自动同步每条人工评论。
 
 ## 合并冲突
 
@@ -195,6 +204,8 @@ merge_conflicts:
 ```
 
 GitHub 报告 `states` 中某张可派发卡片的 PR 有冲突时，调度器把卡片移到 `return_state`，留言说明原因，并排在所有卡片之前派发（不打断正在跑的 agent）。agent 合并基准分支、解决冲突、重跑检查后再次提交，结果和其他改动一样要经过审核。`tracker_submit_for_review` 会拒绝与基准分支冲突的 HEAD，所以卡片不会在列之间原地来回。想自己解决冲突，就在卡片等你的时候去掉 `agent` 标签。
+
+自动冲突退回沿用原额度，不能重启已暂停或耗尽次数的工作。`return_state` 不得是 Todo，冲突监测列也不得包含 Blocked。
 
 ## 安全模型
 

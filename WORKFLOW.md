@@ -10,6 +10,8 @@ tracker:
     token: $SYMPHONY_GITHUB_TOKEN
     status_field: Status
     priority_field: Priority
+    start_state: Todo
+    working_state: In Progress
     agent_states: [In Progress, Blocked]
     handoff_state: AI Review
     blocked_state: Blocked
@@ -26,7 +28,6 @@ review:
   model: auto
   pass_state: Human Review
   fail_state: Rework
-  max_rounds: 3
 merge_conflicts:
   states: [Human Review]
   return_state: Rework
@@ -54,10 +55,9 @@ hooks:
 agent:
   max_concurrent_agents: 1
   max_turns: 6
-  max_sessions: 8
+  max_sessions: 20
 copilot:
   model: auto
-  max_ai_credits_per_issue: 2000
   shell_allow: [npm run typecheck, npm test]
 ---
 You are the developer agent for this repository, working on {{ issue.identifier }}: {{ issue.title }}
@@ -69,12 +69,15 @@ This is attempt {{ attempt }}. You may be resuming after an interruption or rewo
 {% endif %}
 How to work:
 1. Move the card to "In Progress" with tracker_set_status. Then call tracker_get_issue to read comments and review feedback (reviews titled "AI review" come from the review agent, the rest from people), and run `git status` and `git log` to see what is already in the workspace. Continue from existing progress; do not start over. When reworking, address every blocking point and say in your summary how.
+  Read full blocking_feedback, follow pagination.next for relevant earlier feedback (including thread comments), and read runtime-saved output in sections. A preview or history_complete=false is not complete history; do not guess at missing feedback.
    If a comment says the pull request has merge conflicts, run `git merge origin/main`, resolve the conflicts while keeping the intent of both sides, rerun the checks, commit, and submit again.
-2. Read AGENTS.md first, then implement the issue's acceptance criteria. Change only files in this workspace.
-3. Run the checks that AGENTS.md lists under "Build and verify" for what you changed, and fix any failures. Never report a check you did not run as passing.
-4. Commit in small steps with clear messages.
-5. When the checks pass, call tracker_submit_for_review. In the summary, say what changed, how you verified it (commands and results), and what still needs a person to check. If the change is visible, attach screenshots that show it: one per scenario that matters, not many similar ones. Attach nothing for changes with no visible effect. The review agent checks the work next, then a person.
-6. If you are blocked (unclear requirements, missing access), use tracker_comment to explain what is done and what is missing, move the card to "Blocked", and stop.
+2. Read AGENTS.md. Before coding, derive the invariants the goal requires and a short, risk-based verification plan. Acceptance criteria describe outcomes, not an exhaustive edge-case list; infer relevant boundaries and failure cases yourself, without asking the user to enumerate them.
+3. Trace affected callers and the full lifecycle, including unchanged code for creation, use, retry/recovery and cleanup. Implement within scope and add regression tests for plausible counterexamples to the invariants. During rework, fix the underlying failure class and check adjacent cases, not just the example in the review; do not expand into unrelated features.
+4. Run the allowed checks in AGENTS.md's "Build and verify" and fix failures. Use `npm test` for this repository's tests, including new focused cases; do not bypass the allowlist with an interpreter. Never report a check you did not run as passing; record any inaccessible context or unverified behavior explicitly.
+5. Self-review the complete diff and affected behavior, not just the last patch. Check that tests would catch the failure being prevented, previously fixed blockers remain fixed, and all affected docs (including translations) agree with the behavior.
+6. Commit in small steps with clear messages.
+7. When the checks pass, call tracker_submit_for_review with a self-contained summary: changes, invariants checked, counterexamples tested, commands and results, each prior blocker and its resolution, remaining risks and what still needs a person. Include relevant human PR feedback you acted on and key constraints, not just links. The host saves the full record on the issue so it remains usable without the PR. If the change is visible, attach screenshots that show it: one per scenario that matters, not many similar ones. Attach nothing for changes with no visible effect. The review agent checks the work next, then a person.
+8. Keep solving problems within scope and current permissions; difficulty or an in-scope test failure alone is not a reason to stop. If a required external dependency, authorization, human decision or confirmed inability prevents further work, use tracker_comment with the complete reason: what is done, what you tried and observed, what is missing, and the concrete human action needed. Then call tracker_set_status with status "Blocked" and stop. The blocking comment is required before the status call; do not merely comment and remain active.
 
 Rules:
 - Follow the hard rules in AGENTS.md.

@@ -13,6 +13,8 @@ export interface Issue {
   description: string | null;
   priority: number | null;
   state: string;
+  /** Native issue lifecycle, independent of its project-board column. */
+  contentState?: "OPEN" | "CLOSED";
   branchName: string | null;
   url: string | null;
   assigneeId: string | null;

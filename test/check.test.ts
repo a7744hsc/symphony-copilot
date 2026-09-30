@@ -41,7 +41,7 @@ const everyKey = {
     provider: {
       owner: "me", owner_type: "user", project_number: 1, repo: "me/app", token: "$TOKEN", endpoint: "https://api.github.com/graphql",
       status_field: "Status", priority_field: "Priority", identifier_prefix: "GH-", branch_prefix: "agent/", agent_states: ["In Progress", "Blocked"],
-      handoff_state: "AI Review", blocked_state: "Blocked", evidence_branch: "evidence",
+      start_state: "Todo", working_state: "In Progress", handoff_state: "AI Review", blocked_state: "Blocked", evidence_branch: "evidence",
       followups: { labels: ["tech-debt"], state: "Todo", priority: "P4", max_per_session: 2 },
     },
     required_labels: ["agent"],
@@ -56,13 +56,13 @@ const everyKey = {
     max_concurrent_agents_by_state: { Todo: 1 }, continuation_prompt: "go on",
   },
   copilot: {
-    cli_path: "/bin/copilot", model: "auto", reasoning_effort: "high", max_ai_credits: 10, max_ai_credits_per_issue: 20,
+    cli_path: "/bin/copilot", model: "auto", reasoning_effort: "high",
     startup_timeout_ms: 1, turn_timeout_ms: 1, stall_timeout_ms: 0, shell_allow: ["npm test"], shell_deny: ["rm"],
     read_allow: ["/opt"], url_allow: ["https://example.test"], user_input_reply: "decide yourself",
   },
   review: {
     states: ["AI Review"], prompt_file: "REVIEW.md", model: "m", reasoning_effort: "high",
-    pass_state: "Human Review", fail_state: "Rework", max_rounds: 2, continuation_prompt: "keep reviewing",
+    pass_state: "Human Review", fail_state: "Rework", continuation_prompt: "keep reviewing",
   },
   merge_conflicts: { states: ["Human Review"], return_state: "Rework" },
 };
@@ -76,6 +76,26 @@ test("the schema lists exactly the keys the orchestrator reads", () => {
   assert.deepEqual([...read].filter((p) => !paths.has(p)).sort(), [], "read by the code but missing from the schema");
   assert.deepEqual([...paths].filter((p) => !read.has(p)).sort(), [], "in the schema but never read");
   assert.deepEqual(unknownKeys(everyKey), []);
+});
+
+test("provider settings and runtime expose the same trimmed lifecycle mappings", () => {
+  const raw = structuredClone(everyKey);
+  raw.tracker.provider.start_state = " Todo ";
+  raw.tracker.provider.working_state = " In Progress ";
+  raw.tracker.provider.blocked_state = " Blocked ";
+  raw.tracker.provider.handoff_state = " AI Review ";
+  const config = buildConfig(raw, "/repo/WORKFLOW.md", {});
+  const settings = parseSettings(config.tracker.provider, { TOKEN: "t" });
+  for (const key of ["startState", "workingState", "blockedState", "handoffState"] as const) {
+    assert.equal(config.tracker[key], settings[key]);
+    assert.equal(settings[key], settings[key]?.trim());
+  }
+  for (const key of ["start_state", "working_state", "blocked_state"]) {
+    for (const value of [undefined, null, " ", 42]) {
+      assert.throws(() => parseSettings({ ...raw.tracker.provider, [key]: value }, { TOKEN: "t" }),
+        new RegExp(`tracker.provider.${key} is required`));
+    }
+  }
 });
 
 function workflowFile(frontMatter: string, body = "Work on {{ issue.identifier }}: {{ issue.title }}", files: Record<string, string> = {}): string {
@@ -93,6 +113,8 @@ tracker:
     owner: me
     project_number: 1
     repo: me/app
+    start_state: Todo
+    working_state: In Progress
     handoff_state: Human Review
     blocked_state: Blocked
   required_labels: [agent]
@@ -122,6 +144,23 @@ test("misspelled keys are errors with a suggestion", () => {
   assert.ok(found.includes("error: agent.colour: unknown key"));
 });
 
+test("removed limits have actionable offline migration errors", () => {
+  for (const [section, key] of [["copilot", "max_ai_credits"], ["copilot", "max_ai_credits_per_issue"], ["review", "max_rounds"]]) {
+    const found = messages(workflowFile(`${base}\n${section}:\n  ${key}: null\n`));
+    const migration = found.filter((m) => m.includes(`${section}.${key}`) && m.includes("removed") && m.includes("agent.max_sessions"));
+    assert.equal(migration.length, 1, found.join("\n"));
+  }
+});
+
+test("missing provider mappings and automatic returns to Todo fail offline too", () => {
+  for (const key of ["start_state", "working_state", "blocked_state"]) {
+    const found = messages(workflowFile(base.replace(new RegExp(`    ${key}: [^\\n]+\\n`), "")));
+    assert.ok(found.some((m) => m.includes(`tracker.provider.${key} is required`)), found.join("\n"));
+  }
+  const found = messages(workflowFile(base.replace("handoff_state: Human Review", "handoff_state: Todo")));
+  assert.ok(found.some((m) => m.includes("handoff_state") && m.includes("start_state")), found.join("\n"));
+});
+
 test("column roles that would loop or bypass limits are errors", () => {
   const path = workflowFile(base
     .replace("handoff_state: Human Review", "handoff_state: Rework")
@@ -142,18 +181,28 @@ review:
   fail_state: AI Review
 `;
   const found = messages(workflowFile(review, undefined, { "REVIEW.md": "Review {{ issue.identifier }} round {{ review_round }}" }));
-  assert.ok(found.includes('warning: tracker.provider.handoff_state "Human Review" is not a review state: submissions skip the review agent'), found.join("\n"));
   assert.ok(found.includes('error: review.pass_state "Todo" must not be an active state: approved work would be picked up again'));
   assert.ok(found.includes('error: review.fail_state "AI Review" must be an active state worked by the implementer'));
-  assert.ok(found.some((m) => m.startsWith("warning: hooks.before_run does not look at SYMPHONY_ROLE")));
+  const valid = messages(workflowFile(review.replace("pass_state: Todo", "pass_state: Human Review").replace("fail_state: AI Review", "fail_state: Rework"), undefined,
+    { "REVIEW.md": "Review {{ issue.identifier }} round {{ review_round }}" }));
+  assert.ok(valid.includes('warning: tracker.provider.handoff_state "Human Review" is not a review state: submissions skip the review agent'), valid.join("\n"));
+  assert.ok(valid.some((m) => m.startsWith("warning: hooks.before_run does not look at SYMPHONY_ROLE")));
 });
 
 test("templates are rendered with a sample issue, including conditional branches", () => {
-  const found = messages(workflowFile(`${base}\nreview:\n  states: [Rework]\n  prompt_file: MISSING.md\n  pass_state: Human Review\n  fail_state: Todo\n`, "Work on {{ issue.identifer }}"));
+  const found = messages(workflowFile(`${base}\nreview:\n  states: [Rework]\n  prompt_file: MISSING.md\n  pass_state: Human Review\n  fail_state: In Progress\n`, "Work on {{ issue.identifer }}"));
   assert.ok(found.some((m) => m.startsWith("error: prompt:") && m.includes("identifer")), found.join("\n"));
   assert.ok(found.some((m) => m.startsWith("error: review.prompt_file") && m.includes("MISSING.md does not exist")));
   const branch = messages(workflowFile(base, "Work on {{ issue.identifier }}\n{% if attempt %}Attempt {{ attemps }}{% endif %}"));
   assert.ok(branch.some((m) => m.startsWith("error: prompt:") && m.includes("attemps")), branch.join("\n"));
+});
+
+test("review templates retain the review sequence, not a separate round cap", () => {
+  const front = `${base}\nreview:\n  states: [Rework]\n  prompt_file: REVIEW.md\n  pass_state: Human Review\n  fail_state: In Progress\n`;
+  const valid = messages(workflowFile(front, undefined, { "REVIEW.md": "Review {{ issue.identifier }} round {{ review_round }} in {{ implementer_workspace }}" }));
+  assert.deepEqual(valid.filter((m) => m.startsWith("error:")), []);
+  const removed = messages(workflowFile(front, undefined, { "REVIEW.md": "Review {{ review_round }} of {{ max_review_rounds }}" }));
+  assert.ok(removed.some((m) => m.startsWith("error: review.prompt_file:") && m.includes("max_review_rounds")), removed.join("\n"));
 });
 
 test("a board that does not exist yet and a literal token are warnings", () => {

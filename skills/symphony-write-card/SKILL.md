@@ -11,12 +11,12 @@ An agent works from the issue alone, so the card has to say what done means and 
 
 ## 1. Read the setup
 
-- `WORKFLOW.md` at the repository root: `tracker.provider.owner`, `project_number`, `repo`, `status_field`, `priority_field`, `tracker.required_labels` (the dispatch label) and `tracker.active_states` (new work starts in the first one). If `project_number` is empty, stop: the board does not exist yet; the symphony-onboard skill explains the setup.
+- `WORKFLOW.md` at the repository root: `tracker.provider.owner`, `project_number`, `repo`, `status_field`, `priority_field`, `tracker.provider.start_state` (the explicit start column) and `tracker.required_labels` (the dispatch label). If `project_number` or `start_state` is empty, stop and fix onboarding; do not infer a start column from active-state order.
 - AGENTS.md, "Build and verify": the commands the card can refer to.
 
 ## 2. Understand the request
 
-Look at the code involved so the card names real files, commands and behavior. Ask the user only what you cannot find out: intent, priorities, edge cases.
+Look at the code involved so the card names real files, commands and behavior. Infer relevant invariants and edge cases yourself; ask the user only for missing intent, priorities or decisions, not an exhaustive case list.
 
 ## 3. Size it
 
@@ -61,7 +61,9 @@ Use `gh`, logged in as the user:
 3. `gh project view <project_number> --owner <owner> --format json --jq .id` returns the project id, and `gh project field-list <project_number> --owner <owner> --format json` the field and option ids.
 4. Set the priority, and the status when starting now: `gh project item-edit --id <item id> --project-id <project id> --field-id <field id> --single-select-option-id <option id>`.
 
-Starting now means the first active column and the dispatch label. Otherwise leave the status empty or pick a column that is not active: without the label, or outside the active columns, no agent starts. If the card must wait for another issue, say so in Notes and mark it as blocked by that issue on GitHub; the orchestrator waits until blockers are closed.
+Do not guess project, field or option IDs: use the returned metadata and match the configured column name exactly.
+
+Starting now means `tracker.provider.start_state` and the dispatch label. Otherwise leave the status empty or pick a waiting column without the dispatch label. Never start by moving to In Progress, Rework or AI Review; those are scheduler-managed. For an existing card, renewed authorization is a human move from a waiting column to `start_state`, not an automatic retry or conflict return. If the card must wait for another issue, say so in Notes and mark it as blocked by that issue on GitHub; the orchestrator waits until blockers are closed.
 
 ## 7. Report
 

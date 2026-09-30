@@ -1,6 +1,6 @@
 ---
 name: symphony-onboard
-description: Set up a repository so symphony-copilot agents can work on it. Reads the repository's build and test setup, asks which workflow capabilities the user wants (independent AI review, merge-conflict recovery, blocked/follow-up handling), derives board columns automatically instead of asking the user to invent them, writes WORKFLOW.md, AGENTS.md and optional REVIEW.md from templates, and validates with `symphony check`. Use when the user wants to onboard a repository, choose board workflow behavior, or write/fix WORKFLOW.md, AGENTS.md or REVIEW.md.
+description: Set up a repository so symphony-copilot agents can work on it. Reads the repository's build and test setup, asks which workflow capabilities the user wants (independent AI review, merge-conflict recovery, follow-up issues), derives board columns including mandatory Blocked, writes WORKFLOW.md, AGENTS.md and optional REVIEW.md from templates, and validates with `symphony check`. Use when the user wants to onboard a repository, choose board workflow behavior, or write/fix WORKFLOW.md, AGENTS.md or REVIEW.md.
 ---
 
 <!-- Installed by symphony-copilot install-skills from $SYMPHONY_HOME. Rerun it after updating symphony-copilot. -->
@@ -35,16 +35,16 @@ Users should not have to know Symphony's internal state machine or invent a boar
 Ask:
 
 - Independent AI review before a person reviews/merges the PR? Explain the extra model usage/latency; human approval before merge remains final either way. If enabled, use reviewer model `auto` by default: Copilot chooses a model available to this account. Ask this as a normal-language question, not a technical model picker. Do not present a picker of guessed model IDs or ask the user to recognize names they may not know. Configure a fixed reviewer model only if the user explicitly requests it and provides an ID, or you have verified that exact ID is available to their Copilot account. A different model family can improve independence, but never invent an ID to achieve that.
-- Automatically detect PR merge conflicts while a PR waits for a person and return the card to the implementer? Recommend Yes; if No, explain a person can move it back manually.
-- A visible Blocked lane when an agent hits a run limit or cannot proceed? Recommend Yes; if No, omit the column and explain the card remains paused until a person intervenes.
+- Automatically detect PR merge conflicts while a PR waits for a person and return the card to the implementer? Recommend Yes; if No, explain a person can return a waiting card to Todo after leaving instructions.
 - Let agents file low-priority follow-up issues for unrelated problems? Recommend No if issue noise is a concern; when Yes, explain follow-ups use `tech-debt` and P4 and do not receive the dispatch label, so never start automatically. Clarify this is separate from the issue form below.
-- Implementer model defaults to `auto` (Copilot selects an available model). Do not present an unverified model list. If the user requests a fixed model, use an ID they provide or one verified as available; otherwise keep `auto`. Also ask concurrent agents (default 1), sessions per card/run (default 8), and per-card AI-credit budget; review rounds count toward it.
-- Per-card AI-credit budget: recommend 1000 credits per run as the starting cap; it covers implementer and reviewer calls together and the run halts at the cap. Explain that higher caps permit more work but may incur more usage, and let the user lower or raise it.
+- Implementer model defaults to `auto` (Copilot selects an available model). Do not present an unverified model list. If the user requests a fixed model, use an ID they provide or one verified as available; otherwise keep `auto`. Ask concurrent agents (onboarding default 1) and total started sessions per card authorization (default 20, implementer and reviewer combined, not 20 pairs). Costs are recorded for people, not used as a stopping threshold; do not ask for a credit budget.
 - Board owner only if it cannot be inferred: default to repository owner; `gh api users/<owner> --jq .type` distinguishes user from organization.
 - Dispatch label (default `agent`); only issues with this label are eligible.
 - Add an optional GitHub task issue form? Recommend Yes. Explain it only adds a structured New issue form for human-written tasks (goal, acceptance, verification, scope, notes); it does not create, label, dispatch, or start issues. This is distinct from agent-generated follow-up issues.
 
 Use the user's conversation language for questions and generated column names. Do not ask for individual column names. Show the derived lane plan after the capability answers; the user may ask to rename lanes. Keep chosen names consistent in WORKFLOW.md, REVIEW.md and the handoff summary.
+
+Explain the fixed behavior, not as optional questions: Blocked is mandatory. A successful SDK session creation consumes one session; workspace/hook/runtime startup failures before that pause without charging or endless retry. Approval goes to Human Review; a human-only blocker, two consecutive reviewed no-progress reworks or the shared session limit pauses in Blocked. Initial review and infrastructure failures are not no-progress reworks. No credit cap or absolute elapsed-time cap is provided.
 
 ### Derive columns from the selected behavior
 
@@ -52,12 +52,12 @@ Use these default names, localized to the user's language when appropriate, in t
 
 | Role | Default column | Mapping |
 |---|---|---|
-| New work | Todo | First `tracker.active_states` item; requires the dispatch label |
-| Implementation | In Progress | Implementer active state; `tracker.provider.agent_states` |
+| New work / renewed authorization | Todo | Required `tracker.provider.start_state`; requires the dispatch label, independent of active-state order |
+| Implementation | In Progress | Required `tracker.provider.working_state`; scheduler-managed implementer state |
 | Rework | Rework | Add when either independent AI review or conflict recovery is enabled; review failures and/or conflicted PRs return here |
 | Independent check | AI Review | Only with independent AI review; `review.states` and handoff state |
 | Human decision | Human Review | Always; direct handoff without AI review, pass state with it; conflict-wait state if enabled |
-| Blocked | Blocked | Only if selected; `tracker.provider.blocked_state`; allow agents to set it |
+| Blocked | Blocked | Always; required `tracker.provider.blocked_state`; allow implementers to set it after commenting with the reason |
 | Complete | Done, Canceled | `tracker.terminal_states`; keep Done first for closed/merged automation |
 
 Generate config consistently from the answers:
@@ -70,14 +70,16 @@ Generate config consistently from the answers:
   | Off | On | `[Todo, In Progress, Rework]` |
   | Off | Off | `[Todo, In Progress]` |
 
-- AI review on: include AI Review and Rework in `active_states`; hand off to AI Review; pass to Human Review; fail to Rework; include `review` and generate REVIEW.md. On the last failed round the runtime hands the card to Human Review. Rework is needed even if conflict recovery is off.
+- AI review on: include AI Review and Rework in `active_states`; hand off to AI Review; pass to Human Review; fail to Rework when the host allows continuation; include `review` and generate REVIEW.md. Review numbering is a sequence, not a separate cap. Rework is needed even if conflict recovery is off.
 - AI review off: omit `review` and REVIEW.md; hand off directly to Human Review; omit AI Review. Include Rework only if conflict recovery is on.
 - Conflict recovery on: include Rework in `active_states` and set `merge_conflicts.states: [Human Review]`, `return_state: Rework`. If off, omit `merge_conflicts`; when AI review is also off, omit Rework.
-- Blocked lane on: add the Blocked column, set `blocked_state: Blocked`, and include Blocked in `agent_states`. When the visible lane is off, omit both Blocked and `blocked_state`; adapt the prompt to have the agent comment with the blocker and stop without trying to set a Blocked status. The orchestrator still records the run limit and waits for a person to move the card.
+- Always set `start_state: Todo`, `working_state: In Progress`, `blocked_state: Blocked`; Blocked is a waiting column, never active, terminal or monitored for conflicts. Automatic review/conflict return must not target Todo.
 - Follow-ups on: configure `followups` with `state: Todo`, `labels: [tech-debt]`, and `priority: P4`; never attach the dispatch label. Todo is the human intake queue; an issue is not picked up until a person explicitly labels it for dispatch.
-- Set `terminal_states: [Done, Canceled]`. `agent_states` contains only statuses an agent may set directly: `[In Progress]`, plus Blocked if selected. Do not list every active state; AI Review, Rework, Human Review and terminal states are set by submission/review/orchestrator tools, not `tracker_set_status`.
+- Set `terminal_states: [Done, Canceled]` and `agent_states: [In Progress, Blocked]`. Do not list every active state; AI Review, Rework and Human Review are set by submission/review/orchestrator tools, not `tracker_set_status`. Terminal means a person merges the PR or closes the issue, not an AI approval.
 
-Before writing, show a compact preview, for example: “AI reviewer: on; conflict return: on; blocked lane: on; task issue form: yes; columns: Todo → In Progress → Rework → AI Review → Human Review → Blocked → Done → Canceled.” Then generate from this plan; do not copy the full-featured example unchanged.
+Before writing, show a compact preview, for example: “AI reviewer: on; conflict return: on; Blocked: required; task issue form: yes; columns: Todo → In Progress → Rework → AI Review → Human Review → Blocked → Done → Canceled.” Then generate from this plan; do not copy the full-featured example unchanged.
+
+Teach state ownership as a working agreement, not a GitHub permission lock: people start new work in Todo and return existing cards only from a waiting column (Blocked/Human Review) to Todo. This renews the session allowance and clears the no-progress streak, preserving work and issue history. Do not manually move cards into or out of In Progress, Rework or AI Review. Automatic conflict return to Rework does not reset anything and cannot restart paused or exhausted work; restarting Symphony does not reset it either. Other board automation must not send existing cards to Todo as if a person had authorized them.
 
 ## 3. Write WORKFLOW.md
 
@@ -86,6 +88,7 @@ Start from the templates and change only what this repository needs and the user
 - Leave `project_number:` empty. `symphony setup-board` creates the board later and writes the number.
 - Apply the derived lane plan from step 2. Remove the `review` section and do not create REVIEW.md when independent AI review is off. Do not keep unused Rework or AI Review columns. Use each selected column name consistently; `symphony setup-board` creates exactly the states named by WORKFLOW.md. `symphony check` enforces these rules:
   - review states are also in `active_states`, and one of them is `handoff_state`;
+  - required `start_state` and `working_state` are distinct implementer active columns; no automatic return or agent status targets `start_state`;
   - `review.pass_state` is a waiting column, not an active one;
   - `review.fail_state` and `merge_conflicts.return_state` are active columns the implementer works;
   - `blocked_state` is not active and not in `merge_conflicts.states`;
@@ -93,7 +96,9 @@ Start from the templates and change only what this repository needs and the user
 - `hooks.after_create`: keep the template's single-branch clone and branch switch, then install dependencies (hooks have network access; agents do not) and copy local-only files. `hooks.before_run`: keep the fetch and the reviewer reset. Replace `main` with the default branch in the hooks and the prompt.
 - `copilot.shell_allow`: the exact build, test and lint commands, as prefixes, for example `npm test` or `swift test`. Do not add entries that run arbitrary code: `node`, `python3`, `bash`, `sh`, `npx`, or a bare `npm run`. git and basic file commands are built in.
 - `workspace.root`: `~/symphony-workspaces/<repository name>`, outside the repository.
-- The prompt: keep the template's steps and rules, replace every example state with the generated localized name, and make verify fit this repository. If the Blocked lane is off, replace instructions to move a card to Blocked with “comment with the blocker and stop”; if follow-ups are off, remove the instruction to file follow-up issues; if conflict recovery is off, say a person must move a conflicted PR back to an implementation state. The PR-submission/handoff step stays enabled even when AI review is off.
+- The prompt: keep the template's steps and rules, replace every example state with the generated localized name, and make verify fit this repository. Preserve the required blocking comment then `tracker_set_status` exit for missing external dependencies, authorization or confirmed inability; in-scope failures still need solving. If follow-ups are off, remove the instruction to file follow-up issues; if conflict recovery is off, say a person can return a waiting card to Todo. The PR-submission/handoff step stays enabled even when AI review is off.
+- Use `agent.max_sessions: 20` unless the user chooses otherwise. Remove obsolete credit-cap and review-round-cap keys; costs belong only in detailed logs and a best-effort issue-result footer, e.g. `用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx` with actual model usage. Missing metrics or a failed footer update may leave no footer; there is no separate usage comment or durable footer retry queue.
+- Preserve the implementer's responsibility to infer invariants and edge cases from the goal and code, trace the affected lifecycle (including unchanged callers and cleanup), test counterexamples, and fix the underlying failure class on rework. Do not ask users to enumerate edge cases. Keep the instructions to follow feedback pagination and read saved output fully rather than relying on previews.
 
 ## 4. Write AGENTS.md
 
@@ -102,6 +107,10 @@ If the repository has one, keep it and add only what is missing: a "Build and ve
 ## 5. Write REVIEW.md only when selected
 
 If independent AI review is on, start from the template, point its verify step at AGENTS.md's "Build and verify", and keep the rule that changes to WORKFLOW.md, REVIEW.md, AGENTS.md or CI go to a person. If review is off, do not create a REVIEW.md just to satisfy the example; the human-review handoff still remains.
+
+Retain independent risk-based review, whole-change coverage before a verdict, explicit unverified areas, and evidence-backed findings rather than speculative requirements. Name this repository's existing test-discovery path and allowed test command so the reviewer can create new disposable regression tests in its own clone, run them, and remove them without changing implementation, existing tests, scripts or permissions. Include this narrow scratch-test allowance in AGENTS.md's "Build and verify"; do not grant bare interpreter access or introduce a new test framework just for review.
+
+Keep the structured `tracker_submit_review` fields from the template: exact `reviewed_head`, `progress`, `progress_reason`, `next_action` and `next_step`, plus verdict, summary and blockers. Follow the runner's initial/rework context; unavailable verification uses `unable_to_verify`, `not_assessed`, `human_required` and a concrete human action (SHA may be null), never just a comment and stop. Preserve complete implementation/review/blocking handoffs on the issue, including relevant human PR feedback and constraints; do not rely on PR links alone or promise automatic copying of every human comment.
 
 ## 6. Apply the issue-form choice
 

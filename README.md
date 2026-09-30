@@ -13,8 +13,8 @@ Symphony's idea is "manage work, not agents": you write issues, and an orchestra
 
 - **Symphony with Copilot inside.** Polling, one workspace per issue, multi-turn sessions, reconciliation with the board, stall detection, retries with backoff, and a `WORKFLOW.md` that reloads on save, as the spec describes.
 - **Local runtime.** Agents work in folders on your computer, with your compilers, SDKs, simulators, databases and licensed tools. There are no containers, VMs or runners to set up.
-- **$0 extra.** No API keys, cloud machines or Actions minutes. Sessions draw on your existing Copilot plan, the same way Copilot CLI does, and per-card [run limits](#run-limits) cap what any one card can spend.[^cost]
-- **The board is the UI.** Move a card to Todo and a pull request appears, with the card moved to Human Review. Move the card to Rework and the agent reads the review and continues.
+- **Uses your Copilot plan.** No API keys, cloud machines or Actions minutes. Sessions draw on your existing Copilot plan, the same way Copilot CLI does. Per-card [run limits](#run-limits) cap started sessions, not cost or elapsed time.[^cost]
+- **The board is the UI.** Start a card in Todo and get a pull request for Human Review, optionally after independent AI review. To request more work, leave feedback and return the waiting card to Todo.
 - **Guardrails by default.** Writes stay inside the workspace. Shell commands must be on an allowlist. Network access is off. Tokens are never passed to the agent. The only way to push is the orchestrator's `tracker_submit_for_review` tool.
 - **Small and readable.** About 2,400 lines of TypeScript with no build step, and 60+ unit tests.
 
@@ -28,15 +28,17 @@ flowchart LR
   B --> C["Workspace per issue<br/>clone + branch agent/N"]
   C --> D["Copilot session<br/>multi-turn"]
   D -->|tracker_submit_for_review| E["Push branch<br/>open PR"]
-  E --> F[Card: Human Review]
+  E --> R[Optional AI Review]
+  R -->|approved or review disabled| F[Card: Human Review]
+  R -->|continue via Rework| D
   F -->|you merge| G[Done]
-  F -->|you move it to Rework| D
+  F -->|you return it to Todo| A
 ```
 
-1. You label an issue `agent` and put its card in an active column (for example Todo).
+1. You label an issue `agent` and put its card in `tracker.provider.start_state` (for example Todo), regardless of active-column order.
 2. symphony-copilot claims the card, creates a workspace for it (in the example workflow, the `after_create` hook clones the repo and checks out `agent/<number>`), and starts a Copilot session with the prompt from `WORKFLOW.md`.
-3. The agent works, runs your checks, commits, and calls `tracker_submit_for_review`. The orchestrator pushes the branch, opens a PR that closes the issue, and moves the card to Human Review.
-4. You review. Merge, and the card goes to Done. Or move the card to Rework, and the agent picks it up again in the same workspace, with your review comments.
+3. The agent works, runs your checks, commits, and calls `tracker_submit_for_review`. The orchestrator pushes the branch, opens a PR that closes the issue, saves the full handoff on the issue, and moves the card to AI Review if enabled, otherwise Human Review.
+4. You review. Merge the PR or close the issue to finish. For more work, leave comments and return the waiting card to Todo; the agent keeps the workspace and history with a fresh session allowance. In Progress, Rework and AI Review are scheduler-managed: do not move cards into or out of them manually.
 
 ## Compared with
 
@@ -79,11 +81,14 @@ Commit the files, so the prompt is versioned with your code. The board gets thes
 
 | Status | Meaning |
 |---|---|
-| Todo, In Progress, Rework | Active: the orchestrator runs an agent on these cards |
-| AI Review | Active: a second agent reviews the pull request (see [Independent review](#independent-review)) |
+| Todo | Explicit start/reauthorization entry (`start_state`) |
+| In Progress, Rework | Scheduler-managed implementation and automatic rework; In Progress maps to required `working_state` |
+| AI Review | Scheduler-managed independent review (see [Independent review](#independent-review)) |
 | Human Review | Handoff: the work waits for you |
-| Blocked | The agent needs help; it comments on the issue first |
-| Done, Canceled | Terminal: the workspace is deleted, right away if an agent is still running, otherwise the next time the orchestrator starts |
+| Blocked | Required waiting lane (`blocked_state`): needs human action, startup failure, no progress or exhausted sessions; the issue records the reason |
+| Done, Canceled | Terminal after a person merges/closes; workspace cleanup follows the terminal state, not an AI approval |
+
+State ownership is an onboarding working agreement, not a GitHub permission lock. People renew authorization only by moving a waiting card (Human Review/Blocked) to Todo; other board automation must not do this for existing cards.
 
 GitHub Project workflows are separate from `WORKFLOW.md` and may change card statuses automatically. `setup-board` cannot configure or enable them because GitHub's public API does not expose workflow configuration; you do not need to change them during onboarding. If a card changes status unexpectedly or skips a Symphony stage, inspect the enabled workflows on the project's **Workflows** page; one may be responsible.
 
@@ -124,15 +129,13 @@ The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their
 
 - `agent.continuation_prompt`: the message sent at the start of each later turn (variables `issue`, `turn` and `max_turns`).
 - `agent.max_sessions`: see [Run limits](#run-limits).
-- `agent.usage_comments` (default `true`): after every session, the orchestrator comments on the issue with the outcome, model and number of model calls, turns, time, lines changed, AI credits (this session and this run) and tokens. The same summary is always logged as `session summary`.
+- `agent.usage_comments` (default `true`): best-effort usage footer on the session's issue result, not a separate usage-only comment: `用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx`. It shows this session's AI credits, started-session ordinal/limit and actual model(s), not configured `auto` or cumulative cost. Missing metrics or a failed update may omit it; there is no durable footer retry queue. Detailed metrics remain in `session summary` logs; disabling the footer does not suppress necessary failure reports.
 
 The `copilot` block is specific to this implementation:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `model`, `reasoning_effort` | Runtime default | Passed to the Copilot session |
-| `max_ai_credits_per_issue` | No limit | AI credit budget per card per run, enforced by the orchestrator (see [Run limits](#run-limits)) |
-| `max_ai_credits` | No limit | Per-session cap enforced by the Copilot runtime. The runtime tells the model how much it has used, which made agents cut corners in testing; prefer `max_ai_credits_per_issue`. |
 | `shell_allow` | Built-in list | Commands to allow **in addition to** the built-in git and file tools |
 | `shell_deny` | Built-in list | Commands to deny in addition to the built-in list. Deny always wins. |
 | `read_allow` | None | Directories outside the workspace that the agent may read |
@@ -149,16 +152,21 @@ See [docs/reference.md](docs/reference.md) for the GitHub Project adapter settin
 
 ## Run limits
 
-A *run* is one stretch of work on a card. It starts when the card is dispatched and ends when the orchestrator sees the card outside the active columns: handed off, blocked, done, or moved by you. The spec keeps starting sessions for as long as a card stays active, so a card that never hands off could spend credits forever. The orchestrator enforces two limits per run:
+One authorization covers implementation, review and automatic rework for an issue, including conflict returns after a human-review handoff. There is one shared session limit:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `agent.max_sessions` | 5 | Copilot sessions per run. A session ends after `max_turns` turns or when the agent stops. |
-| `copilot.max_ai_credits_per_issue` | No limit | AI credits per run, counted live from every model call. The session is stopped as soon as the budget is reached. |
+| `agent.max_sessions` | 20 | Successfully created SDK sessions, implementer and reviewer combined, per issue authorization—not 20 implement/review pairs, model requests or in-session turns |
 
-When a run reaches a limit, the orchestrator stops the agent, comments on the issue with what the run used, and moves the card to `tracker.provider.blocked_state` if you set one. The workspace is kept. Moving the card back to an active column starts a new run with fresh limits, and so does rework after a handoff.
+Each successful `createSession` consumes one slot, even if the first prompt later fails. Workspace preparation, hooks or startup failures before session creation pause in required `tracker.provider.blocked_state` with the stage/error, without consuming a slot or retrying endlessly. Uncertain startup is paused for reconciliation, not guessed to be free. The last started session may finish, but no next session starts beyond the cap; an implementation submitted with no review capacity is explicitly blocked as unreviewed, not approved.
 
-The model is never told about these limits. Usage is saved in `.symphony-ledger.json` under `workspace.root`, so restarting the orchestrator does not reset it. For unattended use, set both limits and a `blocked_state`.
+Renew authorization by moving a waiting card (Blocked/Human Review) to `start_state` (Todo). This resets the allowance and no-progress streak, not the branch, workspace, issue history or cumulative usage. Automatic Rework/conflict transitions, pauses and restarts do not reset it. Control state is persisted in `.symphony-ledger.json` under `workspace.root`.
+
+An unresolved startup is an exception to ordinary board recovery: Todo and restarting the host cannot prove that an old runtime stopped. The owning runner clears the durable fence only after the startup request settles and cleanup succeeds. If the host crashed first, keep the task paused and verify the residual runtime and ledger before manual recovery; do not delete the ledger to bypass the fence.
+
+Costs are recorded for people, never a stopping threshold. There is no absolute elapsed-time cap; startup and inactivity timeouts remain operational protections. Onboarding explicitly sets concurrency to 1 and models to `auto`; higher concurrency can increase usage.
+
+**Migrating an older workflow:** add explicit `tracker.provider.start_state`, `working_state` and `blocked_state`; remove `copilot.max_ai_credits`, `copilot.max_ai_credits_per_issue` and `review.max_rounds` (now configuration errors), and remove `max_review_rounds` from review templates. See the [reference](docs/reference.md#prompt-templates).
 
 ## Independent review
 
@@ -167,20 +175,21 @@ Optionally, every submission goes through a second agent before a human sees it.
 ```yaml
 review:
   states: [AI Review]
-  prompt_file: REVIEW.md      # Liquid; variables: issue, attempt, review_round, max_review_rounds, implementer_workspace
-  model: gpt-6-sol            # ideally a different model family from the implementer
+  prompt_file: REVIEW.md      # Liquid; variables: issue, attempt, review_round, implementer_workspace
+  model: auto                # use a fixed ID only when provided or verified for your account
   pass_state: Human Review
   fail_state: Rework
-  max_rounds: 3               # after the last round, a failing card goes to pass_state for a human to decide
 ```
 
 The reviewer:
 
 - starts in a new session, so it never sees the implementer's reasoning;
 - works in its own workspace (`<issue>-review`), which your `before_run` hook resets to the pushed branch when `SYMPHONY_ROLE` is `review`; it may read the implementer's workspace but not change it;
-- cannot push or open pull requests. Its only way to finish is `tracker_submit_review`, which posts the verdict on the PR and the issue and moves the card.
+- cannot commit, push or open pull requests. Its only way to finish is `tracker_submit_review`, which saves a complete issue record before mirroring to the PR and handing off.
 
-When a card moves between implementation and review, the running session ends and the other role starts in a new one. The whole implement-and-review loop counts as one run, so the [run limits](#run-limits) cap it too. GitHub does not let a PR's author approve or request changes on it, so the verdict is the card's state plus a comment review.
+The reviewer supplies the checked SHA, evidence-backed progress and a concrete next step. Approval goes to Human Review. A fixable initial finding or a rework making progress can continue; the first reviewed no-progress rework gets a changed approach, two consecutive ones pause in Blocked. Only formally submitted and reviewed rework counts—initial findings and infrastructure failures do not. Missing verification uses `unable_to_verify` and a human-required Blocked handoff, not approval or a stagnation strike. The host enforces these rules and remaining sessions, not a fixed number of reviews.
+
+When roles change, a new session starts and consumes one shared slot. `review_round` is only a review sequence number, separate from SDK turns and total sessions. GitHub does not let a PR's author approve or request changes on it, so the verdict is the card's state plus a comment review. Both roles include relevant human PR feedback and constraints in issue handoffs; this is not automatic copying of every human comment.
 
 ## Merge conflicts
 
@@ -193,6 +202,8 @@ merge_conflicts:
 ```
 
 When GitHub reports the pull request of a routable card in `states` as conflicting, the orchestrator moves the card to `return_state`, comments why, and dispatches it before every other card (running agents are not interrupted). The agent merges the base branch, resolves the conflicts, reruns the checks and submits again, and the result goes through review like any other change. `tracker_submit_for_review` refuses a HEAD that would conflict with the base branch, so a card cannot bounce between columns without progress. To resolve a conflict yourself, remove the `agent` label while the card waits.
+
+Automatic conflict return preserves the same allowance and cannot restart paused or exhausted work. Never use Todo as `return_state`, or include Blocked in conflict-monitoring states.
 
 ## Safety model
 
