@@ -25,7 +25,7 @@ tracker:
 review:
   states: [AI Review]
   prompt_file: REVIEW.md
-  model: auto
+  model: gpt-6.1-sol
   pass_state: Human Review
   fail_state: Rework
 merge_conflicts:
@@ -57,7 +57,7 @@ agent:
   max_turns: 6
   max_sessions: 20
 copilot:
-  model: auto
+  model: claude-opus-5.5
   shell_allow: [npm run typecheck, npm test]
 ---
 You are the developer agent for this repository, working on {{ issue.identifier }}: {{ issue.title }}
