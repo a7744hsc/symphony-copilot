@@ -106,17 +106,21 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 | `--once` | 只轮询一次，等派发出去的 agent 结束后退出。 |
 | `--log-level` | `debug`、`info`（默认）、`warn` 或 `error`。日志是输出到 stderr 的 `key=value` 行。 |
 
-**也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，第一次用过工作流路径后就记住它，并且拒绝启动第二个调度器：
+**也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，并管理多个相互隔离的 runner。每个工作流默认使用由规范路径生成的稳定 ID；也可以用 `--id` 指定易记的名字：
 
 ```sh
-symphony start ~/code/your-repo/WORKFLOW.md   # 后台运行；之后直接 `symphony start`
-symphony status                               # 有没有在跑、最近一次轮询和最近的事件
-symphony logs                                 # 实时看日志
-symphony stop                                 # 停止 agent 和调度器，工作区保留
-symphony run                                  # 在当前终端前台运行，Ctrl-C 停止
+symphony start --id api ~/code/api/WORKFLOW.md
+symphony start --id web ~/code/web/WORKFLOW.md
+symphony status                 # 列出所有已注册的 runner
+symphony status api             # 只看 api 的进程、最近轮询和事件
+symphony logs api               # 只实时看 api 的日志
+symphony stop api               # 只停止 api，保留它的工作区
+symphony run --id jobs ~/code/jobs/WORKFLOW.md  # 前台运行，Ctrl-C 停止
 ```
 
-后台运行的日志在 `~/symphony-workspaces/logs/orchestrator.log`；设置 `SYMPHONY_STATE_DIR` 可以把日志和 PID 文件放到别处。在 macOS 上，`start` 还会在调度器运行期间阻止 Mac 自动休眠。
+省略工作流路径时会复用最近启动的工作流。`status` 不带 ID 时会列出所有 runner。只有一个已注册 runner 时，`logs` 和 `stop` 也可以省略 ID，以兼容原来的单工作流用法；否则必须指定 ID。在 macOS 上，`start` 还会在对应 runner 运行期间阻止 Mac 自动休眠。
+
+每个 runner 都有独立的配置进程、位于 `workspace.root` 的运行账本、`~/symphony-workspaces/logs/<id>.log` 日志和工作区。设置 `SYMPHONY_STATE_DIR` 可以移动 runner 注册表和日志。正在运行的 runner 必须使用互不重叠的工作区根目录和不同 ID。两个 runner 不能管理同一个 GitHub Project：在没有安全的共享卡片认领机制时，它们可能重复派发同一张卡片，所以第二个 runner 会在启动时被拒绝，并说明冲突 runner 的 ID。请先停止第一个 runner，或让第二个工作流使用其他 Project。
 
 ## 配置
 

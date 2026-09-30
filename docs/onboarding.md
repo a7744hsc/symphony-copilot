@@ -142,7 +142,20 @@ See what the orchestrator would do, then start it:
 ```sh
 node <symphony-copilot>/src/cli.ts WORKFLOW.md --dry-run --once   # read-only: which cards would run
 symphony start WORKFLOW.md                                       # in the background
+symphony status
 symphony logs
 ```
 
 After every session the orchestrator comments on the issue with what the session did and used. When the agent submits, the card moves to AI Review, then to Human Review for you. Merge the pull request, or move the card to Rework with your comments.
+
+To run more workflows on this host, give each a stable name and a separate `workspace.root`:
+
+```sh
+symphony start --id api ~/code/api/WORKFLOW.md
+symphony start --id web ~/code/web/WORKFLOW.md
+symphony status api
+symphony logs web
+symphony stop api
+```
+
+Runner configuration, ledgers, logs, and workspaces stay isolated. `status` without an ID lists every runner; `logs` and `stop` may omit the ID when only one runner is registered. Two active runners may not use overlapping workspace roots or manage the same GitHub Project. The latter is rejected because shared card claiming is not safe; stop the existing runner or use a different project.
