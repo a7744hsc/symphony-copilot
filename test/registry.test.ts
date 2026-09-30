@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { buildConfig } from "../src/config.ts";
 import { RunLedger } from "../src/ledger.ts";
 import { assertUnchanged, canonical, live, record, register, runnerId, validateId } from "../src/registry.ts";
-import { WorkflowStore } from "../src/workflow.ts";
+import { loadWorkflow, WorkflowStore } from "../src/workflow.ts";
 import { captureLog } from "./helpers.ts";
 
 const bin = resolve("bin/symphony");
@@ -38,6 +38,21 @@ tracker:
   active_states: [Todo]
   terminal_states: [Done]
 workspace: { root: ${JSON.stringify(root)} }
+---
+${prompt}`;
+const reviewWorkflowText = (root: string, project: number, promptFile: string, prompt = "implementation prompt") =>
+  `---
+tracker:
+  kind: github_project
+  provider: { owner: Fixture, project_number: ${project}, repo: fixture/repo }
+  active_states: [Todo, AI Review]
+  terminal_states: [Done]
+workspace: { root: ${JSON.stringify(root)} }
+review:
+  states: [AI Review]
+  prompt_file: ${JSON.stringify(promptFile)}
+  pass_state: Human Review
+  fail_state: Rework
 ---
 ${prompt}`;
 
@@ -245,7 +260,7 @@ test("Unicode-equivalent workspace paths cannot share a ledger on normalization-
   }
 });
 
-test("workflow files cannot be owned inside another runner workspace in either startup order", () => {
+test("configuration inputs cannot be owned inside another runner workspace in either startup order", () => {
   for (const workspaceRunnerFirst of [true, false]) {
     const dir = base();
     const env = environment(dir);
@@ -266,12 +281,52 @@ test("workflow files cannot be owned inside another runner workspace in either s
 
       if (workspaceRunnerFirst) {
         registerAlpha();
-        assert.throws(registerBeta, /workflow path .* overlaps .* workspace/);
+        assert.throws(registerBeta, /configuration input .* overlaps .* workspace/);
       } else {
         registerBeta();
-        assert.throws(registerAlpha, /workflow path .* overlaps .* workspace/);
+        assert.throws(registerAlpha, /configuration input .* overlaps .* workspace/);
       }
       assert.equal(readFileSync(workflowB, "utf8"), "prompt b");
+    } finally {
+      if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+      else process.env.SYMPHONY_STATE_DIR = previousState;
+      if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+      else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
+    }
+  }
+});
+
+test("review prompts cannot be deleted by another runner workspace in either startup order", () => {
+  for (const workspaceRunnerFirst of [true, false]) {
+    const dir = base();
+    const env = environment(dir);
+    const previousState = process.env.SYMPHONY_STATE_DIR;
+    const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+    process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+    try {
+      const rootA = join(dir, "alpha-workspaces");
+      const issueWorkspace = join(rootA, "GH-1");
+      const workflowA = join(dir, "alpha.md");
+      const workflowB = join(dir, "beta.md");
+      const reviewPrompt = join(issueWorkspace, "REVIEW.md");
+      mkdirSync(issueWorkspace, { recursive: true });
+      writeFileSync(workflowA, workflowText(rootA, 34, "prompt a"));
+      writeFileSync(workflowB, reviewWorkflowText(join(dir, "beta-workspaces"), 35, reviewPrompt));
+      writeFileSync(reviewPrompt, "review prompt");
+      const alphaConfig = buildConfig(loadWorkflow(workflowA).config, workflowA);
+      const betaConfig = buildConfig(loadWorkflow(workflowB).config, workflowB);
+      const registerAlpha = () => register("prompt-alpha", workflowA, alphaConfig);
+      const registerBeta = () => register("prompt-beta", workflowB, betaConfig);
+
+      if (workspaceRunnerFirst) {
+        registerAlpha();
+        assert.throws(registerBeta, /configuration input .* overlaps .* workspace/);
+      } else {
+        registerBeta();
+        assert.throws(registerAlpha, /configuration input .* overlaps .* workspace/);
+      }
+      assert.equal(readFileSync(reviewPrompt, "utf8"), "review prompt");
     } finally {
       if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
       else process.env.SYMPHONY_STATE_DIR = previousState;
@@ -347,6 +402,36 @@ test("host ownership survives state relocation and rejected starts do not contam
   }
 });
 
+test("an aliased runner log is rejected before startup writes to its owner", async () => {
+  for (const alias of ["symlink", "hard link"]) {
+    const dir = base();
+    const env = environment(dir);
+    const alpha = join(dir, "alpha.md");
+    const beta = join(dir, "beta.md");
+    const rootA = join(dir, "alpha-workspaces");
+    writeFileSync(alpha, workflowText(rootA, 36, "prompt alpha"));
+    writeFileSync(beta, workflowText(join(dir, "beta-workspaces"), 37, "prompt beta").replace(", repo: fixture/repo", ""));
+    let child: ChildProcess | undefined;
+    try {
+      child = await launch(env, "log-alpha", alpha, rootA, 1);
+      const logs = join(env.SYMPHONY_STATE_DIR!, "logs");
+      mkdirSync(logs, { recursive: true });
+      const alphaLog = join(logs, "log-alpha.log");
+      const betaLog = join(logs, "log-beta.log");
+      writeFileSync(alphaLog, "alpha-only\n");
+      if (alias === "symlink") symlinkSync(alphaLog, betaLog);
+      else linkSync(alphaLog, betaLog);
+
+      const result = command(env, "run", "--id", "log-beta", beta);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /log for runner "log-beta" aliases runner "log-alpha" log/);
+      assert.equal(readFileSync(alphaLog, "utf8"), "alpha-only\n");
+    } finally {
+      if (child?.exitCode === null) child.kill("SIGTERM");
+    }
+  }
+});
+
 test("managed foreground and background startup failures retain targeted logs", async () => {
   const dir = base();
   const env = environment(dir);
@@ -407,6 +492,44 @@ test("single-runner commands work without IDs, stale PID is not treated as live,
     assert.equal(live({ ...entry, started: "not the actual start time" }), false);
   } finally {
     if (child?.exitCode === null) child.kill("SIGTERM");
+  }
+});
+
+test("reload retains a safe review prompt when the new prompt overlaps another runner workspace", () => {
+  const dir = base();
+  const env = environment(dir);
+  const previousState = process.env.SYMPHONY_STATE_DIR;
+  const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+  process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+  process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+  try {
+    const alphaWorkflow = join(dir, "reload-alpha.md");
+    const betaWorkflow = join(dir, "reload-beta.md");
+    const alphaRoot = join(dir, "reload-alpha-workspaces");
+    const betaRoot = join(dir, "reload-beta-workspaces");
+    const safePrompt = join(dir, "safe-review.md");
+    const unsafePrompt = join(alphaRoot, "GH-1", "REVIEW.md");
+    mkdirSync(join(alphaRoot, "GH-1"), { recursive: true });
+    writeFileSync(alphaWorkflow, workflowText(alphaRoot, 38, "alpha prompt"));
+    writeFileSync(safePrompt, "safe review");
+    writeFileSync(unsafePrompt, "unsafe review");
+    writeFileSync(betaWorkflow, reviewWorkflowText(betaRoot, 39, safePrompt));
+    register("reload-alpha", alphaWorkflow, buildConfig(loadWorkflow(alphaWorkflow).config, alphaWorkflow));
+    const entry = register("reload-beta", betaWorkflow, buildConfig(loadWorkflow(betaWorkflow).config, betaWorkflow));
+    const { log } = captureLog();
+    const store = new WorkflowStore(betaWorkflow, log);
+    store.onValidate((next) => assertUnchanged(next.config, entry));
+
+    writeFileSync(betaWorkflow, reviewWorkflowText(betaRoot, 39, unsafePrompt));
+    utimesSync(betaWorkflow, 2_000_000_200, 2_000_000_200);
+    assert.equal(store.refresh().config.review?.promptFile, safePrompt);
+    assert.match(store.reloadError ?? "", /configuration input .* overlaps .* workspace/);
+    store.close();
+  } finally {
+    if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+    else process.env.SYMPHONY_STATE_DIR = previousState;
+    if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
   }
 });
 

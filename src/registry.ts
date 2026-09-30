@@ -8,9 +8,11 @@ import type { ServiceConfig } from "./config.ts";
 export interface RunnerRecord {
   id: string;
   workflow: string;
+  inputs: string[];
   root: string;
   project: string;
   state: string;
+  log: string;
   pid: number;
   started: string;
 }
@@ -178,6 +180,18 @@ function pathKey(path: string): string {
   return isCaseInsensitive(resolved) ? normalized.toLowerCase() : normalized;
 }
 
+function samePath(a: string, b: string): boolean {
+  if (pathKey(a) === pathKey(b)) return true;
+  try {
+    const first = statSync(a);
+    const second = statSync(b);
+    return first.dev === second.dev && first.ino === second.ino;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 export function projectKey(config: ServiceConfig): string {
   if (config.tracker.kind !== "github_project") throw new Error(`unsupported tracker ${config.tracker.kind}`);
   const p = config.tracker.provider;
@@ -235,6 +249,14 @@ function managedPaths(state: string): string[] {
   return [join(state, "logs"), join(state, ".last-workflow")];
 }
 
+function inputPaths(entry: Pick<RunnerRecord, "workflow"> & Partial<Pick<RunnerRecord, "inputs">>): string[] {
+  return entry.inputs ?? [entry.workflow];
+}
+
+function runnerLog(entry: Pick<RunnerRecord, "id" | "state"> & Partial<Pick<RunnerRecord, "log">>): string {
+  return entry.log ?? canonical(join(entry.state, "logs", `${entry.id}.log`));
+}
+
 function reservationFile(dir: string, id: string): string {
   return join(dir, `${id}.reservation.json`);
 }
@@ -248,13 +270,16 @@ function reservationLive(entry: RunnerReservation): boolean {
   return pidStart(entry.ownerPid) === entry.ownerStarted && entry.ownerStarted !== "";
 }
 
-function candidate(id: string, workflow: string, config: ServiceConfig): Omit<RunnerRecord, "pid" | "started"> {
+function candidate(id: string, workflow: string, config: ServiceConfig, state = stateDir()): Omit<RunnerRecord, "pid" | "started"> {
+  const normalizedId = normalizeId(id);
   return {
-    id: normalizeId(id),
+    id: normalizedId,
     workflow: canonical(workflow),
+    inputs: [workflow, ...(config.review ? [config.review.promptFile] : [])].map(canonical),
     root: canonical(config.workspace.root),
     project: projectKey(config),
-    state: stateDir(),
+    state,
+    log: canonical(join(state, "logs", `${normalizedId}.log`)),
   };
 }
 
@@ -265,24 +290,32 @@ function assertAvailable(
   claimToken?: string,
 ): void {
   for (const existing of [...activeRecords, ...activeReservations.filter((entry) => entry.token !== claimToken)]) {
-    if (existing.id === next.id && pathKey(existing.workflow) !== pathKey(next.workflow)) {
+    if (existing.id === next.id && !samePath(existing.workflow, next.workflow)) {
       throw new Error(`runner ID "${next.id}" belongs to ${existing.workflow}; choose a different ID for ${next.workflow}`);
     }
     if (existing.id === next.id) throw new Error(`runner "${next.id}" is already running or starting`);
-    if (pathKey(existing.workflow) === pathKey(next.workflow)) {
+    if (samePath(existing.workflow, next.workflow)) {
       throw new Error(`workflow ${next.workflow} is already running as "${existing.id}"`);
     }
     if (pathsOverlap(existing.root, next.root)) {
       throw new Error(`workspace root ${next.root} overlaps runner "${existing.id}" (${existing.root}); set a separate workspace.root`);
     }
-    if (overlaps(existing.root, next.workflow) || overlaps(next.root, existing.workflow)) {
-      throw new Error(`workflow path for runner "${next.id}" overlaps runner "${existing.id}" workspace; keep workflow files outside runner workspaces`);
+    if (
+      inputPaths(next).some((path) => overlaps(existing.root, path))
+      || inputPaths(existing).some((path) => overlaps(next.root, path))
+    ) {
+      throw new Error(`configuration input for runner "${next.id}" overlaps runner "${existing.id}" workspace; keep workflow and prompt files outside runner workspaces`);
     }
     if (
       managedPaths(next.state).some((path) => pathsOverlap(path, existing.root))
       || managedPaths(existing.state).some((path) => pathsOverlap(path, next.root))
+      || pathsOverlap(runnerLog(next), existing.root)
+      || pathsOverlap(runnerLog(existing), next.root)
     ) {
       throw new Error(`managed state for runner "${next.id}" overlaps runner "${existing.id}" workspace; set SYMPHONY_STATE_DIR outside runner workspaces`);
+    }
+    if (samePath(runnerLog(existing), runnerLog(next))) {
+      throw new Error(`log for runner "${next.id}" aliases runner "${existing.id}" log; remove the alias or choose a different state directory`);
     }
     if (existing.project === next.project) {
       throw new Error(`GitHub Project ${next.project} is already managed by runner "${existing.id}"; shared-card claiming is not supported`);
@@ -291,7 +324,7 @@ function assertAvailable(
 }
 
 function assertIdOwnership(next: Omit<RunnerRecord, "pid" | "started">, existing: RunnerRecord[]): void {
-  const owner = existing.find((entry) => entry.id === next.id && pathKey(entry.workflow) !== pathKey(next.workflow));
+  const owner = existing.find((entry) => entry.id === next.id && !samePath(entry.workflow, next.workflow));
   if (owner) throw new Error(`runner ID "${next.id}" belongs to ${owner.workflow}; choose a different ID for ${next.workflow}`);
 }
 
@@ -358,9 +391,12 @@ export function register(id: string, workflow: string, config: ServiceConfig, pi
     const allReservations = reservations(dir);
     if (reservationToken) {
       const claimed = allReservations.find((entry) => entry.token === reservationToken);
-      if (!claimed || claimed.id !== next.id || pathKey(claimed.workflow) !== pathKey(next.workflow)
+      if (!claimed || claimed.id !== next.id || !samePath(claimed.workflow, next.workflow)
         || pathKey(claimed.root) !== pathKey(next.root) || claimed.project !== next.project
-        || pathKey(claimed.state) !== pathKey(next.state) || !reservationLive(claimed)) {
+        || pathKey(claimed.state) !== pathKey(next.state) || !samePath(runnerLog(claimed), next.log)
+        || inputPaths(claimed).length !== next.inputs.length
+        || inputPaths(claimed).some((path, index) => !samePath(path, next.inputs[index]!))
+        || !reservationLive(claimed)) {
         throw new Error(`runner reservation for "${next.id}" is missing, expired, or does not match its workflow`);
       }
     }
@@ -373,7 +409,18 @@ export function register(id: string, workflow: string, config: ServiceConfig, pi
 }
 
 export function assertUnchanged(config: ServiceConfig, entry: RunnerRecord): void {
-  if (pathKey(config.workspace.root) !== pathKey(entry.root) || projectKey(config) !== entry.project) {
-    throw new Error("workspace.root and tracker project cannot change while a runner is active; stop it before changing either");
-  }
+  const next = candidate(entry.id, entry.workflow, config, entry.state);
+  locked((dir) => {
+    if (pathKey(next.root) !== pathKey(entry.root) || next.project !== entry.project) {
+      throw new Error("workspace.root and tracker project cannot change while a runner is active; stop it before changing either");
+    }
+    assertAvailable(
+      next,
+      records().filter((other) => other.id !== entry.id && live(other)),
+      reservations(dir).filter(reservationLive),
+    );
+    entry.inputs = next.inputs;
+    entry.log = next.log;
+    writeFileSync(join(dir, `${entry.id}.json`), JSON.stringify(entry) + "\n", { mode: 0o600 });
+  });
 }
