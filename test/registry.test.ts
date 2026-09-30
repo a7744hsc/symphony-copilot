@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 import { buildConfig } from "../src/config.ts";
 import { RunLedger } from "../src/ledger.ts";
-import { assertUnchanged, canonical, live, record, register, runnerId, validateId } from "../src/registry.ts";
+import { assertUnchanged, canonical, live, record, register, retainInputs, runnerId, validateId } from "../src/registry.ts";
 import { loadWorkflow, WorkflowStore } from "../src/workflow.ts";
 import { captureLog } from "./helpers.ts";
 
@@ -481,6 +481,48 @@ test("managed state writes cannot enter another runner workspace in either start
   }
 });
 
+test("ledger temporary-file aliases cannot enter another runner workspace in either startup order", () => {
+  for (const workspaceRunnerFirst of [true, false]) {
+    const dir = base();
+    const env = environment(dir);
+    const previousState = process.env.SYMPHONY_STATE_DIR;
+    const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+    process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+    try {
+      const alphaRoot = join(dir, "alpha-root");
+      const betaRoot = join(dir, "beta-root");
+      const evidence = join(alphaRoot, "GH-1", "evidence.txt");
+      const alphaWorkflow = join(dir, "temp-alpha.md");
+      const betaWorkflow = join(dir, "temp-beta.md");
+      mkdirSync(join(alphaRoot, "GH-1"), { recursive: true });
+      mkdirSync(betaRoot, { recursive: true });
+      writeFileSync(evidence, "alpha evidence");
+      symlinkSync(evidence, join(betaRoot, ".symphony-ledger.json.tmp"));
+      writeFileSync(alphaWorkflow, workflowText(alphaRoot, 53, "alpha prompt"));
+      writeFileSync(betaWorkflow, workflowText(betaRoot, 54, "beta prompt"));
+      const registerAlpha = () =>
+        register("temp-alpha", alphaWorkflow, buildConfig(loadWorkflow(alphaWorkflow).config, alphaWorkflow));
+      const registerBeta = () =>
+        register("temp-beta", betaWorkflow, buildConfig(loadWorkflow(betaWorkflow).config, betaWorkflow));
+
+      if (workspaceRunnerFirst) {
+        registerAlpha();
+        assert.throws(registerBeta, /managed state .* overlaps .* workspace/);
+      } else {
+        registerBeta();
+        assert.throws(registerAlpha, /managed state .* overlaps .* workspace/);
+      }
+      assert.equal(readFileSync(evidence, "utf8"), "alpha evidence");
+    } finally {
+      if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+      else process.env.SYMPHONY_STATE_DIR = previousState;
+      if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+      else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
+    }
+  }
+});
+
 test("host ownership survives state relocation and rejected starts do not contaminate an existing log", async () => {
   const dir = base();
   const envA = environment(dir, "state-a");
@@ -720,6 +762,49 @@ test("reload retains a safe review prompt when the new prompt overlaps another r
     assert.match(store.reloadError ?? "", /configuration input .* aliases .* managed state/);
     assert.equal(readFileSync(alphaLog, "utf8"), "alpha-only\n");
     store.close();
+  } finally {
+    if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+    else process.env.SYMPHONY_STATE_DIR = previousState;
+    if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
+  }
+});
+
+test("reload retains old prompt ownership until a dispatched snapshot releases it", () => {
+  const dir = base();
+  const env = environment(dir);
+  const previousState = process.env.SYMPHONY_STATE_DIR;
+  const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+  process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+  process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+  try {
+    const alphaWorkflow = join(dir, "lease-alpha.md");
+    const betaWorkflow = join(dir, "lease-beta.md");
+    const oldPrompt = join(dir, "old-review.md");
+    const newPrompt = join(dir, "new-review.md");
+    writeFileSync(oldPrompt, "old review");
+    writeFileSync(newPrompt, "new review");
+    writeFileSync(alphaWorkflow, reviewWorkflowText(join(dir, "lease-alpha-root"), 55, oldPrompt));
+    writeFileSync(betaWorkflow, workflowText(join(dir, "lease-beta-root"), 56, "beta prompt"));
+    const oldConfig = buildConfig(loadWorkflow(alphaWorkflow).config, alphaWorkflow);
+    const entry = register("lease-alpha", alphaWorkflow, oldConfig);
+    const release = retainInputs(oldConfig, entry);
+
+    writeFileSync(alphaWorkflow, reviewWorkflowText(join(dir, "lease-alpha-root"), 55, newPrompt));
+    const newConfig = buildConfig(loadWorkflow(alphaWorkflow).config, alphaWorkflow);
+    assert.doesNotThrow(() => assertUnchanged(newConfig, entry), "safe reload should remain available");
+    mkdirSync(join(env.SYMPHONY_STATE_DIR!, "logs"), { recursive: true });
+    symlinkSync(oldPrompt, join(env.SYMPHONY_STATE_DIR!, "logs", "lease-beta.log"));
+    assert.throws(
+      () => register("lease-beta", betaWorkflow, buildConfig(loadWorkflow(betaWorkflow).config, betaWorkflow)),
+      /configuration input .* aliases .* managed state/,
+    );
+
+    release();
+    assert.doesNotThrow(
+      () => register("lease-beta", betaWorkflow, buildConfig(loadWorkflow(betaWorkflow).config, betaWorkflow)),
+      "old prompt ownership should be released after the worker exits",
+    );
   } finally {
     if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
     else process.env.SYMPHONY_STATE_DIR = previousState;

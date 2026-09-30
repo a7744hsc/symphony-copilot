@@ -9,6 +9,8 @@ export interface RunnerRecord {
   id: string;
   workflow: string;
   inputs: string[];
+  /** Configuration inputs retained by dispatched workflow snapshots until their workers finish. */
+  inputLeases?: Record<string, number>;
   root: string;
   project: string;
   state: string;
@@ -249,8 +251,10 @@ function managedPaths(state: string): string[] {
   return [join(state, "logs"), join(state, ".last-workflow")];
 }
 
-function inputPaths(entry: Pick<RunnerRecord, "workflow"> & Partial<Pick<RunnerRecord, "inputs">>): string[] {
-  return entry.inputs ?? [entry.workflow];
+function inputPaths(
+  entry: Pick<RunnerRecord, "workflow"> & Partial<Pick<RunnerRecord, "inputs" | "inputLeases">>,
+): string[] {
+  return [...new Set([...(entry.inputs ?? [entry.workflow]), ...Object.keys(entry.inputLeases ?? {})])];
 }
 
 function runnerLog(entry: Pick<RunnerRecord, "id" | "state"> & Partial<Pick<RunnerRecord, "log">>): string {
@@ -373,12 +377,10 @@ function assertAvailable(
       throw new Error(`configuration input for runner "${next.id}" aliases runner "${existing.id}" managed state; keep workflow and prompt files separate from runner logs and state`);
     }
     if (
-      managedPaths(next.state).some((path) => pathsOverlap(path, existing.root))
-      || managedPaths(existing.state).some((path) => pathsOverlap(path, next.root))
-      || pathsOverlap(runnerLog(next), existing.root)
-      || pathsOverlap(runnerLog(existing), next.root)
+      writableFiles(next).some((entry) => pathsOverlap(entry.path, existing.root))
+      || writableFiles(existing).some((entry) => pathsOverlap(entry.path, next.root))
     ) {
-      throw new Error(`managed state for runner "${next.id}" overlaps runner "${existing.id}" workspace; set SYMPHONY_STATE_DIR outside runner workspaces`);
+      throw new Error(`managed state for runner "${next.id}" overlaps runner "${existing.id}" workspace; keep all runner writable files outside other workspaces`);
     }
     if (samePath(runnerLog(existing), runnerLog(next))) {
       throw new Error(`log for runner "${next.id}" aliases runner "${existing.id}" log; remove the alias or choose a different state directory`);
@@ -491,8 +493,55 @@ export function assertUnchanged(config: ServiceConfig, entry: RunnerRecord): voi
       records().filter((other) => other.id !== entry.id && live(other)),
       reservations(dir).filter(reservationLive),
     );
-    entry.inputs = next.inputs;
-    entry.log = next.log;
-    writeFileSync(join(dir, `${entry.id}.json`), JSON.stringify(entry) + "\n", { mode: 0o600 });
+    const current = records().find((other) =>
+      other.id === entry.id && other.pid === entry.pid && other.started === entry.started,
+    );
+    if (!current) throw new Error(`runner "${entry.id}" is no longer registered`);
+    current.inputs = next.inputs;
+    current.log = next.log;
+    writeFileSync(join(dir, `${entry.id}.json`), JSON.stringify(current) + "\n", { mode: 0o600 });
+    Object.assign(entry, current);
   });
+}
+
+/** Retains a dispatched workflow snapshot's inputs until the returned release function is called. */
+export function retainInputs(config: ServiceConfig, entry: RunnerRecord): () => void {
+  const snapshot = candidate(entry.id, entry.workflow, config, entry.state);
+  locked((dir) => {
+    assertHostRegistrySafe(snapshot, dir);
+    const allRecords = records();
+    const current = allRecords.find((other) =>
+      other.id === entry.id && other.pid === entry.pid && other.started === entry.started && live(other),
+    );
+    if (!current) throw new Error(`runner "${entry.id}" is no longer registered`);
+    assertAvailable(
+      snapshot,
+      allRecords.filter((other) => other.id !== entry.id && live(other)),
+      reservations(dir).filter(reservationLive),
+    );
+    current.inputLeases ??= {};
+    for (const path of snapshot.inputs) current.inputLeases[path] = (current.inputLeases[path] ?? 0) + 1;
+    writeFileSync(join(dir, `${entry.id}.json`), JSON.stringify(current) + "\n", { mode: 0o600 });
+    Object.assign(entry, current);
+  });
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    locked((dir) => {
+      const current = records().find((other) =>
+        other.id === entry.id && other.pid === entry.pid && other.started === entry.started,
+      );
+      if (!current?.inputLeases) return;
+      for (const path of snapshot.inputs) {
+        const count = current.inputLeases[path] ?? 0;
+        if (count <= 1) delete current.inputLeases[path];
+        else current.inputLeases[path] = count - 1;
+      }
+      if (Object.keys(current.inputLeases).length === 0) delete current.inputLeases;
+      writeFileSync(join(dir, `${entry.id}.json`), JSON.stringify(current) + "\n", { mode: 0o600 });
+      Object.assign(entry, current);
+    });
+  };
 }

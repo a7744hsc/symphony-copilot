@@ -5,7 +5,7 @@ import { scrubEnvironment } from "./env.ts";
 import { RunLedger } from "./ledger.ts";
 import { createLogger } from "./log.ts";
 import { Orchestrator } from "./orchestrator.ts";
-import { assertUnchanged, register, runnerId, type RunnerRecord } from "./registry.ts";
+import { assertUnchanged, register, retainInputs, runnerId, type RunnerRecord } from "./registry.ts";
 import { runAgentAttempt } from "./runner.ts";
 import { createTracker } from "./tracker/index.ts";
 import { WorkflowStore } from "./workflow.ts";
@@ -75,6 +75,7 @@ function main(): Promise<number> | number {
     refreshWorkflow: () => store.refresh(),
     workflowError: () => store.reloadError,
     createTracker: (config) => createTracker(config, process.env, log),
+    retainWorkflow: (workflow) => retainInputs(workflow.config, entry!),
     runWorker: async (p) => {
       const env = scrubEnvironment(process.env, p.tracker.secretEnvironmentNames());
       await runAgentAttempt({

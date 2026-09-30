@@ -70,7 +70,13 @@ interface WorkerCall {
   aborted: boolean;
 }
 
-function setup(t: TestContext, raw: Record<string, any> = {}, dryRun = false, ledger?: RunLedger) {
+function setup(
+  t: TestContext,
+  raw: Record<string, any> = {},
+  dryRun = false,
+  ledger?: RunLedger,
+  retainWorkflow?: () => () => void,
+) {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
   const config = makeConfig({ polling: { interval_ms: 3_600_000 }, ...raw });
   const workflow = makeWorkflow(config);
@@ -85,6 +91,7 @@ function setup(t: TestContext, raw: Record<string, any> = {}, dryRun = false, le
     refreshWorkflow: () => workflow,
     workflowError: () => null,
     createTracker: () => tracker,
+    retainWorkflow,
     removeWorkspace: async (_config, issue) => {
       removed.push(issue.identifier);
     },
@@ -126,6 +133,21 @@ test("dispatch order is priority, then oldest, then identifier", () => {
 
 test("retry backoff doubles from 10 s and respects the cap", () => {
   assert.deepEqual([1, 2, 3, 6].map((a) => retryDelayMs(a, 300_000)), [10_000, 20_000, 40_000, 300_000]);
+});
+
+test("dispatched workflow inputs remain retained until the worker exits", async (t) => {
+  const events: string[] = [];
+  const s = setup(t, {}, false, undefined, () => {
+    events.push("retained");
+    return () => events.push("released");
+  });
+  s.tracker.add(issue("A"));
+
+  await s.tick();
+  assert.deepEqual(events, ["retained"]);
+  s.calls[0]!.resolve();
+  await flush();
+  assert.deepEqual(events, ["retained", "released"]);
 });
 
 test("only eligible issues are dispatched, within the global limit", async (t) => {

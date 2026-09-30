@@ -27,6 +27,8 @@ export interface OrchestratorDeps {
   /** Error from the latest failed workflow reload (blocks dispatch until fixed). */
   workflowError(): string | null;
   createTracker(config: ServiceConfig): TrackerAdapter;
+  /** Retains configuration inputs used by a dispatched snapshot until its worker exits. */
+  retainWorkflow?(workflow: EffectiveWorkflow): () => void;
   runWorker(params: WorkerParams): Promise<void>;
   removeWorkspace(config: ServiceConfig, issue: Issue, tracker: TrackerAdapter): Promise<void>;
   log: Logger;
@@ -479,6 +481,7 @@ export class Orchestrator {
   }
 
   private dispatch(issue: Issue, attempt: number | null, workflow: EffectiveWorkflow, tracker: TrackerAdapter): void {
+    const releaseWorkflow = this.deps.retainWorkflow?.(workflow);
     const log = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
     const abort = new AbortController();
     const role = roleFor(workflow.config, issue.state);
@@ -500,7 +503,14 @@ export class Orchestrator {
     entry.done = Promise.resolve()
       .then(() => this.deps.runWorker({ issue, attempt, role, reviewRound, workflow, tracker, signal: abort.signal, log, onUpdate: (u) => this.onUpdate(entry, u) }))
       .then(() => this.serial(() => this.onWorkerExit(entry, null)), (error: Error) => this.serial(() => this.onWorkerExit(entry, error)))
-      .catch((error: Error) => log.error("worker exit handling failed", { error: error.message }));
+      .catch((error: Error) => log.error("worker exit handling failed", { error: error.message }))
+      .finally(() => {
+        try {
+          releaseWorkflow?.();
+        } catch (error) {
+          log.error("workflow input release failed", { error: (error as Error).message });
+        }
+      });
   }
 
   private onUpdate(entry: RunningEntry, update: AgentUpdate): void {
