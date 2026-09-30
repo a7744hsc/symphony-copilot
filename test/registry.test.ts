@@ -336,6 +336,66 @@ test("review prompts cannot be deleted by another runner workspace in either sta
   }
 });
 
+test("configuration inputs cannot alias another runner input or managed log", () => {
+  for (const firstRunner of ["alpha", "beta"]) {
+    const dir = base();
+    const env = environment(dir);
+    const previousState = process.env.SYMPHONY_STATE_DIR;
+    const previousHost = process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+    process.env.SYMPHONY_STATE_DIR = env.SYMPHONY_STATE_DIR;
+    process.env.SYMPHONY_TEST_HOST_STATE_DIR = env.SYMPHONY_TEST_HOST_STATE_DIR;
+    try {
+      const alphaWorkflow = join(dir, "input-alpha.md");
+      const betaWorkflow = join(dir, "input-beta.md");
+      const sharedPrompt = join(dir, "shared-review.md");
+      mkdirSync(join(env.SYMPHONY_STATE_DIR!, "logs"), { recursive: true });
+      writeFileSync(sharedPrompt, "shared review");
+      writeFileSync(alphaWorkflow, reviewWorkflowText(join(dir, "input-alpha-root"), 40, sharedPrompt));
+      writeFileSync(betaWorkflow, reviewWorkflowText(join(dir, "input-beta-root"), 41, sharedPrompt));
+      const alphaConfig = buildConfig(loadWorkflow(alphaWorkflow).config, alphaWorkflow);
+      const betaConfig = buildConfig(loadWorkflow(betaWorkflow).config, betaWorkflow);
+      const registerAlpha = () => register("input-alpha", alphaWorkflow, alphaConfig);
+      const registerBeta = () => register("input-beta", betaWorkflow, betaConfig);
+
+      if (firstRunner === "alpha") {
+        registerAlpha();
+        assert.throws(registerBeta, /configuration input .* aliases .* configuration input/);
+      } else {
+        registerBeta();
+        assert.throws(registerAlpha, /configuration input .* aliases .* configuration input/);
+      }
+
+      const managedWorkflow = join(dir, "managed-alpha.md");
+      const logPromptWorkflow = join(dir, "managed-beta.md");
+      const managedLog = join(env.SYMPHONY_STATE_DIR!, "logs", "managed-alpha.log");
+      writeFileSync(managedLog, "alpha-only\n");
+      writeFileSync(managedWorkflow, workflowText(join(dir, "managed-alpha-root"), 42, "managed prompt"));
+      writeFileSync(logPromptWorkflow, reviewWorkflowText(join(dir, "managed-beta-root"), 43, managedLog));
+      const managedConfig = buildConfig(loadWorkflow(managedWorkflow).config, managedWorkflow);
+      const logPromptConfig = buildConfig(loadWorkflow(logPromptWorkflow).config, logPromptWorkflow);
+      if (firstRunner === "alpha") {
+        register("managed-alpha", managedWorkflow, managedConfig);
+        assert.throws(
+          () => register("managed-beta", logPromptWorkflow, logPromptConfig),
+          /configuration input .* aliases .* managed state/,
+        );
+      } else {
+        register("managed-beta", logPromptWorkflow, logPromptConfig);
+        assert.throws(
+          () => register("managed-alpha", managedWorkflow, managedConfig),
+          /configuration input .* aliases .* managed state/,
+        );
+      }
+      assert.equal(readFileSync(managedLog, "utf8"), "alpha-only\n");
+    } finally {
+      if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;
+      else process.env.SYMPHONY_STATE_DIR = previousState;
+      if (previousHost === undefined) delete process.env.SYMPHONY_TEST_HOST_STATE_DIR;
+      else process.env.SYMPHONY_TEST_HOST_STATE_DIR = previousHost;
+    }
+  }
+});
+
 test("managed state writes cannot enter another runner workspace in either startup order", async () => {
   const dir = base();
   const normal = environment(dir, "shared-state");
@@ -524,6 +584,15 @@ test("reload retains a safe review prompt when the new prompt overlaps another r
     utimesSync(betaWorkflow, 2_000_000_200, 2_000_000_200);
     assert.equal(store.refresh().config.review?.promptFile, safePrompt);
     assert.match(store.reloadError ?? "", /configuration input .* overlaps .* workspace/);
+
+    const alphaLog = join(env.SYMPHONY_STATE_DIR!, "logs", "reload-alpha.log");
+    mkdirSync(join(env.SYMPHONY_STATE_DIR!, "logs"), { recursive: true });
+    writeFileSync(alphaLog, "alpha-only\n");
+    writeFileSync(betaWorkflow, reviewWorkflowText(betaRoot, 39, alphaLog));
+    utimesSync(betaWorkflow, 2_000_000_300, 2_000_000_300);
+    assert.equal(store.refresh().config.review?.promptFile, safePrompt);
+    assert.match(store.reloadError ?? "", /configuration input .* aliases .* managed state/);
+    assert.equal(readFileSync(alphaLog, "utf8"), "alpha-only\n");
     store.close();
   } finally {
     if (previousState === undefined) delete process.env.SYMPHONY_STATE_DIR;

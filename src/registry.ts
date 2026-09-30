@@ -257,6 +257,10 @@ function runnerLog(entry: Pick<RunnerRecord, "id" | "state"> & Partial<Pick<Runn
   return entry.log ?? canonical(join(entry.state, "logs", `${entry.id}.log`));
 }
 
+function managedFiles(entry: Pick<RunnerRecord, "id" | "state"> & Partial<Pick<RunnerRecord, "log">>): string[] {
+  return [runnerLog(entry), join(entry.state, ".last-workflow")];
+}
+
 function reservationFile(dir: string, id: string): string {
   return join(dir, `${id}.reservation.json`);
 }
@@ -290,6 +294,8 @@ function assertAvailable(
   claimToken?: string,
 ): void {
   for (const existing of [...activeRecords, ...activeReservations.filter((entry) => entry.token !== claimToken)]) {
+    const nextInputs = inputPaths(next);
+    const existingInputs = inputPaths(existing);
     if (existing.id === next.id && !samePath(existing.workflow, next.workflow)) {
       throw new Error(`runner ID "${next.id}" belongs to ${existing.workflow}; choose a different ID for ${next.workflow}`);
     }
@@ -300,11 +306,20 @@ function assertAvailable(
     if (pathsOverlap(existing.root, next.root)) {
       throw new Error(`workspace root ${next.root} overlaps runner "${existing.id}" (${existing.root}); set a separate workspace.root`);
     }
+    if (nextInputs.some((path) => existingInputs.some((other) => samePath(path, other)))) {
+      throw new Error(`configuration input for runner "${next.id}" aliases runner "${existing.id}" configuration input; use separate workflow and prompt files`);
+    }
     if (
-      inputPaths(next).some((path) => overlaps(existing.root, path))
-      || inputPaths(existing).some((path) => overlaps(next.root, path))
+      nextInputs.some((path) => overlaps(existing.root, path))
+      || existingInputs.some((path) => overlaps(next.root, path))
     ) {
       throw new Error(`configuration input for runner "${next.id}" overlaps runner "${existing.id}" workspace; keep workflow and prompt files outside runner workspaces`);
+    }
+    if (
+      nextInputs.some((path) => managedFiles(existing).some((managed) => samePath(path, managed)))
+      || existingInputs.some((path) => managedFiles(next).some((managed) => samePath(path, managed)))
+    ) {
+      throw new Error(`configuration input for runner "${next.id}" aliases runner "${existing.id}" managed state; keep workflow and prompt files separate from runner logs and state`);
     }
     if (
       managedPaths(next.state).some((path) => pathsOverlap(path, existing.root))
