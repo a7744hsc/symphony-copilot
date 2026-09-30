@@ -8,6 +8,7 @@ import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { CopilotClient, type CopilotSession, type SessionConfig, type SessionEvent } from "@github/copilot-sdk";
 import type { Role } from "../src/config.ts";
+import type { PendingHandoff } from "../src/iteration.ts";
 import { RunLedger } from "../src/ledger.ts";
 import { Orchestrator, type WorkerParams } from "../src/orchestrator.ts";
 import type { FetchLike } from "../src/tracker/github-api.ts";
@@ -38,8 +39,9 @@ function publicationFetch() {
   const messages = new Map<string, Message>();
   const reviews: Message[] = [], prComments: Message[] = [];
   const transitions: string[] = [];
+  const headReads: Array<{ at: number; head: string | null; remoteHead: string }> = [];
   const state = {
-    status: "Todo", localHead: "", remoteHead: "",
+    status: "Todo", localHead: "", remoteHead: "", delayPrHead: false,
     pr: null as null | { id: string; number: number; url: string; headRefOid: string; body: string },
   };
   const issueMessages = () => [...messages.values()].filter((m) => m.issue?.id === issueId);
@@ -85,6 +87,7 @@ function publicationFetch() {
       data = { node: { id: issueId, state: "OPEN", repository: { nameWithOwner: repo }, projectItems: connection([item()]) } };
     } else if (q.includes("pullRequests(headRefName")) {
       assert.equal(v.branch, "agent/12");
+      headReads.push({ at: Date.now(), head: state.pr?.headRefOid ?? null, remoteHead: state.remoteHead });
       data = { repository: { pullRequests: { nodes: state.pr ? [state.pr] : [] } } };
     } else if (q.includes("defaultBranchRef")) {
       data = { repository: { id: "R_1", defaultBranchRef: { name: "main" } } };
@@ -133,7 +136,7 @@ function publicationFetch() {
     } else assert.fail(`unexpected offline GraphQL request: ${q}`);
     return new Response(JSON.stringify({ data }));
   };
-  return { impl, calls, messages, reviews, prComments, transitions, state, issueMessages };
+  return { impl, calls, messages, reviews, prComments, transitions, headReads, state, issueMessages };
 }
 
 interface GitCall { cwd: string; args: string[] }
@@ -163,7 +166,7 @@ async function offlineRuntime(t: TestContext) {
   return { runAgentAttempt, GitHubProjectTracker, setGit(handler: typeof git) { git = handler; } };
 }
 
-interface Plan { role: Role; progress?: "initial" | "no_progress"; hold?: boolean; failCreate?: boolean }
+interface Plan { role: Role; progress?: "initial" | "no_progress"; hold?: boolean; failCreate?: boolean; pendingHeadMismatch?: boolean }
 
 function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime>>, plans: Plan[]) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "iteration-integration-")));
@@ -192,6 +195,7 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
     head: (index + 1).toString(16).padStart(40, "0"), credits: index + 1.25,
     model: `offline-actual-${plan.role}`, session: undefined as SessionConfig | undefined,
     history: [] as string[], prompt: "", metricsRead: false,
+    submittedPending: null as PendingHandoff | null,
   }));
   const counts = { start: 0, create: 0, created: 0, send: 0, metrics: 0, disconnect: 0, stop: 0, forceStop: 0, abort: 0 };
   t.mock.method(workspaces, "hook", async (_config: unknown, name: string, workspace: Workspace) => {
@@ -220,7 +224,7 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
       assert.equal(pending.result.kind, "implement");
       assert.ok(pending.issueMessage && api.messages.has(pending.issueMessage.id), "full issue record precedes push");
       api.state.remoteHead = api.state.localHead;
-      if (api.state.pr) api.state.pr.headRefOid = api.state.remoteHead;
+      if (api.state.pr && !api.state.delayPrHead) api.state.pr.headRefOid = api.state.remoteHead;
       return "";
     }
     return assert.fail(`unexpected Git operation: ${args.join(" ")}`);
@@ -251,7 +255,17 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
       const handler = session.tools?.find((tool) => tool.name === name)?.handler;
       assert.ok(handler, `real tracker must expose ${name}`);
       const result: any = await handler(args, { sessionId: session.sessionId!, toolCallId: `${step.index}:${name}`, toolName: name, arguments: args });
-      assert.notEqual(result?.resultType, "failure", JSON.stringify(result));
+      if (step.pendingHeadMismatch && name === "tracker_submit_for_review") {
+        assert.equal(result?.resultType, "failure", "post-push metadata lag must be a retryable publication error, not accepted stale completion");
+        assert.equal(workers[step.index]!.params.control.accepted(), true);
+        const pending = ledger.get(controlKey)!.pending;
+        assert.ok(pending, "only an already accepted, still-pending result may return this expected tool error");
+        assert.equal(pending.result.kind, "implement"); assert.equal(pending.stale, false);
+        assert.equal(pending.headMismatch?.attempts, 1);
+        assert.ok(result.textResultForLlm.includes(step.head) && result.textResultForLlm.includes(api.state.pr!.headRefOid));
+        assert.match(result.textResultForLlm, /expected/i); assert.match(result.textResultForLlm, /actual/i);
+        step.submittedPending = structuredClone(pending);
+      } else assert.notEqual(result?.resultType, "failure", JSON.stringify(result));
       return result;
     };
     return {
@@ -282,12 +296,15 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
               progress_reason: step.reason, next_action: "continue", next_step: step.nextStep,
               summary: step.summary, blocking_issues: [step.blocker],
             });
-          assert.equal(result.accepted, true);
-          assert.equal(result.stale, false);
+          if (!step.pendingHeadMismatch) {
+            assert.equal(result.accepted, true);
+            assert.equal(result.stale, false);
+          }
           assert.equal(workers[step.index]!.params.control.accepted(), true);
           assert.doesNotMatch(api.issueMessages().at(-1)!.body, /用量（本轮）/, "footer waits for final runner metrics");
           emit("assistant.usage", { model: step.model, inputTokens: 100, outputTokens: 10, copilotUsage: { totalNanoAiu: 125_000_000 } });
-          emit("session.idle");
+          if (step.pendingHeadMismatch) emit("session.error", { message: "offline turn ended after accepted publication error" });
+          else emit("session.idle");
           step.sent.resolve();
           return "submitted-message";
         } catch (error) {
@@ -456,6 +473,126 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
     assert.equal(s.api.issueMessages().length, 6, "stopping the held session creates no usage-only result");
     for (const step of s.steps) assert.equal(existsSync(step.session!.largeOutput!.outputDirectory!), false);
     t.diagnostic("6 started sessions, 3 reviews, 2 no-progress reworks, 6 full issue results/footers; Todo: 1/20 in a new authorization (7 total SDK sessions).");
+  });
+
+  await t.test("implementation metadata lag ends the accepted runner; host retry waits 60 seconds and starts only the next reviewer", async (t) => {
+    const s = setup(t, runtime, [{ role: "implement", pendingHeadMismatch: true }, { role: "review", hold: true }]);
+    const oldHead = "0".repeat(40), started = Date.now();
+    s.api.state.delayPrHead = true;
+    s.api.state.remoteHead = oldHead;
+    s.api.state.pr = { id: "PR_1", number: 13, url: `https://github.invalid/${repo}/pull/13`, headRefOid: oldHead, body: "Existing PR" };
+    await s.orchestrator.start();
+    await s.orchestrator.tick();
+    await s.finish(0);
+    const cycle = s.ledger.get(controlKey)!, p = cycle.pending!;
+    assert.ok(p, "worker exit must retain accepted publication, not schedule another implementer");
+    const authorization = cycle.authorizationId, ref = p.issueMessage!, resultId = p.id;
+    assert.equal(p.stale, false); assert.equal(p.pushed, true); assert.equal(p.statusApplied, false);
+    assert.deepEqual(p.headMismatch, { attempts: 1, actualHead: oldHead, retryAt: started + 60_000 });
+    assert.deepEqual(s.steps[0]!.submittedPending!.headMismatch, p.headMismatch, "worker-exit resume did not consume check two");
+    assert.deepEqual(new RunLedger(s.ledger.path!).get(controlKey), cycle, "real disk state retains the retry gate");
+    assert.equal(cycle.sessions, 1); assert.equal(cycle.reviewRounds, 0); assert.equal(cycle.noProgress, 0);
+    assert.equal(s.api.state.status, "In Progress"); assert.equal(s.api.reviews.length, 0);
+    assert.deepEqual(s.api.headReads.filter((r) => r.remoteHead === s.steps[0]!.head), [{ at: started, head: oldHead, remoteHead: s.steps[0]!.head }]);
+    assert.equal(s.counts.created, 1); assert.equal(s.counts.send, 1);
+    assert.equal(s.counts.disconnect, 1); assert.equal(s.counts.stop, 1);
+    assert.deepEqual(s.orchestrator.snapshot().counts, { running: 0, retrying: 0 });
+    assert.ok(s.lines.some((line) => line.includes("turn ended after result acceptance")), "runner drains an errored accepted turn without model continuation");
+    const record = s.api.messages.get(ref.id)!;
+    const footer = `用量（本轮）：${s.steps[0]!.credits.toFixed(2)} · 轮次 1/20 · 模型：${s.steps[0]!.model}`;
+    assert.ok(record.body.includes(s.steps[0]!.summary)); assert.ok(record.body.includes(footer));
+    assert.match(record.body, /Publication pending/); assert.doesNotMatch(record.body, /Stale result/);
+    const headReads = s.api.headReads.length, gitCalls = s.gitCalls.length;
+    await s.orchestrator.tick();
+    t.mock.timers.tick(59_999);
+    s.api.state.status = "AI Review"; // An external board workflow must not bypass the pending SHA check.
+    s.api.state.pr!.headRefOid = s.steps[0]!.head;
+    await s.orchestrator.tick();
+    assert.equal(cycle.pending, p); assert.equal(p.headMismatch!.attempts, 1);
+    assert.equal(s.api.headReads.length, headReads); assert.equal(s.gitCalls.length, gitCalls);
+    assert.equal(s.workers.length, 1); assert.equal(s.counts.created, 1); assert.equal(s.counts.send, 1);
+    assert.equal(s.api.issueMessages().length, 1); assert.equal(s.api.state.status, "AI Review");
+    t.mock.timers.tick(1);
+    await s.orchestrator.tick();
+    assert.equal(s.api.state.status, "AI Review"); assert.equal(cycle.pending, null); assert.equal(cycle.halted, null);
+    assert.equal(cycle.authorizationId, authorization); assert.equal(cycle.noProgress, 0); assert.equal(cycle.reviewRounds, 0);
+    assert.equal(s.api.issueMessages().length, 1); assert.equal(s.api.issueMessages()[0]!.id, ref.id);
+    assert.ok(record.body.includes(`<!-- symphony-result:${resultId} -->`));
+    assert.ok(record.body.includes(s.steps[0]!.summary)); assert.ok(record.body.includes(footer));
+    assert.match(record.body, /Handoff completed: AI Review/);
+    assert.equal(s.gitCalls.filter((c) => c.args[0] === "push").length, 1);
+    assert.equal(s.api.prComments.length, 1); assert.equal(s.api.reviews.length, 0);
+    await s.orchestrator.tick();
+    await s.steps[1]!.sent.promise;
+    assert.deepEqual(s.workers.map((w) => w.params.role), ["implement", "review"]);
+    assert.equal(cycle.sessions, 2); assert.equal(s.counts.created, 2); assert.equal(s.counts.send, 2);
+    assert.deepEqual(s.steps[1]!.history, [record.body], "the reviewer reads the one original completed issue result");
+    assert.equal(s.api.issueMessages().length, 1, "host retries and held review create no new messages");
+    assert.deepEqual(s.api.transitions, ["In Progress"], "host does not repeat the external move to its intended target");
+    assert.deepEqual(s.errors, []);
+  });
+
+  await t.test("persistent implementation metadata mismatch gets exactly three spaced host checks, Blocked and no extra SDK session", async (t) => {
+    const s = setup(t, runtime, [{ role: "implement", pendingHeadMismatch: true }]);
+    const oldHead = "0".repeat(40), started = Date.now();
+    s.api.state.delayPrHead = true;
+    s.api.state.remoteHead = oldHead;
+    s.api.state.pr = { id: "PR_1", number: 13, url: `https://github.invalid/${repo}/pull/13`, headRefOid: oldHead, body: "Existing PR" };
+    await s.orchestrator.start();
+    await s.orchestrator.tick();
+    await s.finish(0);
+    const cycle = s.ledger.get(controlKey)!, p = cycle.pending!;
+    assert.ok(p); assert.equal(p.headMismatch!.attempts, 1); assert.equal(p.stale, false);
+    const ref = p.issueMessage!, authorization = cycle.authorizationId;
+    assert.deepEqual(s.steps[0]!.submittedPending!.headMismatch, p.headMismatch);
+    assert.deepEqual(new RunLedger(s.ledger.path!).get(controlKey), cycle);
+    await s.orchestrator.tick();
+    s.api.state.status = "AI Review"; // Auto-moved target still holds the pending result; no reviewer may run.
+    t.mock.timers.tick(60_000);
+    await s.orchestrator.tick();
+    assert.equal(cycle.pending, p); assert.equal(p.stale, false);
+    assert.deepEqual(p.headMismatch, { attempts: 2, actualHead: oldHead, retryAt: started + 120_000 });
+    assert.equal(p.targetState, "AI Review"); assert.equal(p.haltReason, null);
+    assert.equal(cycle.halted, null); assert.equal(cycle.sessions, 1); assert.equal(cycle.reviewRounds, 0); assert.equal(cycle.noProgress, 0);
+    assert.equal(s.counts.created, 1); assert.equal(s.workers.length, 1); assert.equal(s.api.state.status, "AI Review");
+    assert.deepEqual(new RunLedger(s.ledger.path!).get(controlKey), cycle);
+    const checks = s.api.headReads.length;
+    await s.orchestrator.tick();
+    t.mock.timers.tick(59_999);
+    await s.orchestrator.tick();
+    assert.equal(p.headMismatch!.attempts, 2); assert.equal(s.api.headReads.length, checks);
+    assert.equal(s.counts.created, 1); assert.equal(s.counts.send, 1);
+    t.mock.timers.tick(1);
+    await s.orchestrator.tick();
+    assert.equal(p.headMismatch!.attempts, 3); assert.equal(p.stale, false); assert.equal(p.result.kind, "implement");
+    assert.equal(p.targetState, "Blocked"); assert.equal(p.waitingState, "Blocked"); assert.equal(p.haltReason, "head_mismatch");
+    assert.equal(cycle.pending, null); assert.equal(cycle.lastState, "Blocked"); assert.equal(cycle.waitingState, "Blocked");
+    assert.equal(cycle.halted!.reason, "head_mismatch"); assert.equal(cycle.invocation!.phase, "finished");
+    assert.equal(cycle.authorizationId, authorization); assert.equal(cycle.sessions, 1);
+    assert.equal(cycle.reviewRounds, 0); assert.equal(cycle.noProgress, 0); assert.equal(cycle.lastSettledReworkId, null);
+    assert.equal(cycle.reworkReady, false); assert.equal(Object.keys(cycle.allocations).length, 1);
+    assert.deepEqual(new RunLedger(s.ledger.path!).get(controlKey), cycle);
+    assert.deepEqual(s.api.headReads.filter((r) => r.remoteHead === s.steps[0]!.head).map((r) => r.at), [started, started + 60_000, started + 120_000]);
+    const record = s.api.messages.get(ref.id)!;
+    assert.ok(record.body.includes(s.steps[0]!.summary));
+    assert.ok(record.body.includes(`<!-- symphony-result:${p.id} -->`));
+    const status = record.body.split(`<!-- symphony-handoff:${p.id}:start -->`)[1]?.split(`<!-- symphony-handoff:${p.id}:end -->`)[0];
+    assert.ok(status);
+    for (const text of ["Blocked", s.steps[0]!.head, oldHead, "3"]) assert.ok(status.includes(text), `missing host diagnostic: ${text}`);
+    assert.match(status, /expected/i); assert.match(status, /actual/i); assert.match(status, /attempt|check/i);
+    assert.doesNotMatch(record.body, /Stale result|\*\*Progress:|Reviewed HEAD:/);
+    assert.deepEqual(record.body.match(/^用量（本轮）：.*$/gm), [`用量（本轮）：1.25 · 轮次 1/20 · 模型：${s.steps[0]!.model}`]);
+    const finalReads = s.api.headReads.length;
+    t.mock.timers.tick(60_000);
+    await s.orchestrator.tick();
+    assert.equal(s.api.headReads.length, finalReads); assert.equal(s.workers.length, 1);
+    assert.equal(s.api.issueMessages().length, 1); assert.equal(s.api.issueMessages()[0]!.id, ref.id);
+    assert.equal(s.api.reviews.length, 0); assert.equal(s.api.prComments.length, 0);
+    assert.equal(s.gitCalls.filter((c) => c.args[0] === "push").length, 1);
+    assert.deepEqual(s.api.transitions, ["In Progress", "Blocked"]);
+    assert.deepEqual(s.orchestrator.snapshot().counts, { running: 0, retrying: 0 });
+    assert.deepEqual(s.counts, { start: 1, create: 1, created: 1, send: 1, metrics: 1, disconnect: 1, stop: 1, forceStop: 0, abort: 1 });
+    assert.deepEqual(s.errors, []);
   });
 
   await t.test("real runner createSession failure blocks without a quota charge or automatic retry", async (t) => {

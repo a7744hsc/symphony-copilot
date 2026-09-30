@@ -219,6 +219,70 @@ test("stale reviews finish the invocation but neither settle progress nor apply 
   assert.equal(cycle.reviewRounds, 2);
 });
 
+test("implementation head retry persists across restart and exhausted publication does not ready rework or consume sessions", (t) => {
+  const { ledger, path } = fixture(t);
+  const cycle = ledger.authorize(issue, 20, now);
+  handoff(ledger, cycle, review());
+  const reworkId = cycle.reworkId;
+  const invocation = start(ledger, cycle, "implement");
+  const pending = ledger.accept(cycle, invocation.id, implementation, "/work", config);
+  assert.equal(pending.headMismatch, undefined, "old pending records remain valid without a retry field");
+  pending.pushed = true;
+  pending.headMismatch = { attempts: 1, actualHead: "older-sha", retryAt: now.getTime() + 60_000 };
+  ledger.checkpoint(cycle);
+
+  const restoredLedger = new RunLedger(path), restored = restoredLedger.get(cycle.key)!;
+  const p = restored.pending!;
+  assert.deepEqual(p.headMismatch, pending.headMismatch);
+  assert.equal(restored.sessions, 2);
+  p.headMismatch = { attempts: 3, actualHead: "different-sha", retryAt: now.getTime() + 180_000 };
+  p.haltReason = "head_mismatch";
+  p.targetState = p.waitingState = "Blocked";
+  p.issueMessage = { id: "comment", url: null };
+  p.statusApplied = true;
+  restoredLedger.checkpoint(restored);
+  const restarted = new RunLedger(path), halted = restarted.get(cycle.key)!;
+  restarted.complete(halted);
+  assert.equal(halted.halted?.reason, "head_mismatch");
+  assert.equal(halted.lastState, "Blocked");
+  assert.equal(halted.waitingState, "Blocked");
+  assert.equal(halted.sessions, 2);
+  assert.equal(halted.reviewRounds, 1);
+  assert.equal(halted.noProgress, 0);
+  assert.equal(halted.reworkId, reworkId);
+  assert.equal(halted.lastSettledReworkId, null);
+  assert.equal(halted.reworkReady, false, "failed publication is not a formally submitted rework");
+  assert.throws(() => restarted.begin(halted, "implement"), /halted/);
+});
+
+test("malformed head-retry counters and halt combinations cannot reset a pending retry", (t) => {
+  const { ledger, path } = fixture(t);
+  const cycle = ledger.authorize(issue, 20, now), invocation = start(ledger, cycle);
+  const pending = ledger.accept(cycle, invocation.id, implementation, "/work", config);
+  pending.pushed = true;
+  ledger.checkpoint(cycle);
+  const valid = JSON.parse(readFileSync(path, "utf8"));
+  const retry = { attempts: 1, actualHead: "older-sha", retryAt: now.getTime() + 60_000 };
+  const mutations: Array<(p: any) => void> = [
+    (p) => { p.headMismatch = null; },
+    (p) => { p.headMismatch = { ...retry, attempts: 0 }; },
+    (p) => { p.headMismatch = { ...retry, attempts: 1.5 }; },
+    (p) => { p.headMismatch = { ...retry, attempts: 4 }; },
+    (p) => { p.headMismatch = { ...retry, actualHead: "" }; },
+    (p) => { p.headMismatch = { ...retry, retryAt: -1 }; },
+    (p) => { p.headMismatch = { ...retry, retryAt: "tomorrow" }; },
+    (p) => { p.headMismatch = retry; p.pushed = false; },
+    (p) => { p.headMismatch = { ...retry, attempts: 3 }; },
+    (p) => { p.haltReason = "head_mismatch"; p.waitingState = p.targetState = "Blocked"; },
+  ];
+  for (const mutate of mutations) {
+    const data = structuredClone(valid);
+    mutate(data.issues[cycle.key].pending);
+    writeFileSync(path, JSON.stringify(data));
+    assert.throws(() => new RunLedger(path), LedgerError, mutate.toString());
+  }
+});
+
 test("unable-to-verify and runtime pauses preserve the existing streak and unassessed rework", () => {
   const ledger = new RunLedger();
   const cycle = ledger.authorize(issue, 20, now);

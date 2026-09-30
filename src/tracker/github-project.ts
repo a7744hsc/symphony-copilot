@@ -3,7 +3,7 @@ import { basename, extname, isAbsolute, resolve } from "node:path";
 import { defineTool, type Tool, type ToolResultObject } from "@github/copilot-sdk";
 import { resolveEnvRef } from "../config.ts";
 import { ExecError, run } from "../exec.ts";
-import { validateReviewResult, type IssueMessageRef, type PendingHandoff } from "../iteration.ts";
+import { IMPLEMENTATION_HEAD_CHECK_LIMIT, IMPLEMENTATION_HEAD_RETRY_MS, validateReviewResult, type IssueMessageRef, type PendingHandoff } from "../iteration.ts";
 import { truncate, type Logger } from "../log.ts";
 import { isInside } from "../policy.ts";
 import { normalizeState, type BlockerRef, type Issue } from "../types.ts";
@@ -854,10 +854,13 @@ export class GitHubProjectTracker implements TrackerAdapter {
   private async handoffIssue(issue: Issue, p: PendingHandoff): Promise<Issue | null> {
     const current = await this.publicationIssue(issue);
     if (!current) return null;
-    const needsPr = p.result.kind === "implement" || (p.result.kind === "review" && p.result.verdict !== "unable_to_verify");
+    const needsPr = p.haltReason !== "head_mismatch" && (p.result.kind === "implement" || (p.result.kind === "review" && p.result.verdict !== "unable_to_verify"));
     const completed = p.issueMessage && (!needsPr || p.prPublished && (p.result.kind !== "implement" || p.pushed));
+    // Board automation may advance to the intended target before PR metadata catches up.
+    // Retain the pending SHA fence there rather than clear it and dispatch a reviewer early.
+    const reconcilingHead = p.result.kind === "implement" && p.pushed && p.issueMessage && p.headMismatch;
     return normalizeState(current.state) === normalizeState(p.sourceState) ||
-      completed && normalizeState(current.state) === normalizeState(p.targetState) ? current : null;
+      (completed || reconcilingHead) && normalizeState(current.state) === normalizeState(p.targetState) ? current : null;
   }
 
   private async ensureIssueResult(issue: Issue, p: PendingHandoff, checkpoint: () => void, assertActive: () => void): Promise<{ body: string } | null> {
@@ -898,7 +901,9 @@ export class GitHubProjectTracker implements TrackerAdapter {
     const current = await this.ensureIssueResult(issue, p, checkpoint, assertActive);
     if (!current) return false;
     const start = `<!-- symphony-handoff:${p.id}:start -->`, end = `<!-- symphony-handoff:${p.id}:end -->`;
-    const text = p.stale ? "Stale result: source evidence only; no target state or progress applied."
+    const text = p.haltReason === "head_mismatch" && p.result.kind === "implement" && p.headMismatch
+      ? `Handoff blocked: ${p.targetState}. Stop reason: head_mismatch after ${p.headMismatch.attempts} host checks; expected HEAD: ${p.result.head}; actual PR HEAD: ${p.headMismatch.actualHead}. Latest implementation has not been reviewed. Check the branch/PR, then return the card to "${this.settings.startState}" to reauthorize.`
+      : p.stale ? "Stale result: source evidence only; no target state or progress applied."
       : `Handoff completed: ${p.targetState}.${p.pr ? ` [PR #${p.pr.number}](${p.pr.url})` : ""}`;
     const body = replaceMarkedBlock(current.body, start, end, statusBlock(p, text));
     if (body === null) throw new TrackerError("tracker_response", "canonical issue result has no unambiguous host status block");
@@ -910,6 +915,10 @@ export class GitHubProjectTracker implements TrackerAdapter {
 
   /** Resume the one persisted semantic result. No model, policy decision, or current checkout substitution. */
   async publishHandoff(issue: Issue, p: PendingHandoff, checkpoint: () => void, assertActive: () => void): Promise<{ stale: boolean }> {
+    assertActive();
+    if (p.headMismatch && p.haltReason !== "head_mismatch" && Date.now() < p.headMismatch.retryAt) {
+      throw new Error(`PR head check pending until ${new Date(p.headMismatch.retryAt).toISOString()}; host will retry without another agent`);
+    }
     const needsPr = p.result.kind === "implement" || (p.result.kind === "review" && p.result.verdict !== "unable_to_verify");
     const qualityReview = p.result.kind === "review" && p.result.verdict !== "unable_to_verify";
     const stale = () => { p.stale = true; checkpoint(); return { stale: true }; };
@@ -921,21 +930,54 @@ export class GitHubProjectTracker implements TrackerAdapter {
     };
     let current = await refresh();
     if (!current) return stale();
-    const headChanged = async (): Promise<boolean> => {
-      if (!needsPr) return false;
-      const pr = await this.openPullRequest(current!);
-      assertActive();
-      const expected = p.result.kind === "review" ? p.result.reviewedHead : p.result.kind === "implement" ? p.result.head : null;
-      if (p.pr && pr?.id !== p.pr.id) return true;
-      return qualityReview || p.prPublished ? !pr || pr.headRefOid !== expected : false;
-    };
     const staleHead = async () => {
       p.stale = true; checkpoint();
       await this.finalizeIssueResult(current!, p, checkpoint, assertActive);
       return { stale: true };
     };
+    const finishPublication = async () => {
+      current = await refresh();
+      if (!current) return stale();
+      if (!await this.ensureIssueResult(current, p, checkpoint, assertActive)) return stale();
+      current = await refresh();
+      if (!current) return stale();
+      assertActive();
+      if (normalizeState(current.state) !== normalizeState(p.targetState)) await this.setStatus(current, p.targetState, assertActive);
+      p.statusApplied = true; checkpoint();
+      if (!await this.finalizeIssueResult(current, p, checkpoint, assertActive)) return stale();
+      return { stale: false };
+    };
+    const mismatchedHead = async (actualHead: string): Promise<{ stale: boolean }> => {
+      if (p.result.kind !== "implement" || !p.pushed) return staleHead();
+      const attempts = (p.headMismatch?.attempts ?? 0) + 1;
+      p.headMismatch = { attempts, actualHead, retryAt: Date.now() + IMPLEMENTATION_HEAD_RETRY_MS };
+      if (attempts >= IMPLEMENTATION_HEAD_CHECK_LIMIT) {
+        // This is a publication failure, not another rework or a quality verdict.
+        p.sourceState = current!.state;
+        p.targetState = p.waitingState = this.settings.blockedState;
+        p.haltReason = "head_mismatch";
+      }
+      checkpoint();
+      const detail = `PR head mismatch: expected ${p.result.head}; actual ${actualHead}; host check ${attempts}/${IMPLEMENTATION_HEAD_CHECK_LIMIT}`;
+      this.log.warn("implementation handoff head mismatch", { issue_identifier: issue.identifier, expected_head: p.result.head, actual_head: actualHead, checks: attempts });
+      if (attempts < IMPLEMENTATION_HEAD_CHECK_LIMIT) throw new Error(`${detail}; publication pending, retry after ${new Date(p.headMismatch.retryAt).toISOString()}`);
+      return finishPublication();
+    };
+    const checkHead = async (): Promise<{ stale: boolean } | null> => {
+      if (!needsPr) return null;
+      const pr = await this.openPullRequest(current!);
+      assertActive();
+      const expected = p.result.kind === "review" ? p.result.reviewedHead : p.result.kind === "implement" ? p.result.head : null;
+      if (p.pr && pr?.id !== p.pr.id) return staleHead();
+      if ((qualityReview || p.pushed || p.prPublished) && pr && pr.headRefOid !== expected) return mismatchedHead(pr.headRefOid);
+      if ((qualityReview || p.prPublished) && !pr) return staleHead();
+      return null;
+    };
     if (p.stale) return staleHead();
-    if (await headChanged()) return staleHead();
+    // Once Blocked is decided, retry only its publication; do not grant more SHA checks.
+    if (p.haltReason === "head_mismatch") return finishPublication();
+    const before = await checkHead();
+    if (before) return before;
     if (!await this.ensureIssueResult(current, p, checkpoint, assertActive)) return stale();
 
     if (p.result.kind === "implement" && !p.pushed) {
@@ -958,7 +1000,8 @@ export class GitHubProjectTracker implements TrackerAdapter {
       assertActive();
       if (p.pr && pr?.id !== p.pr.id) return staleHead();
       const expected = p.result.kind === "review" ? p.result.reviewedHead : p.result.kind === "implement" ? p.result.head : null;
-      if (pr && pr.headRefOid !== expected || qualityReview && !pr) return staleHead();
+      if (pr && pr.headRefOid !== expected) return mismatchedHead(pr.headRefOid);
+      if (qualityReview && !pr) return staleHead();
       if (!pr && p.result.kind === "implement") {
         const repo = await this.repository();
         if (!await this.ensureIssueResult(current, p, checkpoint, assertActive)) return stale();
@@ -1001,15 +1044,8 @@ export class GitHubProjectTracker implements TrackerAdapter {
 
     current = await refresh();
     if (!current) return stale();
-    if (await headChanged()) return staleHead();
-    if (!await this.ensureIssueResult(current, p, checkpoint, assertActive)) return stale();
-    current = await refresh();
-    if (!current) return stale();
-    assertActive();
-    if (normalizeState(current.state) !== normalizeState(p.targetState)) await this.setStatus(current, p.targetState, assertActive);
-    p.statusApplied = true; checkpoint();
-    if (!await this.finalizeIssueResult(current, p, checkpoint, assertActive)) return stale();
-    return { stale: false };
+    const after = await checkHead();
+    return after ?? finishPublication();
   }
 
   /** Cosmetic only. Read the typed, invocation-owned issue message; never guess the last comment. */

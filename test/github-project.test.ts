@@ -874,6 +874,246 @@ test("existing-PR comment response loss is reconciled by marker, not mirrored a 
   assert.equal(s.prComments.length, 1); assert.equal(s.comments.size, 2);
 });
 
+async function delayedImplementation(t: TestContext) {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-09-30T00:00:00Z") });
+  const s = publicationSetup({ review: false, target: "AI Review" });
+  const result: AgentResult = { kind: "implement", title: "Repair", head: "head1",
+    summary: `Full implementation criteria, checks and human constraints.\n${"Complete evidence. ".repeat(400)}\nEND IMPLEMENTATION EVIDENCE` };
+  await s.control.accept(result, "/nonexistent/implementation-checkout");
+  s.state.pr!.headRefOid = "head0";
+  const gitCalls: string[][] = [], checkpoints: PendingHandoff[] = [];
+  const git = async (cwd: string, args: string[]) => {
+    assert.equal(cwd, s.saved.pending!.workspacePath);
+    gitCalls.push(args);
+    if (args[0] === "rev-parse") { assert.deepEqual(args, ["rev-parse", "HEAD"]); return "head1"; }
+    if (args[0] === "status") { assert.deepEqual(args, ["status", "--porcelain"]); return ""; }
+    assert.deepEqual(args, ["push", "--quiet", "origin", "head1:refs/heads/agent/12"]);
+    assert.ok(s.saved.pending!.issueMessage, "full issue evidence must precede push");
+    return ""; // Push succeeds; only GraphQL PR metadata is delayed. Never run real Git.
+  };
+  let tracker = s.tracker;
+  Object.assign(tracker, { git });
+  return { ...s, gitCalls, checkpoints, result,
+    get pending() { return s.saved.pending!; },
+    resume: () => tracker.publishHandoff(s.issue, s.saved.pending!, () => {
+      s.control.checkpoint(); checkpoints.push(structuredClone(s.saved.pending!));
+    }, () => s.control.assertActive()),
+    restart() {
+      s.saved.pending = structuredClone(s.saved.pending!);
+      tracker = new GitHubProjectTracker({ ...provider, handoff_state: "AI Review" }, env, quietLog, s.impl);
+      Object.assign(tracker, { git });
+    },
+  };
+}
+
+function mismatchError(expected: string, actual: string) {
+  return (error: unknown) => {
+    assert.ok(error instanceof Error, "a host retry must reject, not complete a stale handoff");
+    assert.match(error.message, /expected/i);
+    assert.match(error.message, /actual/i);
+    assert.ok(error.message.includes(expected), "diagnostic must name the accepted SHA");
+    assert.ok(error.message.includes(actual), "diagnostic must name the observed PR SHA");
+    return true;
+  };
+}
+
+function handoffStatus(body: string, p: PendingHandoff) {
+  const start = `<!-- symphony-handoff:${p.id}:start -->`, end = `<!-- symphony-handoff:${p.id}:end -->`;
+  assert.equal(body.split(`<!-- symphony-result:${p.id} -->`).length, 2);
+  assert.equal(body.split(`<!-- symphony-invocation:${p.invocationId} -->`).length, 2);
+  assert.equal(body.split(start).length, 2); assert.equal(body.split(end).length, 2);
+  assert.ok(body.indexOf(start) < body.indexOf(end));
+  return body.slice(body.indexOf(start) + start.length, body.indexOf(end));
+}
+
+test("implementation post-push metadata lag stays pending; immediate tool/host retries have no effects before 60 seconds", async (t) => {
+  const s = await delayedImplementation(t), p = s.pending, now = Date.now();
+  assert.equal(p.headMismatch, undefined, "legacy pending results need no retry field");
+  await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+  assert.equal(s.saved.pending, p); assert.equal(p.stale, false); assert.equal(p.pushed, true);
+  assert.equal(p.targetState, "AI Review"); assert.equal(p.statusApplied, false); assert.equal(p.haltReason, null);
+  assert.deepEqual(p.headMismatch, { attempts: 1, actualHead: "head0", retryAt: now + 60_000 });
+  assert.deepEqual(s.checkpoints.at(-1)!.headMismatch, p.headMismatch, "retry gate must be checkpointed before rejecting");
+  const ref = p.issueMessage!, record = s.comments.get(ref.id)!;
+  assert.ok(record.body.includes(s.result.summary));
+  assert.match(handoffStatus(record.body, p), /Publication pending/);
+  assert.doesNotMatch(record.body, /Stale result/);
+  assert.equal(s.state.status, "进行中"); assert.deepEqual(s.saved.finishes, []);
+  const effects = [s.calls.length, s.gitCalls.length, s.saved.checkpoints];
+  assert.match((await s.call("tracker_submit_for_review", { title: s.result.title, summary: s.result.summary })).textResultForLlm, /already been accepted/);
+  await assert.rejects(s.resume(), Error);
+  t.mock.timers.tick(59_999);
+  s.state.pr!.headRefOid = "head1"; // Even already-correct metadata must wait for the durable gate.
+  await assert.rejects(s.resume(), Error);
+  assert.deepEqual([s.calls.length, s.gitCalls.length, s.saved.checkpoints], effects, "no API, Git or checkpoint before retryAt");
+  assert.deepEqual(p.headMismatch, { attempts: 1, actualHead: "head0", retryAt: now + 60_000 });
+  t.mock.timers.tick(1);
+  assert.deepEqual(await s.resume(), { stale: false });
+  assert.equal(s.saved.pending, p); assert.deepEqual(p.issueMessage, ref);
+  assert.equal(s.state.status, "AI Review"); assert.equal(p.statusApplied, true); assert.equal(p.haltReason, null);
+  assert.equal(s.gitCalls.filter((args) => args[0] === "push").length, 1);
+  assert.equal([...s.comments.values()].filter((c) => c.issue).length, 1);
+  assert.equal(s.prComments.length, 1); assert.equal(s.reviews.length, 0);
+  assert.deepEqual(p.result, s.result);
+  assert.match(handoffStatus(record.body, p), /Handoff completed: AI Review/);
+});
+
+test("three separated implementation head checks survive new adapters and halt in configured Blocked without semantic review", async (t) => {
+  const s = await delayedImplementation(t), started = Date.now();
+  s.pending.nextNoProgress = 1; s.pending.reworkId = "existing-rework";
+  await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+  const ref = s.pending.issueMessage!, id = s.pending.id;
+  const record = s.comments.get(ref.id)!;
+  record.body = `Human preface\n${record.body}\nHuman afterword`;
+  const outsideStatus = (body: string) => body.replace(/<!-- symphony-handoff:result-1:start -->[\s\S]*?<!-- symphony-handoff:result-1:end -->/, "HOST STATUS");
+  const preserved = outsideStatus(record.body);
+  s.restart();
+  const before = [s.calls.length, s.gitCalls.length];
+  await assert.rejects(s.resume(), Error);
+  assert.deepEqual([s.calls.length, s.gitCalls.length], before, "fresh adapter honors persisted retryAt before even loading project metadata");
+  assert.deepEqual(s.pending.headMismatch, { attempts: 1, actualHead: "head0", retryAt: started + 60_000 });
+  t.mock.timers.tick(60_000);
+  s.state.pr!.headRefOid = "head2"; // A different unexpected head does not restart the three-check allowance.
+  await assert.rejects(s.resume(), mismatchError("head1", "head2"));
+  assert.deepEqual(s.pending.headMismatch, { attempts: 2, actualHead: "head2", retryAt: started + 120_000 });
+  assert.deepEqual(s.checkpoints.at(-1)!.headMismatch, s.pending.headMismatch);
+  assert.equal(s.pending.stale, false); assert.equal(s.pending.targetState, "AI Review");
+  assert.equal(s.pending.haltReason, null); assert.equal(s.pending.waitingState, null);
+  s.restart();
+  t.mock.timers.tick(59_999);
+  const gated = [s.calls.length, s.gitCalls.length];
+  await assert.rejects(s.resume(), Error);
+  assert.deepEqual([s.calls.length, s.gitCalls.length], gated);
+  assert.equal(s.pending.headMismatch!.attempts, 2);
+  t.mock.timers.tick(1);
+  assert.deepEqual(await s.resume(), { stale: false });
+  const p = s.pending;
+  assert.equal(p.id, id); assert.deepEqual(p.issueMessage, ref); assert.deepEqual(p.result, s.result);
+  assert.equal(p.headMismatch!.attempts, 3); assert.equal(p.headMismatch!.actualHead, "head2");
+  assert.equal(p.stale, false); assert.equal(p.statusApplied, true);
+  assert.equal(p.targetState, "受阻"); assert.equal(p.haltReason, "head_mismatch"); assert.equal(p.waitingState, "受阻");
+  assert.equal(p.nextNoProgress, 1); assert.equal(p.reworkId, "existing-rework");
+  assert.equal(s.state.status, "受阻"); assert.equal(s.reviews.length, 0);
+  assert.equal(s.gitCalls.filter((args) => args[0] === "push").length, 1);
+  assert.equal([...s.comments.values()].filter((c) => c.issue).length, 1);
+  assert.equal(outsideStatus(record.body), preserved, "only the original host status block changes");
+  const status = handoffStatus(record.body, p);
+  assert.match(status, /受阻/);
+  assert.match(status, /expected/i); assert.match(status, /actual/i);
+  assert.ok(status.includes("head1") && status.includes("head2"));
+  assert.match(status, /3/); assert.match(status, /attempt|check/i);
+  assert.doesNotMatch(record.body, /Stale result|\*\*Progress:|Reviewed HEAD:/);
+});
+
+test("closing an issue during a head retry prevents both review handoff and the fallback Blocked mutation", async (t) => {
+  const s = await delayedImplementation(t);
+  await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+  s.state.open = false;
+  t.mock.timers.tick(60_000);
+  const before = s.calls.length;
+  assert.deepEqual(await s.resume(), { stale: true });
+  assert.equal(s.pending.headMismatch!.attempts, 1, "closed issue is not another head mismatch");
+  assert.ok(!s.calls.slice(before).some(c => c.query.startsWith("mutation")));
+  assert.equal(s.state.status, "进行中");
+  assert.equal(s.pending.statusApplied, false);
+});
+
+test("a PR lookup transport failure is not a successful inconsistent-head observation", async (t) => {
+  const s = await delayedImplementation(t);
+  await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+  t.mock.timers.tick(60_000);
+  const before = structuredClone(s.pending.headMismatch);
+  s.state.fail = "pullRequests(headRefName";
+  await assert.rejects(s.resume(), /injected request failure/);
+  assert.deepEqual(s.pending.headMismatch, before);
+  assert.equal(s.pending.stale, false);
+  s.state.pr!.headRefOid = "head1";
+  assert.deepEqual(await s.resume(), { stale: false });
+  assert.equal(s.state.status, "AI Review");
+  assert.equal(s.gitCalls.filter(args => args[0] === "push").length, 1);
+});
+
+test("a board move to the intended review state cannot bypass a pending implementation SHA fence", async (t) => {
+  const s = await delayedImplementation(t);
+  await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+  s.state.status = "AI Review";
+  t.mock.timers.tick(60_000);
+  await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+  assert.equal(s.pending.headMismatch!.attempts, 2);
+  assert.equal(s.pending.stale, false);
+  assert.equal(s.pending.statusApplied, false);
+  assert.equal(s.prComments.length, 0);
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(await s.resume(), { stale: false });
+  assert.equal(s.pending.targetState, "受阻");
+  assert.equal(s.state.status, "受阻");
+  assert.equal(s.pending.haltReason, "head_mismatch");
+  assert.equal(s.reviews.length, 0);
+});
+
+for (const recovery of ["matching", "still divergent"]) {
+  test(`implementation mismatch after PR mirror is ${recovery}: use the same timed host recovery, not stale`, async (t) => {
+    const s = await delayedImplementation(t);
+    s.state.pr!.headRefOid = "head1";
+    s.state.after = (q) => { if (q.includes("addComment") && s.prComments.length === 1) s.state.pr!.headRefOid = "head0"; };
+    await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+    assert.equal(s.pending.prPublished, true); assert.equal(s.pending.pushed, true); assert.equal(s.pending.stale, false);
+    assert.equal(s.pending.headMismatch!.attempts, 1); assert.equal(s.state.status, "进行中");
+    const ref = s.pending.issueMessage!;
+    s.state.after = undefined; s.restart();
+    const before = [s.calls.length, s.gitCalls.length];
+    await assert.rejects(s.resume(), Error);
+    assert.deepEqual([s.calls.length, s.gitCalls.length], before);
+    t.mock.timers.tick(60_000);
+    if (recovery === "matching") s.state.pr!.headRefOid = "head1";
+    else {
+      await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+      assert.equal(s.pending.headMismatch!.attempts, 2);
+      s.restart(); t.mock.timers.tick(60_000);
+    }
+    assert.deepEqual(await s.resume(), { stale: false });
+    assert.deepEqual(s.pending.issueMessage, ref);
+    assert.equal(s.pending.stale, false); assert.equal(s.pending.statusApplied, true);
+    assert.equal(s.state.status, recovery === "matching" ? "AI Review" : "受阻");
+    assert.equal(s.pending.haltReason, recovery === "matching" ? null : "head_mismatch");
+    assert.equal([...s.comments.values()].filter((c) => c.issue).length, 1);
+    assert.equal(s.prComments.length, 1); assert.equal(s.reviews.length, 0);
+    assert.equal(s.gitCalls.filter((args) => args[0] === "push").length, 1);
+    assert.deepEqual(s.pending.result, s.result);
+  });
+}
+
+for (const lost of ["updateProjectV2ItemFieldValue", "updateIssueComment"]) {
+  test(`final implementation head-mismatch Blocked ${lost} response loss resumes without a fourth check or duplicate comment`, async (t) => {
+    const s = await delayedImplementation(t);
+    await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+    const ref = s.pending.issueMessage!;
+    t.mock.timers.tick(60_000);
+    await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+    t.mock.timers.tick(60_000); s.state.lose = lost;
+    await assert.rejects(s.resume(), /injected response loss/);
+    assert.equal(s.pending.headMismatch!.attempts, 3); assert.equal(s.pending.haltReason, "head_mismatch");
+    assert.equal(s.pending.targetState, "受阻"); assert.equal(s.pending.waitingState, "受阻"); assert.equal(s.pending.stale, false);
+    const headLookups = () => s.calls.filter((c) => c.query.includes("pullRequests(headRefName")).length;
+    const checked = headLookups();
+    s.restart();
+    assert.deepEqual(await s.resume(), { stale: false }, "the final host decision can be republished immediately");
+    t.mock.timers.tick(60_000);
+    assert.deepEqual(await s.resume(), { stale: false }, "completed publication is idempotent too");
+    assert.equal(s.pending.headMismatch!.attempts, 3); assert.equal(headLookups(), checked, "do not recheck SHA after the final Blocked decision");
+    assert.deepEqual(s.pending.issueMessage, ref); assert.equal(s.pending.statusApplied, true);
+    assert.equal(s.state.status, "受阻"); assert.equal(s.reviews.length, 0);
+    assert.equal(s.calls.filter((c) => c.query.includes("updateProjectV2ItemFieldValue")).length, 1);
+    assert.equal(s.calls.filter((c) => c.query.includes("addComment") && c.variables.id === "I_1").length, 1);
+    assert.equal(s.gitCalls.filter((args) => args[0] === "push").length, 1);
+    const record = s.comments.get(ref.id)!;
+    assert.ok(record.body.includes(s.result.summary));
+    const status = handoffStatus(record.body, s.pending);
+    for (const text of ["受阻", "head1", "head0", "3"]) assert.ok(status.includes(text));
+    assert.doesNotMatch(record.body, /Stale result/);
+  });
+}
+
 test("uploaded attachments are persisted in the result before core publication retries", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "review-image-")); t.after(() => rmSync(root, { recursive: true, force: true }));
   writeFileSync(join(root, "evidence.png"), "image");

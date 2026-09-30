@@ -58,8 +58,14 @@ for (const folder of ["", "examples"]) {
     assert.equal(config.tracker.blockedState, "Blocked");
     assert.equal(config.agent.maxSessions, 20);
     assert.equal(config.agent.maxConcurrentAgents, 1);
-    assert.equal(config.copilot.model, "auto");
-    assert.equal(config.review?.model ?? config.copilot.model, "auto");
+    if (folder === "examples") {
+      assert.equal(config.copilot.model, "auto");
+      assert.equal(config.review?.model ?? config.copilot.model, "auto");
+    } else {
+      // The live repository profile may pin user-selected models without changing the contract.
+      assert.ok(config.copilot.model?.trim());
+      assert.ok((config.review?.model ?? config.copilot.model)?.trim());
+    }
     assert.deepEqual(config.tracker.provider.agent_states, ["In Progress", "Blocked"]);
   });
 }

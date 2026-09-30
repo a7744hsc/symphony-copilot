@@ -118,6 +118,12 @@ Screenshots are linked by commit, so they render for anyone with access to the r
 
 If a tool fails before accepting a result, it returns a failure result and the session can correct it. Once a semantic handoff is accepted, its persisted publication is recovered without starting another model invocation to repeat it. This recovery is separate from the optional usage footer.
 
+After an implementation push succeeds, the PR API can temporarily report a different head SHA. Symphony keeps that result pending rather than marking it stale or rerunning implementation. A successful inconsistent-head observation counts once; the next check runs on a host poll at least 60 seconds later. The fixed limit is three mismatching checks in total (the first plus two retries). The count, last observed SHA and next-check time survive restart. API failures are not SHA observations. A match completes the same handoff without another push, result comment or agent session.
+
+If the third check still differs, Symphony moves the card to `blocked_state` and updates the original issue result's host status block with `head_mismatch`, the expected and actual SHA, and the check count. It does not infer commit ancestry, force-push, or consume another agent round. This is a publication failure, not a no-progress review. A lost Blocked/status-comment response retries only that final publication, not a fourth head check. Reviewer quality verdicts retain strict checked-SHA validation; closing an issue or leaving the applicable handoff state still cancels outdated work. No extra configuration is needed.
+
+Source-code fixes require restarting the service after active work is safely stopped. Previously finalized `Stale result` records are not automatically reconstructed or retried by this change.
+
 #### Reading complete feedback
 
 `tracker_get_issue` without arguments returns an overview: the latest five issue comments, PR reviews and PR comments, plus the first five review threads and the first five comments in each thread. No text is clipped at a character limit. Reviews expose the full Markdown after `**Blocking issues**` in `blocking_feedback`, independently of the full `body`; GitHub's `COMMENT` state is not treated as the AI verdict. An exact issue-comment copy of a review is omitted only when the full source review with the same author and URL is present in that response. Other comments, and mirrors whose source is on another page, remain available.

@@ -16,6 +16,8 @@ export interface ImplementationResult { kind: "implement"; title: string; summar
 export interface BlockedResult { kind: "blocked"; summary: string }
 export type AgentResult = ReviewResult | ImplementationResult | BlockedResult;
 export interface IssueMessageRef { id: string; url: string | null }
+export const IMPLEMENTATION_HEAD_CHECK_LIMIT = 3;
+export const IMPLEMENTATION_HEAD_RETRY_MS = 60_000;
 export interface PendingHandoff {
   id: string;
   invocationId: string;
@@ -34,6 +36,8 @@ export interface PendingHandoff {
   reworkId: string | null;
   /** Snapshot of the decision: completion must not depend on a later config reload. */
   waitingState: string | null;
+  /** Optional for existing ledgers. Host-only publication retries, never agent attempts. */
+  headMismatch?: { attempts: number; actualHead: string; retryAt: number };
 }
 export interface IterationContext { sessions: number; limit: number; noProgress: number; hasRework: boolean }
 export interface IterationDecision { targetState: string; haltReason: string | null; nextNoProgress: number }

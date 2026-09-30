@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { Role, ServiceConfig } from "./config.ts";
-import { decideResult, validateAgentResult, type AgentResult, type PendingHandoff } from "./iteration.ts";
+import { decideResult, IMPLEMENTATION_HEAD_CHECK_LIMIT, validateAgentResult, type AgentResult, type PendingHandoff } from "./iteration.ts";
 import { normalizeState, type Issue } from "./types.ts";
 
 export interface RunInvocation {
@@ -224,7 +224,7 @@ export class RunLedger {
           cycle.reworkId = p.result.verdict === "request_changes" && !p.haltReason ? randomUUID() : null;
           cycle.reworkReady = false;
         }
-      } else if (p.result.kind === "implement" && cycle.reworkId) cycle.reworkReady = true;
+      } else if (p.result.kind === "implement" && cycle.reworkId && !p.haltReason) cycle.reworkReady = true;
     }
     cycle.invocation!.phase = "finished"; cycle.pending = null; this.save();
   }
@@ -319,7 +319,14 @@ function validateData(data: any): void {
       const next = r.kind !== "review" ? c.noProgress : r.verdict === "approve" || r.progress === "made_progress" ? 0 : r.progress === "no_progress" ? c.noProgress + 1 : c.noProgress;
       check(p.nextNoProgress === next, "pending progress contradicts the saved result");
       check(r.kind !== "review" || r.verdict === "unable_to_verify" || !p.reworkId || c.reworkReady, "pending rework was never handed off");
-      check(p.haltReason === null || ["human_required", "no_progress", "session_limit", "session_limit_unreviewed"].includes(p.haltReason), "invalid pending halt reason");
+      check(p.haltReason === null || ["human_required", "no_progress", "session_limit", "session_limit_unreviewed", "head_mismatch"].includes(p.haltReason), "invalid pending halt reason");
+      if (p.headMismatch !== undefined) {
+        const h = p.headMismatch;
+        check(object(h) && r.kind === "implement" && p.pushed && count(h.attempts) && h.attempts > 0 &&
+          h.attempts <= IMPLEMENTATION_HEAD_CHECK_LIMIT && text(h.actualHead) && count(h.retryAt), "invalid implementation head retry");
+        check((h.attempts === IMPLEMENTATION_HEAD_CHECK_LIMIT) === (p.haltReason === "head_mismatch"), "head retry limit contradicts halt decision");
+      }
+      check(p.haltReason !== "head_mismatch" || p.headMismatch?.attempts === IMPLEMENTATION_HEAD_CHECK_LIMIT, "head mismatch halt needs exhausted checks");
       check(p.waitingState === null || p.waitingState === p.targetState, "pending waiting state contradicts target");
       check(p.haltReason === null || p.waitingState === p.targetState, "halted handoff must wait at its target");
     }
