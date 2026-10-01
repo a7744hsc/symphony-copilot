@@ -64,7 +64,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "root": { "type": "string", "default": "<system temp dir>/symphony_workspaces", "description": "One folder per issue is created here; the run ledger .symphony-ledger.json also lives here. Supports ~, $VAR and paths relative to WORKFLOW.md. Use a separate, non-nested root for each workflow, outside its source repository and runner logs. Startup rejects overlapping runner state paths. Changing the root requires stopping and restarting the runner." }
+        "root": { "type": "string", "default": "<system temp dir>/symphony_workspaces", "description": "One folder per issue is created here; the run ledger .symphony-ledger.json also lives here. Supports ~, $VAR and paths relative to WORKFLOW.md. Use a separate, non-nested root for each workflow, outside its source repository and runner logs. Startup reserves configured root entries, symlink-ancestor locations and resolved targets, rejecting overlapping runner state paths. Changing the root, even to another alias of the same target, requires stopping and restarting the runner." }
       }
     },
     "hooks": {
