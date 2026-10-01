@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -167,6 +167,42 @@ test("state path collision is rejected even for different projects, including di
   assert.equal(registry.list().length, 1);
   assert.match((await command(["status", "alpha"])).stdout, /alpha: running/);
 });
+
+for (const [kind, link] of [["symlink", symlinkSync], ["hard link", linkSync]] as const) {
+  test(`a real runner rejects a ledger temporary ${kind} to a live runner's log before startup`, { timeout: 40_000 }, async (t) => {
+    const { command, workflow, registry, env, home, calls } = await fixture(t);
+    const a = workflow(1), b = workflow(2);
+    assert.equal((await command(["start", a.path, "--id", "alpha"])).code, 0);
+    await until(() => new RunLedger(a.ledger).records()[0]?.lastState === "Human Review");
+    const alpha = registry.list()[0]!;
+    const log = join(alpha.directory, "orchestrator.log");
+    const originalLog = readFileSync(log, "utf8");
+    const originalLedger = readFileSync(b.ledger, "utf8");
+    const authorization = new RunLedger(b.ledger).records()[0]!.authorizationId;
+    link(log, `${b.ledger}.tmp`);
+    const rejected = await capture(spawn(process.execPath, [cli, b.path, "--id", "beta", "--once"], {
+      env, stdio: ["ignore", "pipe", "pipe"],
+    }));
+    assert.equal(rejected.code, 1, rejected.stderr);
+    assert.match(rejected.stderr, /state path collision.*alpha/);
+    assert.ok(readFileSync(log, "utf8").startsWith(originalLog), "alpha's existing log must remain intact");
+    assert.doesNotMatch(readFileSync(log, "utf8"), /"version": 2|"me\/app-2:issue-2"/);
+    assert.equal(readFileSync(b.ledger, "utf8"), originalLedger);
+    assert.equal(existsSync(join(home, "state", "runners", "beta")), false);
+    assert.equal(registry.list().length, 1);
+    assert.equal(calls.some((c) => c.number === 2), false, "beta must not poll before rejection");
+    assert.equal(await requestRunner(alpha, "status"), "running");
+    const polls = calls.filter((c) => c.number === 1).length;
+    await until(() => calls.filter((c) => c.number === 1).length > polls);
+    rmSync(`${b.ledger}.tmp`);
+    const started = await command(["start", b.path, "--id", "beta"]);
+    assert.equal(started.code, 0, started.stderr);
+    await until(() => new RunLedger(b.ledger).records()[0]?.lastState === "Human Review");
+    assert.equal(new RunLedger(b.ledger).records()[0]?.authorizationId, authorization);
+    assert.equal((await command(["stop", "beta"])).code, 0);
+    assert.equal(await requestRunner(alpha, "status"), "running");
+  });
+}
 
 test("single-workflow default commands, legacy remembered paths, foreground run and read-only CLI remain compatible", { timeout: 40_000 }, async (t) => {
   const { command, workflow, registry, env, home } = await fixture(t);

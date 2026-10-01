@@ -93,6 +93,84 @@ test("existing log/ledger symlinks cannot overlap even within one runner", async
   assert.equal(readFileSync(join(dir, "beta.md"), "utf8"), "prompt");
 });
 
+for (const [kind, link] of [["symlink", symlinkSync], ["hard link", linkSync]] as const) {
+  test(`ledger temporary ${kind} collisions protect live and stopped runners before effects`, async (t) => {
+    for (const resource of ["workflow", "ledger", "log"] as const) {
+      for (const stopped of [false, true]) {
+        const { registry, record } = fixture(t);
+        const a = record("alpha"), b = record("beta");
+        mkdirSync(a.workspace, { recursive: true });
+        mkdirSync(a.directory, { recursive: true });
+        mkdirSync(b.workspace, { recursive: true });
+        const target = resource === "workflow" ? a.workflow
+          : resource === "ledger" ? join(a.workspace, ".symphony-ledger.json")
+          : join(a.directory, "orchestrator.log");
+        writeFileSync(target, "alpha state");
+        await registry.claim(a);
+        if (stopped) await registry.release(a.id, a.run!.nonce);
+        link(target, join(b.workspace, ".symphony-ledger.json.tmp"));
+        await assert.rejects(registry.claim(b), /state path collision.*alpha/, `${kind}: ${resource}, stopped=${stopped}`);
+        assert.equal(readFileSync(target, "utf8"), "alpha state");
+        assert.equal(existsSync(b.directory), false);
+        assert.equal(existsSync(join(b.workspace, ".symphony-ledger.json")), false);
+        assert.deepEqual(registry.list().map((r) => r.id), ["alpha"]);
+      }
+    }
+  });
+
+  test(`ledger temporary ${kind} collisions protect the same runner and the registry`, async (t) => {
+    for (const resource of ["workflow", "ledger", "log", "registry"] as const) {
+      const { registry, record } = fixture(t);
+      const a = record("alpha");
+      mkdirSync(a.workspace, { recursive: true });
+      mkdirSync(a.directory, { recursive: true });
+      mkdirSync(registry.root, { recursive: true });
+      const target = resource === "workflow" ? a.workflow
+        : resource === "ledger" ? join(a.workspace, ".symphony-ledger.json")
+        : resource === "log" ? join(a.directory, "orchestrator.log") : registry.path;
+      writeFileSync(target, "[]");
+      link(target, join(a.workspace, ".symphony-ledger.json.tmp"));
+      const expected = resource === "registry" ? /shared registry/ : /must not overlap/;
+      await assert.rejects(registry.claim(a), expected, `${kind}: ${resource}`);
+      assert.equal(readFileSync(target, "utf8"), "[]");
+      assert.deepEqual(registry.list(), []);
+    }
+  });
+}
+
+test("ledger temporary paths participate in collision checks in either claim order", async (t) => {
+  for (const sidecarFirst of [false, true]) {
+    const { registry, record } = fixture(t);
+    const a = record("alpha"), b = record("beta");
+    mkdirSync(a.directory, { recursive: true });
+    const temporary = join(b.workspace, ".symphony-ledger.json.tmp");
+    symlinkSync(temporary, join(a.directory, "orchestrator.log"));
+    const [first, second] = sidecarFirst ? [b, a] : [a, b];
+    await registry.claim(first);
+    await assert.rejects(registry.claim(second), /state path collision/);
+    assert.equal(existsSync(temporary), false);
+    assert.equal(existsSync(b.workspace), false);
+    assert.equal(registry.list().length, 1);
+  }
+});
+
+test("pre-existing ledger temporary files fail startup without overwriting crash evidence", async (t) => {
+  for (const kind of ["file", "directory", "dangling symlink"]) {
+    const { dir, registry, record } = fixture(t);
+    const a = record("alpha");
+    mkdirSync(a.workspace, { recursive: true });
+    const temporary = join(a.workspace, ".symphony-ledger.json.tmp");
+    if (kind === "file") writeFileSync(temporary, "unfinished save");
+    else if (kind === "directory") mkdirSync(temporary);
+    else symlinkSync(join(dir, "missing"), temporary);
+    await assert.rejects(registry.claim(a), /ledger temporary path already exists/);
+    assert.equal(existsSync(a.directory), false);
+    assert.equal(existsSync(join(a.workspace, ".symphony-ledger.json")), false);
+    assert.deepEqual(registry.list(), []);
+    if (kind === "file") assert.equal(readFileSync(temporary, "utf8"), "unfinished save");
+  }
+});
+
 test("dangling symlinks reserve their eventual targets before state files exist", async (t) => {
   const { dir, registry, record } = fixture(t);
   const a = record("alpha"), b = record("beta");

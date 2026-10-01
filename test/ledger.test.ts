@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -396,11 +397,13 @@ test("read-only mode never writes, including migration and a missing parent dire
   const { path, dir } = fixture(t);
   const text = JSON.stringify({ version: 1, issues: { [issue.id]: legacy() } });
   writeFileSync(path, text);
+  symlinkSync(path, `${path}.tmp`);
   const ledger = new RunLedger(path, { readOnly: true });
   const cycle = ledger.adopt(issue, 20)!;
   start(ledger, cycle);
   ledger.save();
   assert.equal(readFileSync(path, "utf8"), text);
+  assert.ok(lstatSync(`${path}.tmp`).isSymbolicLink());
   const missing = join(dir, "not-created", "ledger.json");
   new RunLedger(missing, { readOnly: true }).authorize(issue, 20, now);
   assert.equal(existsSync(join(dir, "not-created")), false);
@@ -422,6 +425,80 @@ test("a critical write failure propagates and poisons the instance, including ca
   restored.lastState = "In Progress";
   assert.throws(() => reopened.checkpoint(restored), LedgerError);
   assert.throws(() => reopened.records(), LedgerError);
+});
+
+for (const [kind, link] of [["symlink", symlinkSync], ["hard link", linkSync]] as const) {
+  test(`a save never follows a temporary ${kind}, preserves durable state and requires a fresh instance`, (t) => {
+    const { ledger, path, dir } = fixture(t);
+    const cycle = ledger.authorize(issue, 20, now);
+    const durable = readFileSync(path, "utf8");
+    const target = join(dir, "another-runner.log");
+    writeFileSync(target, "other runner's log\n");
+    link(target, `${path}.tmp`);
+    assert.throws(() => ledger.begin(cycle, "implement"), /run ledger save failed.*EEXIST/);
+    assert.equal(readFileSync(target, "utf8"), "other runner's log\n");
+    assert.equal(readFileSync(path, "utf8"), durable);
+    assert.ok(lstatSync(`${path}.tmp`), "the failed save must not remove a pre-existing alias");
+    rmSync(`${path}.tmp`);
+    assert.throws(() => ledger.save(), /instance unusable/);
+    const restored = new RunLedger(path);
+    const resumed = restored.get(cycle.key)!;
+    assert.equal(resumed.authorizationId, cycle.authorizationId);
+    assert.equal(resumed.invocation, null);
+    restored.begin(resumed, "implement");
+    assert.equal(existsSync(`${path}.tmp`), false);
+    assert.equal(new RunLedger(path).get(cycle.key)!.invocation?.phase, "starting");
+  });
+}
+
+test("a save refuses stale temporary files and dangling aliases without deleting them", (t) => {
+  for (const kind of ["file", "dangling symlink"]) {
+    const { ledger, path, dir } = fixture(t);
+    const target = join(dir, "missing-target");
+    if (kind === "file") writeFileSync(`${path}.tmp`, "crash evidence");
+    else symlinkSync(target, `${path}.tmp`);
+    assert.throws(() => ledger.authorize(issue, 20, now), /run ledger save failed.*EEXIST/);
+    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(target), false);
+    assert.ok(lstatSync(`${path}.tmp`));
+    if (kind === "file") assert.equal(readFileSync(`${path}.tmp`, "utf8"), "crash evidence");
+  }
+});
+
+test("a failed rename cleans up only the temporary file owned by that save", (t) => {
+  const { ledger, path } = fixture(t);
+  mkdirSync(path);
+  assert.throws(() => ledger.authorize(issue, 20, now), /run ledger save failed/);
+  assert.equal(existsSync(`${path}.tmp`), false);
+  assert.ok(lstatSync(path).isDirectory());
+  assert.throws(() => ledger.records(), /instance unusable/);
+});
+
+test("a partial temporary write closes its descriptor, removes its sidecar and preserves the durable ledger", (t) => {
+  const { ledger, path } = fixture(t);
+  const cycle = ledger.authorize(issue, 20, now);
+  const durable = readFileSync(path, "utf8");
+  let descriptor: number | undefined;
+  const write = t.mock.method(fs, "writeFileSync", (file: Parameters<typeof writeFileSync>[0]) => {
+    assert.equal(typeof file, "number", "the save must write through its exclusively owned descriptor");
+    if (typeof file !== "number") assert.fail("expected a file descriptor");
+    descriptor = file;
+    writeSync(file, '{"version":');
+    throw new Error("simulated partial write failure");
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => ledger.begin(cycle, "implement"), /run ledger save failed.*simulated partial write failure/);
+  } finally {
+    write.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.notEqual(descriptor, undefined);
+  assert.throws(() => fstatSync(descriptor!), /EBADF/);
+  assert.equal(existsSync(`${path}.tmp`), false);
+  assert.equal(readFileSync(path, "utf8"), durable);
+  assert.throws(() => ledger.records(), /instance unusable/);
+  assert.equal(new RunLedger(path).get(cycle.key)!.invocation, null);
 });
 
 test("unknown versions, invalid top-level records, counters and nested pending data fail closed", (t) => {

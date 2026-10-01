@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "./config.ts";
+import { ledgerWritePaths } from "./ledger.ts";
 import { parseSettings } from "./tracker/github-project.ts";
 
 export interface RunnerIdentity {
@@ -105,8 +106,12 @@ export function processAlive(pid: number): boolean {
   }
 }
 
+function workspaceResources(record: RunnerRecord): string[] {
+  return [record.workspace, ...ledgerWritePaths(join(record.workspace, ".symphony-ledger.json"))];
+}
+
 function resources(record: RunnerRecord): string[] {
-  return [record.workflow, record.workspace, join(record.workspace, ".symphony-ledger.json"), record.directory, join(record.directory, "orchestrator.log")];
+  return [record.workflow, ...workspaceResources(record), record.directory, join(record.directory, "orchestrator.log")];
 }
 
 function recordValid(value: unknown): value is RunnerRecord {
@@ -150,15 +155,18 @@ export class RunnerRegistry {
         throw new Error(`workflow ID "${record.id}" already belongs to ${own.workflow}; choose another --id`);
       }
       const requested = resources(record);
-      if (requested.some((p) => pathsOverlap(p, this.root))) {
+      const registryPaths = [this.root, this.path, join(this.root, "registry.lock")];
+      if (requested.some((p) => registryPaths.some((other) => pathsOverlap(p, other)))) {
         throw new Error(`runner state paths must not overlap the shared registry ${this.root}`);
       }
-      const workspacePaths = [record.workspace, join(record.workspace, ".symphony-ledger.json")];
+      const workspacePaths = workspaceResources(record);
+      const [ledger, temporary] = ledgerWritePaths(join(record.workspace, ".symphony-ledger.json"));
       const logPaths = [record.directory, join(record.directory, "orchestrator.log")];
       if (workspacePaths.some((p) => [...logPaths, record.workflow].some((other) => pathsOverlap(p, other))) ||
         logPaths.some((p) => pathsOverlap(record.workflow, p))) {
         throw new Error("workspace.root, workflow file and runner log directory must not overlap");
       }
+      if (pathsOverlap(ledger, temporary)) throw new Error("ledger and temporary file must not overlap");
       for (const other of records) {
         const live = other.run && processAlive(other.run.pid);
         if (other.id === record.id) {
@@ -175,6 +183,9 @@ export class RunnerRegistry {
           const collision = resources(other).find((p) => pathsOverlap(path, p));
           if (collision) throw new Error(`state path collision with runner "${other.id}": ${path} overlaps ${collision}; choose separate, non-nested workspace/log paths`);
         }
+      }
+      if (lstatSync(temporary, { throwIfNoEntry: false })) {
+        throw new Error(`ledger temporary path already exists: ${temporary}; with the runner stopped, inspect and remove the leftover file or alias before restarting; do not delete the ledger`);
       }
       if (own) records.splice(records.indexOf(own), 1, record);
       else records.push(record);
