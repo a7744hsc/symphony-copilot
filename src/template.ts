@@ -1,5 +1,6 @@
 import { Liquid } from "liquidjs";
 import type { Role } from "./config.ts";
+import { outputLanguageInstruction, type Language } from "./language.ts";
 import { issueForTemplate, type Issue } from "./types.ts";
 
 const engine = new Liquid({ strictVariables: true, strictFilters: true, ownPropertyOnly: true });
@@ -55,11 +56,11 @@ Check whether rework addressed the underlying failure class and whether justifie
 If a missing external prerequisite or human decision makes verification impossible, use tracker_submit_review with verdict=unable_to_verify, progress=not_assessed and next_action=human_required, with the required evidence and next step. Do not turn review into a planning interview or bypass the configured verdict handoff.`;
 
 /** Host guidance, not a filesystem gate. Compose only after rendering repository Liquid. */
-export function composeAgentPrompt(repositoryPrompt: string, role: Role, firstTurn: boolean): string {
+export function composeAgentPrompt(repositoryPrompt: string, role: Role, firstTurn: boolean, language: Language = "en"): string {
   const instructions = firstTurn
     ? role === "implement" ? IMPLEMENTATION_PLANNING : REVIEW_PLANNING
     : role === "implement"
       ? "Continue the existing plan and workspace progress; do not republish an unchanged plan. If the plan is still missing, complete the planning protocol before product edits. For material changes or repeated failure classes, revise the approach and record the revision on the issue before proceeding. Use the configured blocker path only for genuine impediments."
       : "Continue the remaining independent checks, treating issue plans as evidence rather than authority. Do not restart planning or wait for chat approval; finish through the configured review tool.";
-  return `${AUTONOMOUS_AUTHORITY}\n\n${instructions}\n\n## Repository instructions\n${repositoryPrompt}`;
+  return `${outputLanguageInstruction(language)}\n\n${AUTONOMOUS_AUTHORITY}\n\n${instructions}\n\n## Repository instructions\n${repositoryPrompt}`;
 }

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { CopilotClient, RuntimeConnection, type CopilotSession, type SessionEvent } from "@github/copilot-sdk";
 import { isActiveState, isRoutable, roleFor, type Role, type ServiceConfig } from "./config.ts";
 import { truncate, type Logger } from "./log.ts";
+import { outputLanguageInstruction } from "./language.ts";
 import { createPermissionHandler, isInside } from "./policy.ts";
 import { composeAgentPrompt, renderContinuationPrompt, renderIssuePrompt, renderTemplate } from "./template.ts";
 import type { TrackerAdapter } from "./tracker/index.ts";
@@ -321,7 +322,7 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
           urlAllow: config.copilot.urlAllow,
         }, p.log),
         // Unattended: answer questions with a fixed instruction instead of stalling (spec §10.5).
-        onUserInputRequest: () => ({ answer: config.copilot.userInputReply, wasFreeform: true }),
+        onUserInputRequest: () => ({ answer: `${config.copilot.userInputReply}\n\n${outputLanguageInstruction(config.language)}`, wasFreeform: true }),
       }), "session_create", (created) => cleanupLate(created));
     } catch (error) {
       if (error instanceof RunError) throw error;
@@ -377,7 +378,7 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
             : "a formally handed-off rework is ready; assess it as made_progress or no_progress with evidence."} If verification is impossible, use unable_to_verify with not_assessed and human_required.`
           : renderIssuePrompt(p.promptTemplate, issue, p.attempt)
         : renderContinuationPrompt(review ? review.continuationPrompt : config.agent.continuationPrompt, issue, turn, config.agent.maxTurns);
-      const prompt = composeAgentPrompt(repositoryPrompt, role, turn === 1);
+      const prompt = composeAgentPrompt(repositoryPrompt, role, turn === 1, config.language);
       p.onUpdate({ event: "turn_started", timestamp: new Date(), sessionId, turn });
       turns = turn;
       await runTurn({

@@ -25,6 +25,23 @@ test("continuation prompt gets turn and max_turns", () => {
   assert.equal(renderContinuationPrompt("{{ issue.identifier }} {{ turn }}/{{ max_turns }}", makeIssue(), 2, 5), "GH-1 2/5");
 });
 
+test("one English prompt specifies the selected output language in both roles and every turn", () => {
+  for (const language of ["en", "zh-CN"] as const) {
+    for (const role of ["implement", "review"] as const) {
+      for (const firstTurn of [true, false]) {
+        const prompt = composeAgentPrompt("Literal {{ unrendered }}. Use the issue evidence.", role, firstTurn, language);
+        assert.ok(prompt.endsWith("Literal {{ unrendered }}. Use the issue evidence."));
+        assert.ok(prompt.includes(`The workflow language is ${language === "en" ? "English (en)" : "Simplified Chinese (zh-CN)"}.`));
+        assert.match(prompt, /even when the issue, conversation or repository instructions use another language/);
+        assert.match(prompt, /issue and pull request titles\/bodies.*plans.*review.*follow-ups.*blocking/);
+        assert.match(prompt, /prompt templates in English/);
+        assert.match(prompt, /enum values.*Closes/);
+        assert.doesNotMatch(prompt, /[\u3400-\u9fff]/, "the prompt itself remains English");
+      }
+    }
+  }
+});
+
 test("implementer receives proportional planning and self-grill without replacing the repository prompt", () => {
   const repository = "Use this project's checks. Literal {{ not_a_template }} stays intact.";
   const prompt = composeAgentPrompt(repository, "implement", true);

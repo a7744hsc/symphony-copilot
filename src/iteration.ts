@@ -1,4 +1,5 @@
 import type { ServiceConfig } from "./config.ts";
+import type { Language } from "./language.ts";
 import { normalizeState } from "./types.ts";
 
 export interface ReviewResult {
@@ -19,6 +20,8 @@ export interface IssueMessageRef { id: string; url: string | null }
 export const IMPLEMENTATION_HEAD_CHECK_LIMIT = 3;
 export const IMPLEMENTATION_HEAD_RETRY_MS = 60_000;
 export interface PendingHandoff {
+  /** Frozen at acceptance; absent only in ledgers written before language support. */
+  language?: Language;
   id: string;
   invocationId: string;
   sourceState: string;

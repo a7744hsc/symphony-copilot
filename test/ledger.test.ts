@@ -172,6 +172,23 @@ test("accept checkpoints one immutable semantic result; restart and completion d
   assert.ok(!text.includes("Reproduced the blocker."), "settled semantic body is not a local history store");
 });
 
+test("accepted language is durable across reload/restart; old ledgers remain readable", (t) => {
+  const { ledger, path } = fixture(t);
+  const cycle = ledger.authorize(issue, 20, now);
+  const invocation = start(ledger, cycle);
+  const pending = ledger.accept(cycle, invocation.id, implementation, "/work", { ...config, language: "zh-CN" });
+  assert.equal(pending.language, "zh-CN");
+  assert.equal(ledger.accept(cycle, invocation.id, implementation, "/work", { ...config, language: "en" }).language, "zh-CN");
+  assert.equal(new RunLedger(path).get(cycle.key)!.pending!.language, "zh-CN");
+  const saved = readFileSync(path, "utf8");
+  writeFileSync(path, saved.replace(/"language":\s*"zh-CN"/, '"language":"fr"'));
+  assert.throws(() => new RunLedger(path), /invalid pending language/);
+  writeFileSync(path, saved);
+  delete pending.language;
+  ledger.checkpoint(cycle);
+  assert.equal(new RunLedger(path).get(cycle.key)!.pending!.language, undefined);
+});
+
 test("only two distinct, formally handed-off reworks can stop for no progress, even on the same SHA", (t) => {
   const { ledger, path } = fixture(t);
   const cycle = ledger.authorize(issue, 20, now);

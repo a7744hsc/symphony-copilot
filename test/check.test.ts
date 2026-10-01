@@ -36,6 +36,7 @@ function tracked(value: Record<string, unknown>, seen: Set<string>, prefix = "")
 }
 
 const everyKey = {
+  language: "en",
   tracker: {
     kind: "github_project",
     provider: {
@@ -129,6 +130,17 @@ const messages = (path: string, env: NodeJS.ProcessEnv = { SYMPHONY_GITHUB_TOKEN
 
 test("a sound workflow has no findings", () => {
   assert.deepEqual(messages(workflowFile(base)), []);
+});
+
+test("offline language validation agrees with runtime validation", () => {
+  for (const language of ["en", "zh-CN"]) {
+    const path = workflowFile(`language: ${language}\n${base}`);
+    assert.deepEqual(messages(path), []);
+    assert.equal(checkWorkflow(path).config?.language, language);
+  }
+  for (const language of ["fr", "null", "false", "[]", '""']) {
+    assert.match(messages(workflowFile(`language: ${language}\n${base}`)).join("\n"), /language must be "en" or "zh-CN"/);
+  }
 });
 
 test("the example workflow has no errors", () => {

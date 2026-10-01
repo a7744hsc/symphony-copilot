@@ -8,7 +8,7 @@ export { TrackerError, type AgentToolContext, type MergeConflict, type TrackerAd
 export function createTracker(config: ServiceConfig, env: NodeJS.ProcessEnv, log: Logger): TrackerAdapter {
   switch (config.tracker.kind) {
     case "github_project":
-      return new GitHubProjectTracker(config.tracker.provider, env, log, undefined, (issue) => isRoutable(config, issue));
+      return new GitHubProjectTracker(config.tracker.provider, env, log, undefined, (issue) => isRoutable(config, issue), config.language);
     default:
       throw new TrackerError("unsupported_tracker_kind", `tracker.kind "${config.tracker.kind}" is not supported (supported: github_project)`);
   }

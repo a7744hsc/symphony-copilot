@@ -71,6 +71,22 @@ test("overview preserves long issue/PR text, long blockers, and deduplicates onl
   assert.match(s.calls[0]!.query, new RegExp(`reviews\\(last: ${CONTEXT_PAGE_SIZE}\\)`));
 });
 
+test("English and Chinese review blockers remain unabridged in overview and older review pages", async () => {
+  for (const heading of ["Blocking issues", "阻塞问题"]) {
+    const data = response();
+    const blockers = "1. " + "完整阻塞证据 ".repeat(1500) + "RAW_ERROR_END";
+    const body = `**AI 审查 · 需要修改 (request_changes)**\n\n已验证。\n\n**${heading}**\n\n${blockers}`;
+    data.repository.pullRequests.nodes[0]!.reviews = connection([review("review-1", body)]);
+    const s = setup([data, data]);
+    const overview = await s.read();
+    assert.equal(overview.pull_request.reviews[0].blocking_feedback, blockers);
+    const older = await s.read({ section: "reviews", cursor: "older" });
+    assert.equal(older.items[0].blocking_feedback, blockers);
+    assert.equal(older.items[0].body, body);
+    assert.equal(older.text_truncated, false);
+  }
+});
+
 for (const section of ["issue_comments", "reviews", "pull_request_comments"] as const) {
   test(`${section} exposes older pages and unabridged feedback via scoped cursors`, async () => {
     const first = response();

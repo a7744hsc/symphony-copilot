@@ -3,6 +3,7 @@ import { isActiveState, isRoutable, isTerminalState, roleFor, type Role, type Se
 import { issueControlKey, RunLedger, type RunCycle } from "./ledger.ts";
 import type { IssueMessageRef } from "./iteration.ts";
 import { truncate, type Logger } from "./log.ts";
+import { localize, type Language } from "./language.ts";
 import type { AgentUpdate, SessionSummary, TokenTotals } from "./runner.ts";
 import type { MergeConflict, TrackerAdapter } from "./tracker/index.ts";
 import type { AgentControl } from "./tracker/types.ts";
@@ -81,7 +82,9 @@ interface RetryEntry {
 }
 
 const CONTINUATION_DELAY_MS = 1_000;
-const STARTUP_RECOVERY = "startup remains uncertain; verify/clean up interrupted runtime before reauthorizing; cannot establish automatically";
+const startupRecovery = (language: Language) => localize(language,
+  "startup remains uncertain; verify/clean up interrupted runtime before reauthorizing; cannot establish automatically",
+  "启动状态仍不确定；重新授权前请检查并清理中断的运行时，系统无法自动确认");
 
 function terminalIssue(config: ServiceConfig, issue: Issue): boolean {
   return issue.contentState === "CLOSED" || isTerminalState(config, issue.state);
@@ -112,17 +115,20 @@ export function formatDuration(ms: number): string {
 }
 
 /** Cosmetic only: never substitute configured model names or unobserved zero usage. */
-export function formatUsageFooter(s: SessionSummary, ordinal: number | null, limit: number): string | null {
+export function formatUsageFooter(s: SessionSummary, ordinal: number | null, limit: number, language: Language = "en"): string | null {
   const models = [...new Set(s.models.map((m) => m.model.trim()))];
   if (s.usageComplete !== true || ordinal === null || !Number.isFinite(s.aiCredits) || s.aiCredits < 0 ||
     !models.length || models.some((m) => !m || /^(auto|unknown)$/i.test(m) || /[\r\n<>]/.test(m))) return null;
-  return `用量（本轮）：${s.aiCredits.toFixed(2)} · 轮次 ${ordinal}/${limit} · 模型：${models.join(", ")}`;
+  return localize(language,
+    `Usage (this session): ${s.aiCredits.toFixed(2)} · Sessions ${ordinal}/${limit} · Models: ${models.join(", ")}`,
+    `用量（本轮）：${s.aiCredits.toFixed(2)} · 轮次 ${ordinal}/${limit} · 模型：${models.join(", ")}`);
 }
 
 /** Why this run may not start another session, or null. */
-export function runLimitReached(cycle: RunCycle): string | null {
+export function runLimitReached(cycle: RunCycle, language: Language = "en"): string | null {
   if (cycle.sessions >= cycle.limit) {
-    return `It used all ${cycle.limit} sessions allowed per authorization (agent.max_sessions) without handing the issue off.`;
+    return localize(language, `It used all ${cycle.limit} sessions allowed per authorization (agent.max_sessions) without handing the issue off.`,
+      `本次授权允许的 ${cycle.limit} 次会话 (agent.max_sessions) 已全部用尽，但尚未完成 issue 交接。`);
   }
   return null;
 }
@@ -389,7 +395,9 @@ export class Orchestrator {
       if (this.ledgerFailure) throw error;
       if (!this.unidentified.has(issue.id) && !terminalIssue(config, issue) && isActiveState(config, issue.state)) {
         this.unidentified.add(issue.id);
-        await tracker.commentOnIssue?.(issue, `**symphony-copilot: control identity cannot be recovered.** ${(error as Error).message}. Restore the ledger/native issue mapping before moving the card to "${config.tracker.startState}".`);
+        await tracker.commentOnIssue?.(issue, localize(config.language,
+          `**symphony-copilot: control identity cannot be recovered.** ${(error as Error).message}. Restore the ledger/native issue mapping before moving the card to "${config.tracker.startState}".`,
+          `**symphony-copilot：无法恢复控制标识。** ${(error as Error).message}。请恢复账本与原始 issue 的映射，再将卡片移至 "${config.tracker.startState}"。`));
         await tracker.blockIssue?.(issue);
       }
       return;
@@ -406,7 +414,8 @@ export class Orchestrator {
       }
       // Persist an inactive origin first: a crash before pause must not authorize an orphan active card.
       cycle = this.ledger.authorize({ ...issue, state: config.tracker.blockedState }, config.agent.maxSessions, new Date(this.now()));
-      this.markHalted(issue, cycle, "No recoverable authorization for this running card; human takeover is required.");
+      this.markHalted(issue, cycle, localize(config.language, "No recoverable authorization for this running card; human takeover is required.",
+        "无法恢复此运行中卡片的授权，需要人工接管。"));
       await this.reportHalt(issue, cycle);
       return;
     }
@@ -443,7 +452,7 @@ export class Orchestrator {
     }
     const invocation = cycle.invocation;
     if (invocation && (invocation.startupUncertain || invocation.phase !== "finished") && !cycle.halted) {
-      this.markHalted(issue, cycle, invocation.startupUncertain ? `startup_uncertain: ${STARTUP_RECOVERY}` : "interrupted_session");
+      this.markHalted(issue, cycle, invocation.startupUncertain ? `startup_uncertain: ${startupRecovery(config.language)}` : localize(config.language, "interrupted_session", "会话已中断 (interrupted_session)"));
       await this.reportHalt(issue, cycle);
       return;
     }
@@ -467,12 +476,14 @@ export class Orchestrator {
       if (cycle.returnedFor && config.mergeConflicts && this.same(issue.state, config.mergeConflicts.returnState)) {
         cycle.waitingState = null; // A lost successful conflict-return response; keep allowance and streak.
       } else {
-        this.markHalted(issue, cycle, "Unexpected transition from a waiting column; return to the start column to authorize work.");
+        this.markHalted(issue, cycle, localize(config.language, "Unexpected transition from a waiting column; return to the start column to authorize work.",
+          "卡片从等待列发生了非预期转换，请返回开始列以授权工作。"));
         await this.reportHalt(issue, cycle);
         return;
       }
     } else if (this.same(issue.state, config.tracker.startState) && !this.same(cycle.lastState, config.tracker.startState)) {
-      this.markHalted(issue, cycle, "Running -> Todo is not a new authorization; first wait in the blocked column.");
+      this.markHalted(issue, cycle, localize(config.language, "Running -> Todo is not a new authorization; first wait in the blocked column.",
+        "从运行状态直接返回开始列不构成新授权，请先在阻塞列等待。"));
       await this.reportHalt(issue, cycle);
       return;
     }
@@ -490,7 +501,7 @@ export class Orchestrator {
     const cycle = this.ledger.get(issue.id);
     if (terminalIssue(config, issue) || !cycle || cycle.halted || cycle.terminal || cycle.pending || cycle.waitingState || cycle.invocation?.startupUncertain ||
       !this.same(cycle.lastState, issue.state) || this.workerFor(cycle)) return null;
-    const reason = runLimitReached(cycle);
+    const reason = runLimitReached(cycle, config.language);
     if (!reason) {
       if (!this.same(issue.state, config.tracker.startState)) return issue;
       if (!tracker.moveIssue) throw new Error("tracker cannot take over the start column");
@@ -521,7 +532,7 @@ export class Orchestrator {
   }
 
   /** Tells people on the issue why work stopped, and moves the card out of the active states if the tracker can. */
-  private async reportHalt(issue: Issue, cycle: RunCycle, usage: string | null = null, notify = true): Promise<void> {
+  private async reportHalt(issue: Issue, cycle: RunCycle, usage: string | null = null, notify = true, language: Language = this.trackerConfig!.language): Promise<void> {
     const tracker = this.tracker;
     const log = this.log.child({ issue_id: issue.id, issue_identifier: issue.identifier });
     let moved: string | null = null;
@@ -545,12 +556,14 @@ export class Orchestrator {
     }
     this.saveLedger();
     if (!notify) return;
+    const l = (en: string, zh: string) => localize(language, en, zh);
     const recovery = cycle.invocation?.startupUncertain
-      ? `${STARTUP_RECOVERY}. A restart or board move alone cannot release this pause.`
-      : `Resolve the cause, then move the card from a waiting column to "${this.trackerConfig!.tracker.startState}" to authorize a new run.`;
-    const next = `${moved ? `The card was moved to "${moved}". ` : ""}${recovery}`;
-    const body = `**symphony-copilot stopped working on this issue.** ${cycle.halted?.reason ?? ""}\n\n`
-      + `This run used ${cycle.sessions} session(s). ${next}`
+      ? `${startupRecovery(language)}${l(". A restart or board move alone cannot release this pause.", "。仅重启或移动卡片无法解除此暂停。")}`
+      : l(`Resolve the cause, then move the card from a waiting column to "${this.trackerConfig!.tracker.startState}" to authorize a new run.`,
+        `请解决原因，再将卡片从等待列移至 "${this.trackerConfig!.tracker.startState}" 以授权新一轮运行。`);
+    const next = `${moved ? l(`The card was moved to "${moved}". `, `卡片已移至 "${moved}"。`) : ""}${recovery}`;
+    const body = `**${l("symphony-copilot stopped working on this issue.", "symphony-copilot 已停止处理此 issue。")}** ${cycle.halted?.reason ?? ""}\n\n`
+      + l(`This run used ${cycle.sessions} session(s). ${next}`, `本次运行已使用 ${cycle.sessions} 次会话。${next}`)
       + (usage ? `\n\n${usage}` : "");
     try {
       await tracker?.commentOnIssue?.(issue, body);
@@ -601,9 +614,12 @@ export class Orchestrator {
       this.saveLedger();
       log.info("returned for merge conflict", fields);
       const label = config.tracker.requiredLabels[0];
-      const body = `**symphony-copilot: [PR #${pr.number}](${pr.url}) has merge conflicts with \`${pr.baseBranch}\`.** `
+      const body = localize(config.language, `**symphony-copilot: [PR #${pr.number}](${pr.url}) has merge conflicts with \`${pr.baseBranch}\`.** `
         + `The card was moved from "${issue.state}" to "${settings.returnState}" ahead of other work. The agent will merge \`${pr.baseBranch}\` into the branch, resolve the conflicts, rerun the checks and submit it for review again.`
-        + (label ? ` To resolve conflicts yourself instead, remove the "${label}" label while the card waits for you.` : "");
+        + (label ? ` To resolve conflicts yourself instead, remove the "${label}" label while the card waits for you.` : ""),
+        `**symphony-copilot：[PR #${pr.number}](${pr.url}) 与 \`${pr.baseBranch}\` 存在合并冲突。** `
+        + `卡片已从 "${issue.state}" 移至 "${settings.returnState}"，将优先处理。agent 会将 \`${pr.baseBranch}\` 合并到工作分支、解决冲突、重新运行检查并再次提交审查。`
+        + (label ? `如需自行解决冲突，请在卡片等待您处理时移除 "${label}" 标签。` : ""));
       try {
         await tracker.commentOnIssue?.(issue, body);
       } catch (error) {
@@ -845,9 +861,9 @@ export class Orchestrator {
       return;
     }
     if (!cycle.invocation.sessionId || entry.startupUncertain) {
-      const reason = `${entry.startupUncertain ? "startup_uncertain" : "startup_failed"} (${entry.startupPhase}): ${error?.message ?? "worker ended before SDK session creation"}`;
-      this.markHalted(entry.issue, cycle, reason + (cycle.invocation.startupUncertain ? `. ${STARTUP_RECOVERY}.` : ""));
-      await this.reportHalt(entry.issue, cycle, this.footer(entry));
+      const reason = `${entry.startupUncertain ? "startup_uncertain" : "startup_failed"} (${entry.startupPhase}): ${error?.message ?? localize(entry.config.language, "worker ended before SDK session creation", "工作进程在 SDK 会话创建前结束")}`;
+      this.markHalted(entry.issue, cycle, reason + (cycle.invocation.startupUncertain ? `. ${startupRecovery(entry.config.language)}.` : ""));
+      await this.reportHalt(entry.issue, cycle, this.footer(entry), true, entry.config.language);
       return;
     }
     if (!error && !entry.stalled) {
@@ -860,8 +876,10 @@ export class Orchestrator {
     const reason = entry.stalled ? "stalled" : error!.message;
     log.warn("worker failed; retrying", { attempt, error: reason, ...run });
     this.scheduleRetry(entry.issue, attempt, `worker exited: ${reason}`);
-    const body = `**symphony-copilot: session failed.** Stage: ${entry.startupPhase}; outcome: ${reason}. `
-      + `The task may retry using the remaining allowance (${cycle.sessions}/${cycle.limit}); stop the service to troubleshoot if human action is needed.`;
+    const body = localize(entry.config.language, `**symphony-copilot: session failed.** Stage: ${entry.startupPhase}; outcome: ${reason}. `
+      + `The task may retry using the remaining allowance (${cycle.sessions}/${cycle.limit}); stop the service to troubleshoot if human action is needed.`,
+      `**symphony-copilot：会话失败。** 阶段：${entry.startupPhase}；结果：${reason}。`
+      + `任务可能使用剩余额度重试（已使用 ${cycle.sessions}/${cycle.limit}）；如需人工排查，请停止服务。`);
     try { await entry.tracker.commentOnIssue?.(entry.issue, body + (this.footer(entry) ? `\n\n${this.footer(entry)}` : "")); }
     catch (failure) { log.warn("could not report session failure", { error: (failure as Error).message }); }
   }
@@ -891,7 +909,7 @@ export class Orchestrator {
   }
 
   private footer(entry: RunningEntry): string | null {
-    return entry.config.agent.usageComments && entry.summary ? formatUsageFooter(entry.summary, entry.ordinal, entry.limit) : null;
+    return entry.config.agent.usageComments && entry.summary ? formatUsageFooter(entry.summary, entry.ordinal, entry.limit, entry.config.language) : null;
   }
 
   private async reportSession(entry: RunningEntry): Promise<void> {
@@ -1018,7 +1036,7 @@ export class Orchestrator {
       else if (isActiveState(config, issue.state) && isRoutable(config, issue)) {
         if (cycle.pending && [cycle.pending.sourceState, cycle.pending.targetState].some((s) => this.same(s, issue.state))) continue;
         if (this.same(issue.state, config.tracker.startState)) {
-          this.markHalted(issue, cycle, "Running -> Todo is not a new authorization");
+          this.markHalted(issue, cycle, localize(config.language, "Running -> Todo is not a new authorization", "从运行状态直接返回开始列不构成新授权"));
           this.terminate(entry, false, "unexpected start-column move", issue.state);
           continue;
         }

@@ -3,6 +3,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, w
 import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { Role, ServiceConfig } from "./config.ts";
+import { isLanguage } from "./language.ts";
 import { decideResult, IMPLEMENTATION_HEAD_CHECK_LIMIT, validateAgentResult, type AgentResult, type PendingHandoff } from "./iteration.ts";
 import { normalizeState, type Issue } from "./types.ts";
 
@@ -206,6 +207,7 @@ export class RunLedger {
     const hasRework = cycle.reworkReady && cycle.reworkId !== null && cycle.reworkId !== cycle.lastSettledReworkId;
     const decision = decideResult(result, config, { ...cycle, hasRework });
     const pending: PendingHandoff = {
+      language: config.language,
       id: randomUUID(), invocationId, sourceState: cycle.lastState, workspacePath, result: structuredClone(result), ...decision,
       issueMessage: null, pr: null, prPublished: false, pushed: false, statusApplied: false, stale: false, reworkId: cycle.reworkId,
       waitingState: config.tracker.activeStates.some((s) => normalizeState(s) === normalizeState(decision.targetState)) ? null : decision.targetState,
@@ -323,6 +325,7 @@ function validateData(data: any): void {
     if (c.pending !== null) {
       const p = c.pending;
       check(object(p) && text(p.id) && c.invocation?.id === p.invocationId && c.invocation.phase === "running" && c.allocations[p.invocationId]?.resultId === p.id, "malformed pending invocation binding");
+      check(p.language === undefined || isLanguage(p.language), "invalid pending language");
       check(text(p.sourceState) && text(p.targetState) && text(p.workspacePath) && nullableText(p.haltReason) && nullableText(p.waitingState) && count(p.nextNoProgress) && p.reworkId === c.reworkId, "malformed pending decision");
       check([p.prPublished, p.pushed, p.statusApplied, p.stale].every((v) => typeof v === "boolean"), "malformed pending publication flags");
       check(p.issueMessage === null || (object(p.issueMessage) && text(p.issueMessage.id) && nullableText(p.issueMessage.url)), "malformed pending issue message");

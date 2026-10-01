@@ -56,6 +56,17 @@ test("board columns follow the workflow: parked, active in order, waiting, block
   assert.deepEqual(desired.labels.map((l) => l.name), ["agent", "tech-debt"]);
 });
 
+test("Chinese board descriptions preserve configured column and label identifiers", () => {
+  const { config, settings } = load(WORKFLOW.replace("tracker:", "language: zh-CN\ntracker:"));
+  const desired = desiredBoard(config, settings);
+  assert.deepEqual(desired.statusOptions.map((o) => o.name), boardStates(config, settings).map((s) => s.name));
+  assert.match(desired.statusOptions.find((o) => o.name === "Todo")!.description, /人工.*"agent"/);
+  assert.match(desired.statusOptions.find((o) => o.name === "Blocked")!.description, /人工.*"Todo"/);
+  assert.equal(desired.priorityOptions[0]!.description, "优先处理");
+  assert.deepEqual(desired.labels.map((l) => l.name), ["agent", "tech-debt"]);
+  assert.match(desired.labels[1]!.description, /人工决定/);
+});
+
 test("custom lifecycle columns are deduplicated and keep their configured active order", () => {
   const text = WORKFLOW.replaceAll("Todo", "待开始").replaceAll("In Progress", "进行中")
     .replaceAll("Rework", "返工").replaceAll("Human Review", "人工审查").replaceAll("Blocked", "阻塞")
