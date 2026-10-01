@@ -113,7 +113,7 @@ node src/cli.ts ~/code/your-repo/WORKFLOW.md                    # 常驻运行�
 | `--once` | 只轮询一次，等派发出去的 agent 结束后退出。 |
 | `--log-level` | `debug`、`info`（默认）、`warn` 或 `error`。日志是输出到 stderr 的 `key=value` 行。 |
 
-**也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，第一次用过工作流路径后就记住它，并且拒绝启动第二个调度器：
+**也可以用 `bin/symphony`**：它会自动从 `gh` 取令牌，并用稳定的 ID 记住每份工作流：
 
 ```sh
 symphony start ~/code/your-repo/WORKFLOW.md   # 后台运行；之后直接 `symphony start`
@@ -123,7 +123,28 @@ symphony stop                                 # 停止 agent 和调度器，工�
 symphony run                                  # 在当前终端前台运行，Ctrl-C 停止
 ```
 
-后台运行的日志在 `~/symphony-workspaces/logs/orchestrator.log`；设置 `SYMPHONY_STATE_DIR` 可以把日志和 PID 文件放到别处。在 macOS 上，`start` 还会在调度器运行期间阻止 Mac 自动休眠。
+日志在 `~/symphony-workspaces/runners/<ID>/orchestrator.log`；设置 `SYMPHONY_STATE_DIR` 可以更换基础目录，`status` 会显示实际路径。在 macOS 上，`start` 还会在调度器运行期间阻止 Mac 自动休眠。
+
+### 一台机器运行多份工作流
+
+每份工作流必须使用**不同的 GitHub Project，以及独立、互不嵌套的 `workspace.root`**。每个进程独立持有配置、提示词、agent、运行账本和日志，不合并配置。
+
+```sh
+symphony start ~/code/app/WORKFLOW.md --id app
+symphony start ~/code/site/WORKFLOW.md --id site
+symphony list                    # 列出稳定 ID、状态和路径
+symphony status app              # 只看 app 的状态与近期日志
+symphony logs site               # 只跟踪 site 日志；--no-follow 打印后退出
+symphony stop app                # site 继续运行
+symphony start --id app          # 用记住的路径重启 app
+symphony run --id app            # 改为前台运行（先停止后台实例）
+```
+
+不指定 `--id` 时，根据规范化后的工作流路径生成 ID，重启不会改变。ID 允许字母、数字、`_` 和 `-`，不区分大小写。只登记一份工作流时，原来的无 ID 命令仍然有效；登记多份后，`status` 列出全部，`start`/`run` 必须给路径或 `--id`，`stop`/`logs` 必须指定 ID，不会擅自选中或停止全部实例。
+
+启动前会拒绝同一看板的第二个运行实例，即使仓库过滤条件或 `SYMPHONY_STATE_DIR` 不同；工作区、账本、日志和配置路径重叠（包括符号链接别名）也会被拒绝。停止后保留账本、工作区和登记信息。提示词及普通配置仍可热加载；工作区或 tracker 身份变更必须停止后重启。直接执行 `node src/cli.ts` 也参与同一套隔离检查；只读 `--dry-run` 不占用资源。
+
+**升级：**先停止旧版本启动的实例，再运行新版本。首次使用仍会读取旧的 `.last-workflow`，但日志改为按 ID 存放，不会迁移旧日志。协调范围是同一台机器上的一个可信操作系统用户，不跨用户或跨机器；不支持多个实例共享一个看板。恢复方式见[参考文档](docs/reference.md#runner-management-and-recovery)。
 
 ## 配置
 

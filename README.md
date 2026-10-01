@@ -111,7 +111,7 @@ Then write a card with `/symphony-write-card` (or label an issue `agent` and mov
 | `--once` | Polls once, waits for dispatched agents to finish, then exits. |
 | `--log-level` | `debug`, `info` (default), `warn` or `error`. Logs are `key=value` lines on stderr. |
 
-**Or use `bin/symphony`**, which fetches the token from `gh`, remembers the workflow path after the first use, and refuses to start a second orchestrator:
+**Or use `bin/symphony`**, which fetches the token from `gh` and remembers each workflow by a stable ID:
 
 ```sh
 symphony start ~/code/your-repo/WORKFLOW.md   # background; later just `symphony start`
@@ -121,7 +121,28 @@ symphony stop                                 # stop agents and the orchestrator
 symphony run                                  # foreground in this terminal; Ctrl-C stops it
 ```
 
-The background log is `~/symphony-workspaces/logs/orchestrator.log`; set `SYMPHONY_STATE_DIR` to keep the log and PID file elsewhere. On macOS, `start` also keeps the Mac from idle-sleeping while the orchestrator runs.
+Logs are in `~/symphony-workspaces/runners/<ID>/orchestrator.log`; set `SYMPHONY_STATE_DIR` to choose another base directory. `status` shows the exact path. On macOS, `start` also keeps the Mac from idle-sleeping while the runner runs.
+
+### Multiple workflows on one host
+
+Give each workflow a **different GitHub Project and a separate, non-nested `workspace.root`**. Each process owns its own configuration, prompts, agents, ledger and logs; configurations are never merged.
+
+```sh
+symphony start ~/code/app/WORKFLOW.md --id app
+symphony start ~/code/site/WORKFLOW.md --id site
+symphony list                    # stable IDs, state and paths
+symphony status app              # only app's status and recent log
+symphony logs site               # only site's log; --no-follow prints and exits
+symphony stop app                # site keeps running
+symphony start --id app          # restart app using its remembered path
+symphony run --id app            # foreground instead (stop its background run first)
+```
+
+Without `--id`, an ID is derived from the canonical workflow path and remains stable across restarts. IDs use letters, digits, `_` and `-` and are case-insensitive. With one registered workflow, the original no-ID commands still work. With several, `status` lists all, but `start`/`run` need a path or `--id`, and `stop`/`logs` need an ID; they never silently choose or stop all runners.
+
+Startup checks reject duplicate live projects, even with different repository filters or `SYMPHONY_STATE_DIR` values, and overlapping workspace/ledger/log/config paths (including symlink aliases). Stopping preserves the ledger, workspaces and registration. Prompt and ordinary configuration edits still reload; changing workspace or tracker identity requires stopping and restarting. Direct `node src/cli.ts` runs participate in the same ownership checks; read-only `--dry-run` runs do not claim resources.
+
+**Upgrade:** stop runners launched by the old version before starting this version. An old `.last-workflow` is still honored on first use, but logs are now per-ID; old logs are not moved. Coordination is local to one trusted OS user, not across users or hosts. Multiple runners sharing one board are unsupported. See [runner management and recovery](docs/reference.md#runner-management-and-recovery).
 
 ## Configuration
 

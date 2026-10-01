@@ -64,7 +64,7 @@
 | 23 | 固定 SDK 版本，升级时跑端到端 | SDK 自带运行时 1.0.85，CLI 已到 1.0.89，更新频繁 | 未开始 |
 | 24 | 更多 tracker，如只用 GitHub Issues 标签的无看板模式 | 同类项目都有，门槛更低 | 未开始 |
 | 33 | 打开 SDK 的沙盒（`SandboxConfig`，macOS 用 seatbelt，实验性），由系统把 shell 限制在工作区；先验证 `xcodebuild`、模拟器和 DerivedData 在沙盒里能用 | 待办 32 的文本检查挡不住用变量拼出来的路径；运行时现在报告 `sandboxApplied: false` | 未开始 |
-| 41 | 一台机器同时跑多个项目（每个项目一个调度器）：`bin/symphony` 按 `SYMPHONY_STATE_DIR` 区分实例 | `bin/symphony` 用 pgrep 找所有 `src/cli.ts` 进程，第二个直接拒绝，换 `SYMPHONY_STATE_DIR` 也没用；游戏和 symphony 自己的看板没法同时跑 | 暂不考虑 |
+| 41 | 一台机器同时跑多个项目，每份工作流一个隔离的调度器，用稳定 ID 管理 | 旧版 `bin/symphony` 用 pgrep 拒绝第二个调度器，换 `SYMPHONY_STATE_DIR` 也没用 | 已实现：按 ID 启停、状态和日志；独立账本/工作区；同用户共享登记表在启动前拒绝状态路径冲突和同看板并发，热加载不得切换运行身份。见 README 多工作流章节；升级前先停旧实例 |
 
 ### 自举：用 symphony 开发 symphony（待办 25 的前提）
 

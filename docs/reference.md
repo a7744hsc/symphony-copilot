@@ -6,6 +6,10 @@ Details that the [README](../README.md) leaves out. Section numbers (§) refer t
 
 | File | Responsibility (spec sections) |
 |---|---|
+| `src/manage.ts` | Start, list, inspect logs/status and stop independently isolated workflow processes |
+| `src/instances.ts` | Stable workflow IDs, persistent registrations and serialized project/state-path ownership |
+| `src/runner-control.ts` | Per-run local IPC for status and graceful stop, authenticated by a run nonce |
+| `src/cli.ts` | One runner's ownership, ledger, workflow store, orchestrator and shutdown lifecycle |
 | `src/workflow.ts` | Reads, parses and watches `WORKFLOW.md`; keeps the last valid config when an edit is invalid (§5, §6.2) |
 | `src/config.ts` | Typed config with defaults, `$VAR`, `~` and relative paths (§6) |
 | `src/template.ts` | Strict Liquid rendering plus role-specific, host-owned autonomous planning/review instructions (§5.4, §12) |
@@ -22,6 +26,30 @@ Details that the [README](../README.md) leaves out. Section numbers (§) refer t
 | `src/check.ts` | `symphony check`: keys, values, column rules, templates |
 | `src/board.ts` | `symphony check --online` and `symphony setup-board` |
 | `src/tools.ts` | Command line for `check` and `setup-board` |
+
+## Runner management and recovery
+
+`bin/symphony` delegates `start`, `run`, `list`, `status`, `logs` and `stop` to the management interface. Each workflow runs in a separate Node.js process, not a shared scheduler or supervisor daemon. Use `start|run [WORKFLOW.md] [--id ID]`, `status|logs|stop [ID]`, and `list`. Management commands also accept `--id ID` instead of a positional ID. `logs --no-follow` prints the latest lines and exits. The direct runner accepts `node src/cli.ts [WORKFLOW.md] [--id ID]` with its existing `--once`, `--dry-run` and `--log-level` flags.
+
+IDs are 1-64 ASCII letters/digits/underscores/hyphens, starting with a letter or digit, normalized to lowercase. The default is a readable directory name plus a hash of the canonical workflow path. An explicit ID remains bound to that file; invoking the same file again without an ID reuses its registration. On a fresh installation, omitted paths use `SYMPHONY_WORKFLOW`, the legacy `.last-workflow` under `SYMPHONY_STATE_DIR`, or `./WORKFLOW.md`. Once registered, one workflow can be managed without an ID. With multiple registrations (including stopped ones), omit an ID only for `list`/`status`, which list all; other ambiguous commands fail.
+
+| Resource | Location / ownership |
+|---|---|
+| Registry | `~/.symphony/runners/registry.json`, shared across installations for the current OS user; no tracker tokens or prompts |
+| Log | `${SYMPHONY_STATE_DIR:-~/symphony-workspaces}/runners/<ID>/orchestrator.log`, appended across restarts; foreground runs also log to stderr |
+| Ledger | `<workspace.root>/.symphony-ledger.json`, unchanged; stopping does not reset authorization |
+| Workspaces | Under that workflow's `workspace.root`, including separate reviewer folders |
+| Control | Unique local socket (named pipe on Windows) plus a random run nonce; management never sends a stop signal to a PID read from the registry |
+
+The registry serializes collision checks and ownership writes before runner log creation, ledger loading or workspace cleanup. It rejects a second live runner on the same API authority, case-insensitive owner and project number, independent of repository filters, endpoint URL suffixes and log-directory overrides. It also rejects duplicate workflow registration and overlapping config/workspace/ledger/log paths, including nested paths, existing symlink ancestors and hard-linked state files. Supply distinct `workspace.root` values: the unchanged system-temp default is intentionally not enough for two workflows. Case aliases are conservatively rejected on macOS/Windows. A workspace must not contain its workflow file, logs or the shared registry.
+
+Stopped registrations retain their most recently registered paths, preventing accidental reuse by another ID. Restarting the same ID can update its settings and paths after collision checks; it does not migrate or delete old state. Do not repurpose an old workspace for a different repository/project: select a fresh root when changing tracker scope. While running, workflow path, workspace root, API endpoint, owner/type/project, repository, identifier prefix and branch prefix are pinned. Edits to those identities are rejected before replacing the store's last-good configuration; dispatch remains paused until the file is restored or the runner restarted. Other valid settings and prompts still reload independently.
+
+`start` reports success only after the child has acquired ownership, opened its control endpoint and completed orchestrator startup. `stop ID` requests graceful shutdown, retaining ownership while workers and queued tracker operations drain; it times out after 60 seconds without forcing a kill or affecting other runners. Repeated signals do not bypass cleanup. A dead process's claim can be replaced on restart; a live but unresponsive PID retains ownership, including possible PID reuse, rather than risking another runner. Inspect its log and residual Copilot runtimes before manual recovery. Existing ledger startup-uncertainty fences still apply and are never cleared by the manager.
+
+Registry writes use an exclusive `registry.lock` and atomic file replacement. A crash during a registry transaction may leave that lock: the error names its exact path. Its content is the writer PID (possibly empty if interrupted during creation). Only after verifying no management/startup/shutdown operation is still using it should a person remove that lock and retry. A malformed registry fails closed; restore its contents instead of discarding it while runners may still be active. Do not edit registrations or retarget state symlinks under a live runner.
+
+Before upgrading from the old PID-file wrapper, stop all old runners, including direct Node invocations: they do not participate in the new registry. The old remembered workflow path is imported on first use; old logs/PID files are not used for control or migrated. Coordination assumes one trusted OS user on a single host, using the same home directory and canonical API hostname, not different accounts, API proxy aliases or distributed hosts. macOS/Linux are supported; Windows remains unverified. Concurrent runners on one GitHub Project are unsupported.
 
 ## From Codex app-server to the Copilot SDK
 
@@ -224,7 +252,7 @@ After rendering, the runner prepends its role-specific [autonomous protocol](#im
 - **No overlap in a workspace.** The next session for an issue starts only after the previous one, including its `after_run` hook, has finished.
 - **One role per session.** When a card moves between an implementation state and a review state, the running session is stopped and the other role starts in a new session, in its own workspace.
 - **Conflicts first.** A card the orchestrator returned for a [merge conflict](../README.md#merge-conflicts) is dispatched before every other card until its run ends; the reason is kept in the ledger, so a restart does not lose it. GitHub answers `UNKNOWN` while it computes mergeability, so a conflict is acted on at the first poll after GitHub has decided.
-- **One orchestrator per `workspace.root`.** A second instance is not detected and would claim the same issues.
+- **Isolated runner ownership.** Startup rejects a second live owner of a project or overlapping state paths, including direct CLI invocations. Each runner has its own store, ledger and scheduler; [management and recovery](#runner-management-and-recovery) describes the single-user/host boundary.
 
 ### Authorization and usage
 
