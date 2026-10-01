@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,6 +38,7 @@ async function fixture(t: TestContext) {
   const env = { ...process.env, HOME: home, SYMPHONY_STATE_DIR: join(home, "state"), SYMPHONY_GITHUB_TOKEN: "test-only-token", SYMPHONY_WORKFLOW: undefined };
   const registry = new RunnerRegistry(join(home, ".symphony", "runners"));
   const calls: Array<{ number: number; token: string | undefined }> = [];
+  const states = new Map<number, string>();
   const server = createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => { body += chunk; });
@@ -55,7 +56,7 @@ async function fixture(t: TestContext) {
         pageInfo: { hasNextPage: false, endCursor: null },
         nodes: [{
           __typename: "ProjectV2Item", id: `item-${number}`, project: { id: `project-${number}` },
-          status: { name: "Human Review" }, content: {
+          status: { name: states.get(number) ?? "Human Review" }, content: {
             __typename: "Issue", id: `issue-${number}`, number: 1, title: `workflow-${number}`, state: "OPEN",
             repository: { nameWithOwner: `me/app-${number}` }, labels: { nodes: [{ name: "agent" }] },
           },
@@ -97,7 +98,7 @@ async function fixture(t: TestContext) {
     }
     return { path, workspace, ledger: join(workspace, ".symphony-ledger.json") };
   };
-  return { home, env, registry, command, workflow, calls };
+  return { home, env, registry, command, workflow, calls, states };
 }
 
 test("two background runners have independent state, targeted logs/status/stop, and stable restart IDs", { timeout: 40_000 }, async (t) => {
@@ -169,6 +170,55 @@ test("state path collision is rejected even for different projects, including di
   assert.equal(registry.list().length, 1);
   assert.match((await command(["status", "alpha"])).stdout, /alpha: running/);
 });
+
+for (const kind of ["root", "ancestor"] as const) {
+  test(`real runners protect a workspace ${kind} link from another runner's terminal cleanup`, { timeout: 40_000 }, async (t) => {
+    const { command, workflow, registry, env, home, calls, states } = await fixture(t);
+    const b = workflow(2, { seed: false });
+    const parent = join(b.workspace, "GH-1"), mount = join(parent, "mount"), outside = join(home, "outside");
+    mkdirSync(parent, { recursive: true });
+    mkdirSync(outside);
+    symlinkSync(outside, mount);
+    const root = kind === "root" ? mount : join(mount, "alpha");
+    const a = workflow(1, { workspace: root });
+    const targetLedger = canonicalPath(a.ledger);
+    const authorization = new RunLedger(targetLedger).records()[0]!.authorizationId;
+    states.set(2, "Done");
+    assert.equal((await command(["start", a.path, "--id", "alpha"])).code, 0);
+    await until(() => new RunLedger(targetLedger).records()[0]?.lastState === "Human Review");
+    const alpha = registry.list()[0]!;
+    const saved = readFileSync(registry.path, "utf8");
+    const rejected = await capture(spawn(process.execPath, [cli, b.path, "--id", "beta", "--once"], {
+      env, stdio: ["ignore", "pipe", "pipe"],
+    }));
+    assert.equal(rejected.code, 1, rejected.stderr);
+    assert.match(rejected.stderr, /state path collision.*alpha/);
+    assert.equal(calls.some((c) => c.number === 2), false, "reject before beta's startup cleanup");
+    assert.equal(existsSync(join(home, "state", "runners", "beta")), false);
+    assert.equal(readFileSync(registry.path, "utf8"), saved);
+    assert.equal(lstatSync(mount).isSymbolicLink(), true);
+    const polls = calls.filter((c) => c.number === 1).length;
+    await until(() => calls.filter((c) => c.number === 1).length > polls);
+    assert.equal(canonicalPath(a.ledger), targetLedger);
+    assert.equal(new RunLedger(targetLedger).records()[0]!.authorizationId, authorization);
+    assert.equal(await requestRunner(alpha, "status"), "running");
+
+    const safe = workflow(2, { workspace: join(home, "safe-beta"), seed: false });
+    const terminalWorkspace = join(safe.workspace, "GH-1");
+    mkdirSync(terminalWorkspace, { recursive: true });
+    writeFileSync(join(terminalWorkspace, "marker"), "remove only beta's workspace");
+    const started = await command(["start", safe.path, "--id", "beta"]);
+    assert.equal(started.code, 0, started.stderr);
+    assert.equal(existsSync(terminalWorkspace), false, "a safe beta still performs terminal cleanup");
+    assert.equal(lstatSync(mount).isSymbolicLink(), true);
+    assert.equal((await command(["stop", "beta"])).code, 0);
+    assert.equal(await requestRunner(alpha, "status"), "running");
+    assert.equal((await command(["stop", "alpha"])).code, 0);
+    assert.equal((await command(["start", "--id", "alpha"])).code, 0);
+    assert.equal(canonicalPath(a.ledger), targetLedger);
+    assert.equal(new RunLedger(targetLedger).records()[0]!.authorizationId, authorization);
+  });
+}
 
 for (const [kind, link] of [["symlink", symlinkSync], ["hard link", linkSync]] as const) {
   test(`real runners reject log ${kind} aliases to reviewer prompts before polling or writes`, { timeout: 40_000 }, async (t) => {

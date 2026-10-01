@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -22,6 +22,7 @@ function fixture(t: TestContext) {
   const record = (id: string, patch: Partial<RunnerRecord> = {}): RunnerRecord => ({
     id, workflow: join(dir, `${id}.md`), workspace: join(dir, "work", id),
     inputs: [patch.workflow ?? join(dir, `${id}.md`)],
+    workspacePaths: [patch.workspace ?? join(dir, "work", id)],
     directory: join(dir, "logs", id), project: `https://api.github.com/me/${id}`, scope: id,
     run: { pid: process.pid, nonce: randomUUID(), socket: join(dir, `${id}.sock`) }, ...patch,
   });
@@ -98,6 +99,192 @@ test("existing log/ledger symlinks cannot overlap even within one runner", async
   symlinkSync(b.workflow, join(b.directory, "orchestrator.log"));
   await assert.rejects(registry.claim(b), /must not overlap/);
   assert.equal(readFileSync(join(dir, "beta.md"), "utf8"), "prompt");
+});
+
+for (const kind of ["root", "ancestor", "chain"] as const) {
+  for (const aliasFirst of [false, true]) {
+    test(`workspace ${kind} link locations reject cleanup collisions, aliasFirst=${aliasFirst}`, async (t) => {
+      for (const stopped of [false, true]) {
+        const { dir, registry, record } = fixture(t);
+        const b = record("beta");
+        const parent = join(b.workspace, "GH-1"), mount = join(parent, "mount"), outside = join(dir, "outside");
+        mkdirSync(parent, { recursive: true });
+        mkdirSync(outside);
+        symlinkSync(outside, mount);
+        const entry = join(dir, "entry");
+        if (kind === "chain") symlinkSync(mount, entry);
+        const workspace = kind === "root" ? mount : join(kind === "chain" ? entry : mount, "alpha");
+        const a = record("alpha");
+        writeFileSync(a.workflow, workflowText(workspace, 1));
+        const store = new WorkflowStore(a.workflow, quietLog, {});
+        Object.assign(a, runnerIdentity(store.workflow.config));
+        const ledger = new RunLedger(join(workspace, ".symphony-ledger.json"));
+        ledger.authorize(makeIssue(), 20);
+        const original = readFileSync(ledger.path!, "utf8");
+        const [first, second] = aliasFirst ? [a, b] : [b, a];
+        await registry.claim(first);
+        if (stopped) await registry.release(first.id, first.run!.nonce);
+        const saved = readFileSync(registry.path, "utf8");
+        await assert.rejects(registry.claim(second), /state path collision/, `stopped=${stopped}`);
+        assert.equal(readFileSync(registry.path, "utf8"), saved);
+        assert.equal(lstatSync(mount).isSymbolicLink(), true);
+        assert.equal(readFileSync(ledger.path!, "utf8"), original);
+        assert.equal(existsSync(a.directory), false);
+        assert.equal(existsSync(b.directory), false);
+        store.close();
+      }
+    });
+  }
+}
+
+test("same-target workspace aliases require restart and preserve last-good execution paths", async (t) => {
+  const { dir, registry, record } = fixture(t);
+  const b = record("beta");
+  const direct = join(dir, "outside"), mount = join(b.workspace, "GH-1", "mount");
+  mkdirSync(direct);
+  mkdirSync(join(b.workspace, "GH-1"), { recursive: true });
+  symlinkSync(direct, mount);
+  await registry.claim(b);
+  const a = record("alpha");
+  const text = workflowText(direct, 1);
+  writeFileSync(a.workflow, text);
+  let pinned: ReturnType<typeof runnerIdentity> | undefined;
+  const store = new WorkflowStore(a.workflow, quietLog, {}, (c) => { if (pinned) assertRunnerIdentity(pinned, c); });
+  pinned = runnerIdentity(store.workflow.config);
+  Object.assign(a, pinned);
+  await registry.claim(a);
+  const original = store.workflow;
+  let time = 2_000_000_000;
+  const edit = (contents: string) => { writeFileSync(a.workflow, contents); utimesSync(a.workflow, ++time, time); return store.refresh(); };
+  assert.equal(edit(workflowText(mount, 1)), original);
+  assert.equal(store.workflow.config.workspace.root, direct);
+  assert.match(store.reloadError!, /runner identity changed.*restart/);
+  const saved = readFileSync(registry.path, "utf8");
+  assert.equal(edit(text.replace("prompt-1", "updated")).definition.promptTemplate, "updated");
+  assert.equal(store.reloadError, null);
+  assert.equal(readFileSync(registry.path, "utf8"), saved);
+  await registry.release(a.id, a.run!.nonce);
+  edit(workflowText(mount, 1));
+  const colliding = new WorkflowStore(a.workflow, quietLog, {});
+  await assert.rejects(registry.claim({ ...a, ...runnerIdentity(colliding.workflow.config) }), /state path collision/);
+  const safe = join(dir, "safe-alias");
+  symlinkSync(direct, safe);
+  edit(workflowText(safe, 1));
+  assert.match(store.reloadError!, /runner identity changed.*restart/, "even a safe same-target alias needs a new claim");
+  const restarted = new WorkflowStore(a.workflow, quietLog, {});
+  await registry.claim({ ...a, ...runnerIdentity(restarted.workflow.config) });
+  assert.equal(restarted.workflow.config.workspace.root, safe);
+  for (const s of [store, colliding, restarted]) s.close();
+});
+
+test("workspace link locations also protect a runner's own logs and the shared registry", async (t) => {
+  for (const resource of ["log", "registry"] as const) {
+    const { dir, registry, record } = fixture(t);
+    const a = record("alpha"), outside = join(dir, "outside");
+    const owner = resource === "log" ? a.directory : registry.root;
+    mkdirSync(owner, { recursive: true });
+    mkdirSync(outside);
+    const mount = join(owner, "mount");
+    symlinkSync(outside, mount);
+    writeFileSync(a.workflow, workflowText(join(mount, "alpha"), 1));
+    const store = new WorkflowStore(a.workflow, quietLog, {});
+    Object.assign(a, runnerIdentity(store.workflow.config));
+    await assert.rejects(registry.claim(a), resource === "log" ? /must not overlap/ : /shared registry/);
+    assert.equal(lstatSync(mount).isSymbolicLink(), true);
+    assert.equal(existsSync(join(outside, "alpha")), false);
+    assert.deepEqual(registry.list(), []);
+    store.close();
+  }
+});
+
+test("stopped workspace claims retain link entries even after the link is removed", async (t) => {
+  const { dir, registry, record } = fixture(t);
+  const a = record("alpha"), b = record("beta");
+  const outside = join(dir, "outside"), mount = join(b.workspace, "mount");
+  mkdirSync(outside);
+  mkdirSync(b.workspace, { recursive: true });
+  symlinkSync(outside, mount);
+  writeFileSync(a.workflow, workflowText(mount, 1));
+  const store = new WorkflowStore(a.workflow, quietLog, {});
+  Object.assign(a, runnerIdentity(store.workflow.config));
+  await registry.claim(a);
+  await registry.release(a.id, a.run!.nonce);
+  rmSync(mount);
+  const saved = readFileSync(registry.path, "utf8");
+  await assert.rejects(new RunnerRegistry(registry.root).claim(b), /state path collision.*alpha/);
+  assert.equal(readFileSync(registry.path, "utf8"), saved);
+  store.close();
+});
+
+test("dangling workspace root and ancestor links reserve their entries before state exists", async (t) => {
+  for (const suffix of ["", "alpha"]) {
+    for (const aliasFirst of [false, true]) {
+      const { dir, registry, record } = fixture(t);
+      const a = record("alpha"), b = record("beta"), missing = join(dir, "not-created");
+      mkdirSync(b.workspace, { recursive: true });
+      const mount = join(b.workspace, "mount");
+      symlinkSync(missing, mount);
+      writeFileSync(a.workflow, workflowText(join(mount, suffix), 1));
+      const store = new WorkflowStore(a.workflow, quietLog, {});
+      Object.assign(a, runnerIdentity(store.workflow.config));
+      const [first, second] = aliasFirst ? [a, b] : [b, a];
+      await registry.claim(first);
+      await assert.rejects(registry.claim(second), /state path collision/);
+      assert.equal(existsSync(missing), false);
+      assert.equal(lstatSync(mount).isSymbolicLink(), true);
+      store.close();
+    }
+  }
+});
+
+test("independent sibling workspaces can use a common symlink ancestor", async (t) => {
+  const { dir, registry, record } = fixture(t);
+  const outside = join(dir, "outside"), shared = join(dir, "shared");
+  mkdirSync(outside);
+  symlinkSync(outside, shared);
+  for (const [id, number] of [["alpha", 1], ["beta", 2]] as const) {
+    const a = record(id);
+    writeFileSync(a.workflow, workflowText(join(shared, id), number));
+    const store = new WorkflowStore(a.workflow, quietLog, {});
+    const identity = runnerIdentity(store.workflow.config);
+    Object.assign(a, identity);
+    await registry.claim(a);
+    const ledger = new RunLedger(join(store.workflow.config.workspace.root, ".symphony-ledger.json"));
+    ledger.authorize(makeIssue(), 20);
+    assert.doesNotThrow(() => assertRunnerIdentity(identity, store.workflow.config), "creating a missing root must not change its identity");
+    assert.equal(canonicalPath(ledger.path!), join(canonicalPath(outside), id, ".symphony-ledger.json"));
+    store.close();
+  }
+  assert.equal(registry.list().length, 2);
+});
+
+test("intermediate input, log and ledger links cannot hide in another runner's cleanup domain", async (t) => {
+  for (const resource of ["input", "log", "ledger"] as const) {
+    for (const aliasFirst of [false, true]) {
+      const { dir, registry, record, reviewRecord } = fixture(t);
+      const b = record("beta"), outside = join(dir, "outside"), bridge = join(b.workspace, "GH-1", "bridge");
+      mkdirSync(join(b.workspace, "GH-1"), { recursive: true });
+      mkdirSync(outside);
+      symlinkSync(outside, bridge);
+      const target = join(outside, "file");
+      writeFileSync(target, "original contents");
+      const alias = join(dir, "input-alias");
+      if (resource === "input") symlinkSync(join(bridge, "file"), alias);
+      const a = resource === "input" ? reviewRecord("alpha", alias) : record("alpha");
+      if (resource === "log") {
+        mkdirSync(a.directory, { recursive: true });
+        symlinkSync(join(bridge, "file"), join(a.directory, "orchestrator.log"));
+      } else if (resource === "ledger") {
+        mkdirSync(a.workspace, { recursive: true });
+        symlinkSync(join(bridge, "file"), join(a.workspace, ".symphony-ledger.json"));
+      }
+      const [first, second] = aliasFirst ? [a, b] : [b, a];
+      await registry.claim(first);
+      await assert.rejects(registry.claim(second), /state path collision/, `${resource}, aliasFirst=${aliasFirst}`);
+      assert.equal(readFileSync(target, "utf8"), "original contents");
+      assert.equal(lstatSync(bridge).isSymbolicLink(), true);
+    }
+  }
 });
 
 for (const [kind, link] of [["symlink", symlinkSync], ["hard link", linkSync]] as const) {
@@ -276,6 +463,19 @@ test("registry rejects incomplete workflow input inventories without rewriting t
     const text = JSON.stringify([{ ...a, inputs }]);
     writeFileSync(registry.path, text);
     assert.throws(() => registry.list(), /invalid runner registry.*input paths/);
+    await assert.rejects(registry.claim(record("beta")), /invalid runner registry/);
+    assert.equal(readFileSync(registry.path, "utf8"), text);
+  }
+});
+
+test("registry rejects incomplete workspace location inventories without rewriting them", async (t) => {
+  const { registry, record } = fixture(t);
+  const a = record("alpha");
+  mkdirSync(registry.root, { recursive: true });
+  for (const workspacePaths of [undefined, [], ["relative-root"], [a.workspace, null]]) {
+    const text = JSON.stringify([{ ...a, workspacePaths }]);
+    writeFileSync(registry.path, text);
+    assert.throws(() => registry.list(), /invalid runner registry.*workspace paths/);
     await assert.rejects(registry.claim(record("beta")), /invalid runner registry/);
     assert.equal(readFileSync(registry.path, "utf8"), text);
   }

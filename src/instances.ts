@@ -11,6 +11,7 @@ export interface RunnerIdentity {
   workflow: string;
   inputs: string[];
   workspace: string;
+  workspacePaths: string[];
   project: string;
   scope: string;
 }
@@ -76,18 +77,29 @@ export function workflowId(path: string): string {
   return `${/^[a-z0-9]/.test(label) ? label : "workflow"}-${createHash("sha256").update(canonical).digest("hex").slice(0, 12)}`;
 }
 
-function workflowInputs(config: ServiceConfig): string[] {
-  const paths = [config.workflowPath, ...(config.review ? [config.review.promptFile] : [])];
-  // Cleanup can remove an input's symlink entry or an ancestor link, not just its read target.
-  return [...new Set(paths.flatMap((path) => {
-    const locations = [canonicalPath(path)];
-    let parent = resolve(path);
-    while (dirname(parent) !== parent) {
-      parent = dirname(parent);
-      locations.push(join(canonicalPath(parent), relative(parent, path)));
+/** Reserve link entries and intermediate targets too: cleanup can remove either. */
+function pathLocations(path: string): string[] {
+  const locations = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (path: string) => {
+    if (visited.has(path)) return;
+    visited.add(path);
+    locations.add(canonicalPath(path));
+    locations.add(path);
+    for (let entry = path; dirname(entry) !== entry; entry = dirname(entry)) {
+      const parent = dirname(entry);
+      locations.add(join(canonicalPath(parent), relative(parent, path)));
+      if (lstatSync(entry, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        visit(resolve(parent, readlinkSync(entry), relative(entry, path)));
+      }
     }
-    return locations;
-  }))];
+  };
+  visit(resolve(path));
+  return [...locations];
+}
+
+function workflowInputs(config: ServiceConfig): string[] {
+  return [...new Set([config.workflowPath, ...(config.review ? [config.review.promptFile] : [])].flatMap(pathLocations))];
 }
 
 export function runnerIdentity(config: ServiceConfig): RunnerIdentity {
@@ -102,6 +114,7 @@ export function runnerIdentity(config: ServiceConfig): RunnerIdentity {
     workflow: canonicalPath(config.workflowPath),
     inputs: workflowInputs(config),
     workspace: canonicalPath(config.workspace.root),
+    workspacePaths: pathLocations(config.workspace.root),
     project,
     scope: JSON.stringify([project, createHash("sha256").update(endpoint.href).digest("hex"), settings.ownerType, `${settings.repoOwner}/${settings.repoName}`.toLowerCase(), settings.identifierPrefix, settings.branchPrefix, config.review?.promptFile ?? null]),
   };
@@ -109,8 +122,9 @@ export function runnerIdentity(config: ServiceConfig): RunnerIdentity {
 
 export function assertRunnerIdentity(expected: RunnerIdentity, config: ServiceConfig): void {
   const actual = runnerIdentity(config);
+  const sameLocations = (a: string[], b: string[]) => a.length === b.length && a.every((path, i) => locationKey(path) === locationKey(b[i]!));
   if (pathKey(actual.workflow) !== pathKey(expected.workflow) || pathKey(actual.workspace) !== pathKey(expected.workspace) || actual.scope !== expected.scope ||
-    actual.inputs.length !== expected.inputs.length || actual.inputs.some((path, i) => locationKey(path) !== locationKey(expected.inputs[i]!))) {
+    !sameLocations(actual.inputs, expected.inputs) || !sameLocations(actual.workspacePaths, expected.workspacePaths)) {
     throw new Error("runner identity changed (workflow inputs, review.prompt_file, workspace.root or tracker scope); restore it, stop this runner, then restart with the new configuration");
   }
 }
@@ -127,11 +141,15 @@ export function processAlive(pid: number): boolean {
 }
 
 function workspaceResources(record: RunnerRecord): string[] {
-  return [record.workspace, ...ledgerWritePaths(join(record.workspace, ".symphony-ledger.json"))];
+  return [...new Set(record.workspacePaths.flatMap((root) => [root, ...ledgerWritePaths(join(root, ".symphony-ledger.json"))]).flatMap(pathLocations))];
+}
+
+function logResources(record: RunnerRecord): string[] {
+  return [...new Set([record.directory, join(record.directory, "orchestrator.log")].flatMap(pathLocations))];
 }
 
 function resources(record: RunnerRecord): string[] {
-  return [...record.inputs, ...workspaceResources(record), record.directory, join(record.directory, "orchestrator.log")];
+  return [...record.inputs, ...workspaceResources(record), ...logResources(record)];
 }
 
 function recordValid(value: unknown): value is RunnerRecord {
@@ -140,6 +158,8 @@ function recordValid(value: unknown): value is RunnerRecord {
   return typeof r.id === "string" && validateId(r.id) === r.id && typeof r.workflow === "string" &&
     [r.workflow, r.workspace, r.directory].every((p) => typeof p === "string" && isAbsolute(p)) &&
     Array.isArray(r.inputs) && r.inputs.includes(r.workflow) && r.inputs.every((p) => typeof p === "string" && isAbsolute(p)) &&
+    typeof r.workspace === "string" && Array.isArray(r.workspacePaths) && r.workspacePaths.includes(r.workspace) &&
+    r.workspacePaths.every((p) => typeof p === "string" && isAbsolute(p)) &&
     typeof r.project === "string" && typeof r.scope === "string" &&
     (r.run === null || Boolean(r.run && Number.isSafeInteger(r.run.pid) && r.run.pid > 0 &&
       typeof r.run.nonce === "string" && typeof r.run.socket === "string"));
@@ -164,26 +184,26 @@ export class RunnerRegistry {
       throw new Error(`cannot read runner registry ${this.path}: ${(error as Error).message}`);
     }
     if (!Array.isArray(data) || !data.every(recordValid) || new Set(data.map((r) => r.id)).size !== data.length) {
-      throw new Error(`invalid runner registry ${this.path} (complete workflow input paths are required); restore it with all runners stopped before starting runners`);
+      throw new Error(`invalid runner registry ${this.path} (complete workflow input paths and workspace paths are required); restore it with all runners stopped before starting runners`);
     }
     return data;
   }
 
   async claim(record: RunnerRecord): Promise<void> {
-    if (!recordValid(record)) throw new Error("invalid runner record; complete workflow input paths are required");
+    if (!recordValid(record)) throw new Error("invalid runner record; complete workflow input paths and workspace paths are required");
     await this.transaction((records) => {
       const own = records.find((r) => r.id === record.id);
       if (own && pathKey(own.workflow) !== pathKey(record.workflow)) {
         throw new Error(`workflow ID "${record.id}" already belongs to ${own.workflow}; choose another --id`);
       }
       const requested = resources(record);
-      const registryPaths = [this.root, this.path, join(this.root, "registry.lock")];
+      const registryPaths = [this.root, this.path, join(this.root, "registry.lock")].flatMap(pathLocations);
       if (requested.some((p) => registryPaths.some((other) => pathsOverlap(p, other)))) {
         throw new Error(`runner state paths must not overlap the shared registry ${this.root}`);
       }
       const workspacePaths = workspaceResources(record);
       const [ledger, temporary] = ledgerWritePaths(join(record.workspace, ".symphony-ledger.json"));
-      const logPaths = [record.directory, join(record.directory, "orchestrator.log")];
+      const logPaths = logResources(record);
       if (workspacePaths.some((p) => logPaths.some((other) => pathsOverlap(p, other))) ||
         record.inputs.some((p) => [...workspacePaths, ...logPaths].some((other) => pathsOverlap(p, other)))) {
         throw new Error("workspace.root, workflow inputs (including review.prompt_file) and runner log directory must not overlap");
@@ -201,8 +221,9 @@ export class RunnerRegistry {
         if (pathKey(record.workflow) === pathKey(other.workflow)) {
           throw new Error(`workflow ${record.workflow} is registered as "${other.id}"; use that ID`);
         }
+        const occupied = resources(other);
         for (const path of requested) {
-          const collision = resources(other).find((p) => pathsOverlap(path, p));
+          const collision = occupied.find((p) => pathsOverlap(path, p));
           if (collision) throw new Error(`state path collision with runner "${other.id}": ${path} overlaps ${collision}; choose separate, non-nested input/workspace/log paths`);
         }
       }
