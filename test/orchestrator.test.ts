@@ -1057,6 +1057,242 @@ test("publication resumes across restart without a second semantic execution", a
   assert.equal(s.ledger.get("A")!.sessions, 1);
 });
 
+for (const location of ["source", "intended target"] as const) {
+  test(`a failed accepted handoff retains evidence across label removal and restart, then resumes at its ${location}`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "orchestrator-eligibility-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, "ledger.json");
+    const raw = { tracker: { required_labels: ["agent"] }, agent: { max_sessions: 7 } };
+    const first = setup(t, raw, false, new RunLedger(path));
+    const card = issue("A", { state: "In Progress" });
+    const cycle = authorize(first.ledger, card, 7);
+    // Retained earlier work makes accidental quota/progress resets observable.
+    cycle.sessions = 3;
+    cycle.reviewRounds = 2;
+    cycle.noProgress = 1;
+    first.ledger.checkpoint(cycle);
+    first.tracker.add(card);
+    await first.tick();
+    const call = first.calls[0]!;
+    call.params.onUpdate({ event: "session_usage", timestamp: new Date(), aiCredits: 7.25 });
+    const pending = await call.params.control.accept(implementation, "/tmp/checkout");
+    // Model an earlier successful push/message checkpoint before publication failed.
+    pending.pushed = true;
+    pending.issueMessage = { id: "retained-result", url: "https://example.test/issues/1#result" };
+    pending.pr = { id: "retained-pr", number: 10, url: "https://example.test/pull/10" };
+    pending.prPublished = true;
+    call.params.control.checkpoint();
+    const publish = t.mock.method(first.tracker, "publishHandoff");
+    first.tracker.publicationFails = true;
+    call.reject(new Error("post-accept publication failed"));
+    await flush();
+    assert.equal(publish.mock.callCount(), 1);
+    assert.equal(first.orchestrator.snapshot().running.length, 0);
+    const retained = structuredClone(cycle);
+    assert.equal(retained.sessions, 4);
+    assert.equal(retained.aiCredits, 7.25);
+    assert.equal(call.params.control.accepted(), true);
+
+    first.tracker.publicationFails = false;
+    const state = location === "source" ? pending.sourceState : pending.targetState;
+    first.tracker.set("A", { state, labels: [] });
+    const writes = t.mock.method(first.tracker, "set");
+    await first.tick();
+    await first.tick();
+    await first.advance(10_000);
+    assert.equal(publish.mock.callCount(), 1, "ineligible polls must not even enter publication");
+    assert.equal(writes.mock.callCount(), 0, "no move or blocked-state write while ineligible");
+    assert.equal(first.calls.length, 1);
+    assert.equal(first.ledger.get("A")!.pending, pending);
+    assert.deepEqual(first.ledger.get("A"), retained);
+    assert.deepEqual(new RunLedger(path).get("A"), retained, "pending evidence and accounting remain durable");
+    assert.deepEqual(first.tracker.comments, []);
+    await first.orchestrator.stop();
+    t.mock.timers.reset();
+
+    const second = setup(t, { ...raw, agent: { max_sessions: 20 } }, false, new RunLedger(path));
+    second.tracker.add(first.tracker.issues.get("A")!);
+    const resumedPending = second.ledger.get("A")!.pending!;
+    const resumedPublish = t.mock.method(second.tracker, "publishHandoff");
+    const resumedWrites = t.mock.method(second.tracker, "set");
+    await second.tick();
+    await second.tick();
+    assert.equal(resumedPublish.mock.callCount(), 0);
+    assert.equal(resumedWrites.mock.callCount(), 0);
+    assert.equal(second.calls.length, 0);
+    assert.deepEqual(new RunLedger(path).get("A"), retained);
+    assert.deepEqual(second.tracker.comments, []);
+
+    resumedWrites.mock.restore();
+    second.tracker.set("A", { labels: ["agent"] }); // No Todo move or new authorization.
+    await second.tick();
+    await second.tick();
+    assert.equal(resumedPublish.mock.callCount(), 1);
+    assert.equal(resumedPublish.mock.calls[0]!.arguments[1], resumedPending);
+    assert.deepEqual(resumedPending, { ...retained.pending!, statusApplied: true });
+    assert.equal(second.tracker.issues.get("A")!.state, pending.targetState);
+    assert.equal(second.calls.length, 0, "restoration completes only the remaining host work");
+    assert.deepEqual(new RunLedger(path).get("A"), {
+      ...retained, pending: null, invocation: { ...retained.invocation!, phase: "finished" },
+      lastState: pending.targetState, waitingState: pending.waitingState,
+    });
+    await second.orchestrator.stop();
+  });
+}
+
+test("label removal aborts a live accepted worker without publishing its retained handoff on later polls", async (t) => {
+  const s = setup(t, { tracker: { required_labels: ["agent"] } });
+  s.tracker.add(issue("A"));
+  await s.tick();
+  const call = s.calls[0]!;
+  call.params.onUpdate({ event: "session_usage", timestamp: new Date(), aiCredits: 3 });
+  const pending = await call.params.control.accept(implementation, "/tmp/checkout");
+  const retained = structuredClone(s.ledger.get("A")!);
+  const publish = t.mock.method(s.tracker, "publishHandoff");
+  s.tracker.set("A", { labels: [] });
+  const writes = t.mock.method(s.tracker, "set");
+  await s.tick();
+  assert.equal(call.aborted, true);
+  assert.equal(s.orchestrator.snapshot().running.length, 0);
+  assert.equal(publish.mock.callCount(), 0);
+  await s.tick();
+  await s.tick();
+  await s.advance(10_000);
+  assert.equal(publish.mock.callCount(), 0, "worker termination must not release the pending result for publication");
+  assert.equal(writes.mock.callCount(), 0);
+  assert.equal(s.calls.length, 1);
+  assert.equal(s.ledger.get("A")!.pending, pending);
+  assert.deepEqual(s.ledger.get("A"), retained);
+  assert.deepEqual(s.tracker.comments, []);
+  assert.deepEqual(s.removed, []);
+  await s.orchestrator.stop();
+});
+
+test("handoff recovery rechecks eligibility after an eligible poll snapshot and retains pending on fresh-read failure", async (t) => {
+  const s = setup(t, { tracker: { required_labels: ["agent"] } });
+  s.tracker.add(issue("A"));
+  await s.tick();
+  const call = s.calls[0]!;
+  const pending = await call.params.control.accept(implementation, "/tmp/checkout");
+  s.tracker.publicationFails = true;
+  call.resolve();
+  await flush();
+  assert.equal(s.orchestrator.snapshot().running.length, 0);
+  const retained = structuredClone(s.ledger.get("A")!);
+  s.tracker.publicationFails = false;
+  const publish = t.mock.method(s.tracker, "publishHandoff");
+  const writes = t.mock.method(s.tracker, "set");
+  // State-list polling still sees the eligible card; only the fresh ID read sees removal.
+  const fresh = t.mock.method(s.tracker, "fetchIssuesByIds", async () => [{ ...s.tracker.issues.get("A")!, labels: [] }]);
+  try {
+    await s.tick();
+    assert.ok(fresh.mock.callCount() > 0, "resumeHandoff must not trust the earlier poll snapshot");
+    assert.deepEqual(s.tracker.issues.get("A")!.labels, ["agent"]);
+    assert.equal(publish.mock.callCount(), 0);
+    assert.equal(writes.mock.callCount(), 0);
+    assert.deepEqual(s.ledger.get("A"), retained);
+    const reads = fresh.mock.callCount();
+    fresh.mock.mockImplementation(async () => { throw new Error("temporary fresh-read failure"); });
+    await s.tick();
+    assert.ok(fresh.mock.callCount() > reads);
+    assert.equal(publish.mock.callCount(), 0, "failed validation is not permission to publish");
+    assert.equal(writes.mock.callCount(), 0);
+    assert.deepEqual(s.ledger.get("A"), retained);
+    assert.equal(s.calls.length, 1);
+    assert.deepEqual(s.tracker.comments, []);
+  } finally {
+    fresh.mock.restore();
+  }
+  await s.tick();
+  assert.equal(publish.mock.callCount(), 1);
+  assert.equal(publish.mock.calls[0]!.arguments[1], pending);
+  assert.equal(s.ledger.get("A")!.pending, null);
+  assert.equal(s.ledger.get("A")!.sessions, retained.sessions);
+  assert.equal(s.ledger.get("A")!.authorizationId, retained.authorizationId);
+  assert.equal(s.calls.length, 1);
+  await s.orchestrator.stop();
+});
+
+test("immediate accepted-worker exit rechecks removed labels and transient read errors without reconciliation", async (t) => {
+  const s = setup(t, { tracker: { required_labels: ["agent"] } });
+  s.tracker.add(issue("A"), issue("B"));
+  await s.tick();
+  const pending = await Promise.all(s.calls.map((call) => call.params.control.accept(implementation, "/tmp/checkout")));
+  const retained = s.ledger.records().map((cycle) => structuredClone(cycle));
+  const publish = t.mock.method(s.tracker, "publishHandoff");
+  s.tracker.set("A", { labels: [] });
+  const writes = t.mock.method(s.tracker, "set");
+  const read = s.tracker.fetchIssuesByIds.bind(s.tracker);
+  const fresh = t.mock.method(s.tracker, "fetchIssuesByIds", async (ids: string[]) => {
+    if (ids.includes("B")) throw new Error("temporary fresh-read failure");
+    return read(ids);
+  });
+  try {
+    // No tick/reconciliation between removing eligibility and either exit callback.
+    s.calls[0]!.resolve();
+    s.calls[1]!.reject(new Error("post-accept worker failure"));
+    await flush();
+    assert.deepEqual(fresh.mock.calls.map((call) => call.arguments[0]), [["A"], ["B"]]);
+    assert.equal(s.orchestrator.snapshot().running.length, 0);
+    assert.equal(publish.mock.callCount(), 0);
+    assert.equal(writes.mock.callCount(), 0);
+    assert.deepEqual(s.ledger.records(), retained);
+    assert.equal(s.calls.length, 2);
+    assert.ok(s.calls.every((call) => !call.aborted), "this covers exit-time recovery, not reconciliation");
+    assert.deepEqual(s.tracker.comments, []);
+  } finally {
+    fresh.mock.restore();
+  }
+  s.tracker.set("A", { labels: ["agent"] });
+  await s.tick();
+  await s.tick();
+  assert.equal(publish.mock.callCount(), 2);
+  for (const p of pending) assert.ok(publish.mock.calls.some((call) => call.arguments[1] === p));
+  for (const previous of retained) {
+    const current = s.ledger.get(previous.itemId)!;
+    assert.equal(current.pending, null);
+    assert.equal(current.authorizationId, previous.authorizationId);
+    assert.equal(current.sessions, previous.sessions);
+  }
+  assert.equal(s.calls.length, 2);
+  await s.orchestrator.stop();
+});
+
+test("handoff eligibility honors dispatchable=false but permits label removal when required labels are empty", async (t) => {
+  const s = setup(t, { tracker: { required_labels: [] } });
+  s.tracker.add(issue("A"), issue("B"));
+  await s.tick();
+  const pending = await Promise.all(s.calls.map((call) => call.params.control.accept(implementation, "/tmp/checkout")));
+  const retained = structuredClone(s.ledger.get("A")!);
+  const publish = t.mock.method(s.tracker, "publishHandoff");
+  s.tracker.set("A", { dispatchable: false, labels: [] });
+  s.tracker.set("B", { labels: [] });
+  const writes = t.mock.method(s.tracker, "set");
+  for (const call of s.calls) call.resolve();
+  await flush();
+  await s.tick();
+  await s.tick();
+  assert.deepEqual(publish.mock.calls.map((call) => call.arguments[0].id), ["B"]);
+  assert.deepEqual(writes.mock.calls.map((call) => call.arguments), [["B", { state: "Human Review" }]]);
+  assert.equal(s.tracker.issues.get("A")!.state, "In Progress");
+  assert.equal(s.tracker.issues.get("B")!.state, "Human Review");
+  assert.deepEqual(s.ledger.get("A"), retained);
+  assert.equal(s.ledger.get("B")!.pending, null);
+  assert.equal(s.calls.length, 2);
+  assert.deepEqual(s.tracker.comments, []);
+
+  s.tracker.set("A", { dispatchable: true }); // Still no labels; only adapter eligibility was restored.
+  await s.tick();
+  await s.tick();
+  assert.deepEqual(publish.mock.calls.map((call) => call.arguments[0].id), ["B", "A"]);
+  assert.equal(publish.mock.calls[1]!.arguments[1], pending[0]);
+  assert.equal(s.ledger.get("A")!.pending, null);
+  assert.equal(s.ledger.get("A")!.authorizationId, retained.authorizationId);
+  assert.equal(s.ledger.get("A")!.sessions, retained.sessions);
+  assert.equal(s.calls.length, 2);
+  await s.orchestrator.stop();
+});
+
 test("a handoff finishing during a slow poll cannot be undone by the older source snapshot", async (t) => {
   const s = reviewSetup(t);
   s.tracker.add(issue("A"));

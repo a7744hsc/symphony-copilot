@@ -334,13 +334,16 @@ export class GitHubProjectTracker implements TrackerAdapter {
   readonly settings: GitHubProjectSettings;
   private readonly log: Logger;
   private readonly fetchImpl: FetchLike;
+  private readonly publicationEligible: (issue: Issue) => boolean;
   private meta: Promise<ProjectMeta> | null = null;
   private repoMeta: Promise<{ id: string; defaultBranch: string }> | null = null;
 
-  constructor(provider: Record<string, unknown>, env: NodeJS.ProcessEnv, log: Logger, fetchImpl: FetchLike = fetch) {
+  constructor(provider: Record<string, unknown>, env: NodeJS.ProcessEnv, log: Logger, fetchImpl: FetchLike = fetch,
+    publicationEligible: (issue: Issue) => boolean = (issue) => issue.dispatchable) {
     this.settings = parseSettings(provider, env);
     this.log = log;
     this.fetchImpl = fetchImpl;
+    this.publicationEligible = publicationEligible;
   }
 
   secretEnvironmentNames(): string[] {
@@ -813,13 +816,13 @@ export class GitHubProjectTracker implements TrackerAdapter {
       const connection = node.projectItems;
       if (!Array.isArray(connection?.nodes) || typeof connection.pageInfo?.hasNextPage !== "boolean") throw new TrackerError("tracker_response", "missing issue project items/pagination");
       for (const raw of connection.nodes) {
-        if (raw?.project?.id !== projectId || raw.isArchived) continue;
+        if (raw?.project?.id !== projectId) continue;
         const normalized = normalizeItem(raw, this.settings);
         if (normalized.kind !== "issue" || this.issueNodeId(normalized.issue) !== node.id) throw new TrackerError("tracker_response", "invalid publication item");
         if (current) throw new TrackerError("tracker_response", "ambiguous publication item");
         current = normalized.issue;
       }
-      if (!connection.pageInfo.hasNextPage) return current?.dispatchable ? current : null;
+      if (!connection.pageInfo.hasNextPage) return current;
       after = connection.pageInfo.endCursor;
       if (typeof after !== "string" || !after || cursors.has(after)) throw new TrackerError("tracker_pagination", "project item cursor did not advance");
       cursors.add(after);
@@ -862,6 +865,9 @@ export class GitHubProjectTracker implements TrackerAdapter {
   private async handoffIssue(issue: Issue, p: PendingHandoff): Promise<Issue | null> {
     const current = await this.publicationIssue(issue);
     if (!current) return null;
+    // Ineligibility suspends the accepted result, unlike closure or a superseding state.
+    // Keep the pending evidence/accounting intact; a failed read also never permits a write.
+    if (!current.dispatchable || !this.publicationEligible(current)) throw new Error("handoff publication suspended: issue is not routable");
     const needsPr = p.haltReason !== "head_mismatch" && (p.result.kind === "implement" || (p.result.kind === "review" && p.result.verdict !== "unable_to_verify"));
     const completed = p.issueMessage && (!needsPr || p.prPublished && (p.result.kind !== "implement" || p.pushed));
     // Board automation may advance to the intended target before PR metadata catches up.
@@ -916,6 +922,7 @@ export class GitHubProjectTracker implements TrackerAdapter {
     const body = replaceMarkedBlock(current.body, start, end, statusBlock(p, text));
     if (body === null) throw new TrackerError("tracker_response", "canonical issue result has no unambiguous host status block");
     if (body === current.body) return true;
+    if (!await this.handoffIssue(issue, p)) return false;
     assertActive();
     await this.editIssueMessage(p.issueMessage!.id, body);
     return true;
@@ -995,6 +1002,9 @@ export class GitHubProjectTracker implements TrackerAdapter {
       if (await git(["rev-parse", "HEAD"]) !== p.result.head || await git(["status", "--porcelain"])) {
         throw new Error("accepted implementation no longer matches its clean workspace; refusing to push a different result");
       }
+      // Git inspection can await long enough for a person to withdraw the dispatch label.
+      current = await refresh();
+      if (!current) return stale();
       assertActive();
       // The saved SHA, not a moving HEAD; never force-push.
       await git(["push", "--quiet", "origin", `${p.result.head}:refs/heads/${current.branchName}`]);
@@ -1064,6 +1074,8 @@ export class GitHubProjectTracker implements TrackerAdapter {
     const start = `<!-- symphony-usage:${invocationId}:start -->`, end = `<!-- symphony-usage:${invocationId}:end -->`;
     const body = replaceMarkedBlock(current.body, start, end, usageBlock(invocationId, footer));
     if (body === null || body === current.body) return;
+    const eligible = await this.publicationIssue(issue);
+    if (!eligible?.dispatchable || !this.publicationEligible(eligible)) return;
     await this.editIssueMessage(message.id, body);
   }
 

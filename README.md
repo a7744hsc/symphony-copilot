@@ -207,6 +207,8 @@ When GitHub reports the pull request of a routable card in `states` as conflicti
 
 Automatic conflict return preserves the same allowance and cannot restart paused or exhausted work. Never use Todo as `return_state`, or include Blocked in conflict-monitoring states.
 
+Removing a required dispatch label also suspends accepted-but-unfinished handoff publication, including recovery after restart; it is not permission to finish pushing or moving the card. Restoring eligibility in the applicable source/target state resumes that saved handoff without a new agent session or allowance reset. Completed effects are not undone; see [publication recovery](docs/reference.md#agent-tools).
+
 ## Safety model
 
 symphony-copilot is meant for **one trusted user on their own machine**. It is not a sandbox.

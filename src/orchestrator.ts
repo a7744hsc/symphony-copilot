@@ -431,9 +431,10 @@ export class Orchestrator {
     // Also cover a crash between persisting an orphan's inactive origin and its pause record.
     if (!cycle.waitingState && this.waiting(config, cycle.lastState)) cycle.waitingState = cycle.lastState;
     if (cycle.pending) {
+      if (!isRoutable(config, issue)) return; // Accepted work is not permission to publish after human takeover.
       if (cycle.halted) this.ledger.complete(cycle, true);
       else {
-        const completed = await this.resumeHandoff(issue, cycle, tracker);
+        const completed = await this.resumeHandoff(issue, cycle, tracker, config);
         if (!completed) return;
         // Publication may have moved the card; never apply the pre-publication snapshot afterward.
         return;
@@ -692,7 +693,7 @@ export class Orchestrator {
   }
 
   /** Only the host resumes publication after a worker exits. No semantic/model retry here. */
-  private async resumeHandoff(issue: Issue, cycle: RunCycle, tracker: TrackerAdapter, entry?: RunningEntry): Promise<boolean> {
+  private async resumeHandoff(issue: Issue, cycle: RunCycle, tracker: TrackerAdapter, config: ServiceConfig, entry?: RunningEntry): Promise<boolean> {
     const pending = cycle.pending;
     if (!pending || !tracker.publishHandoff) return !pending;
     const authorization = cycle.authorizationId;
@@ -703,7 +704,12 @@ export class Orchestrator {
     };
     try {
       assertActive();
-      const result = await tracker.publishHandoff(issue, pending, () => {
+      // Covers polls, restart, retry timers and immediate worker-exit recovery. Never trust
+      // the dispatch snapshot (or a failed refresh); the adapter rechecks again before writes.
+      const current = (await tracker.fetchIssuesByIds([cycle.itemId])).find((i) => i.id === cycle.itemId);
+      assertActive();
+      if (!current || issueControlKey(current) !== cycle.key || terminalIssue(config, current) || !isRoutable(config, current)) return false;
+      const result = await tracker.publishHandoff(current, pending, () => {
         assertActive();
         this.ledger.checkpoint(cycle);
         if (entry && pending.issueMessage) entry.issueMessage = pending.issueMessage;
@@ -816,7 +822,7 @@ export class Orchestrator {
     if (cycle.authorizationId !== entry.authorizationId || cycle.invocation?.id !== entry.invocationId) return;
     const accepted = !!cycle.allocations[entry.invocationId]?.resultId;
     if (accepted) {
-      if (cycle.pending && !entry.termination && !this.stopped) await this.resumeHandoff(entry.issue, cycle, entry.tracker, entry);
+      if (cycle.pending && !entry.termination && !this.stopped) await this.resumeHandoff(entry.issue, cycle, entry.tracker, entry.config, entry);
       await this.reportSession(entry);
       if (entry.termination?.cleanup) await this.safeRemove(entry.issue);
       if (!cycle.pending && !cycle.halted && !cycle.terminal && !entry.termination && !this.stopped) this.scheduleRetry(entry.issue, 1, null, CONTINUATION_DELAY_MS);
@@ -894,7 +900,9 @@ export class Orchestrator {
     }
     if (!footer || !entry.issueMessage || !entry.tracker.updateUsageFooter) return;
     try {
-      await entry.tracker.updateUsageFooter(entry.issue, entry.issueMessage, entry.invocationId, footer);
+      const current = (await entry.tracker.fetchIssuesByIds([entry.cycle.itemId])).find((i) => i.id === entry.cycle.itemId);
+      if (!current || issueControlKey(current) !== entry.cycle.key || terminalIssue(entry.config, current) || !isRoutable(entry.config, current)) return;
+      await entry.tracker.updateUsageFooter(current, entry.issueMessage, entry.invocationId, footer);
     } catch (error) {
       this.log.warn("could not update usage footer", { issue_id: entry.issue.id, issue_identifier: entry.issue.identifier, error: (error as Error).message });
     }

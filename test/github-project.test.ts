@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { run } from "../src/exec.ts";
+import { isRoutable } from "../src/config.ts";
 import { GitHubProjectTracker, MAX_ATTACHMENT_BYTES, conflictingFiles, normalizeItem, parseSettings, readAttachments, type RawItem } from "../src/tracker/github-project.ts";
-import { TrackerError } from "../src/tracker/index.ts";
+import { createTracker, TrackerError } from "../src/tracker/index.ts";
 import type { AgentResult, IssueMessageRef, PendingHandoff } from "../src/iteration.ts";
 import type { AgentControl } from "../src/tracker/types.ts";
 import type { Issue } from "../src/types.ts";
-import { quietLog } from "./helpers.ts";
+import { makeConfig, quietLog } from "./helpers.ts";
 
 const provider = { owner: "me", project_number: 1, repo: "me/app", status_field: "Status", priority_field: "优先级", start_state: "待开始", working_state: "进行中", blocked_state: "受阻" };
 const env = { SYMPHONY_GITHUB_TOKEN: "t0ken" };
@@ -262,6 +263,7 @@ function publicationFetch() {
   let nextComment = 1;
   const state = {
     status: "AI Review", open: true, itemId: "PVTI_1", pr: { id: "PR_1", number: 10, url: "https://github.com/me/app/pull/10", headRefOid: "head1", body: "" } as null | { id: string; number: number; url: string; headRefOid: string; body: string },
+    labels: ["agent"], archived: false, blocked: false,
     fail: "", lose: "", after: undefined as undefined | ((q: string) => void), pageSize: 100,
   };
   const connection = (nodes: unknown[], after: unknown) => {
@@ -275,7 +277,10 @@ function publicationFetch() {
     if (state.fail && q.includes(state.fail)) { state.fail = ""; throw new Error("injected request failure"); }
     let data: any;
     if (q.includes("projectV2(number")) data = { owner: { projectV2: { id: "PVT_1", field: { id: "F", options: ["AI Review", "进行中", "返工", "待验证", "受阻"].map((name) => ({ id: name, name })) } } } };
-    else if (q.includes("projectItems(first")) data = { node: { id: "I_1", state: state.open ? "OPEN" : "CLOSED", repository: { nameWithOwner: "me/app" }, projectItems: connection([item({ id: state.itemId, status: { name: state.status } }, { state: state.open ? "OPEN" : "CLOSED" })], v.after) } };
+    else if (q.includes("projectItems(first")) data = { node: { id: "I_1", state: state.open ? "OPEN" : "CLOSED", repository: { nameWithOwner: "me/app" }, projectItems: connection([item({ id: state.itemId, status: { name: state.status }, isArchived: state.archived }, {
+      state: state.open ? "OPEN" : "CLOSED", labels: { nodes: state.labels.map((name) => ({ name })) },
+      blockedBy: { nodes: state.blocked ? [{ id: "I_blocker", state: "OPEN" }] : [] },
+    })], v.after) } };
     else if (q.includes("pullRequests(headRefName")) data = { repository: { pullRequests: { nodes: state.pr ? [state.pr] : [] } } };
     else if (q.includes("defaultBranchRef")) data = { repository: { id: "R_1", defaultBranchRef: { name: "main" } } };
     else if (q.includes("updateIssueComment")) {
@@ -323,12 +328,13 @@ function fakeControl(sourceState = "AI Review", targetState = "返工", initialR
   return { control, saved };
 }
 
-function publicationSetup(options: { review?: boolean; initialReview?: boolean; target?: string; round?: number; workspacePath?: string; localHead?: string | Error } = {}) {
+function publicationSetup(options: { review?: boolean; initialReview?: boolean; target?: string; round?: number; workspacePath?: string; localHead?: string | Error; requiredLabels?: string[] } = {}) {
   const api = publicationFetch();
   const review = options.review !== false;
   api.state.status = review ? "AI Review" : "进行中";
   const host = fakeControl(api.state.status, options.target ?? "返工", options.initialReview ?? true);
-  const tracker = new GitHubProjectTracker({ ...provider, agent_states: ["进行中", "受阻"], handoff_state: "AI Review" }, env, quietLog, api.impl);
+  const eligibility = makeConfig({ tracker: { required_labels: options.requiredLabels ?? ["agent"] } });
+  const tracker = new GitHubProjectTracker({ ...provider, agent_states: ["进行中", "受阻"], handoff_state: "AI Review" }, env, quietLog, api.impl, (issue) => isRoutable(eligibility, issue));
   const workspacePath = options.workspacePath ?? "/nonexistent/review-checkout";
   if (review) {
     const localHead = options.localHead ?? "head1";
@@ -871,6 +877,93 @@ test("failed push keeps a complete pending issue record; resume uses saved works
   assert.deepEqual(await s.resume(), { stale: false });
   assert.equal(s.comments.size, 2); assert.equal(s.prComments.length, 1);
   assert.equal(git.filter((c) => c.args[0] === "push").length, 2);
+});
+
+for (const cause of ["required label", "archive", "open blocker"] as const) {
+  test(`pending pre-push recovery refuses ${cause} and preserves its result for eligibility restoration`, async (t) => {
+    const s = publicationSetup({ review: false, target: "AI Review" });
+    s.state.pr = null;
+    const git = mockImplementationGit(t, s, { failPush: true });
+    assert.equal((await s.call("tracker_submit_for_review", { title: "Repair", summary: "Accepted complete evidence" })).resultType, "failure");
+    const saved = structuredClone(s.saved.pending!), effects = s.calls.filter((c) => /mutation/.test(c.query)).length;
+    const record = s.comments.get(saved.issueMessage!.id)!.body;
+    if (cause === "required label") s.state.labels = [];
+    else if (cause === "archive") s.state.archived = true;
+    else s.state.blocked = true;
+    const eligibility = makeConfig({ tracker: { kind: "github_project", provider, active_states: ["待开始", "进行中"], required_labels: ["agent"] } });
+    t.mock.method(globalThis, "fetch", s.impl); // Also verify the production factory passes required-label policy.
+    const restarted = createTracker(eligibility, env, quietLog);
+    for (const adapter of [s.tracker, restarted]) {
+      const snapshot = structuredClone(s.saved.pending!);
+      await assert.rejects(adapter.publishHandoff!(s.issue, snapshot, () => {}, () => {}), /not routable/);
+      assert.deepEqual(snapshot, saved, "ineligibility is a suspension, not stale completion or a new decision");
+    }
+    assert.equal(s.calls.filter((c) => /mutation/.test(c.query)).length, effects);
+    assert.equal(git.filter((c) => c.args[0] === "push").length, 1);
+    assert.equal(s.state.pr, null); assert.equal(s.state.status, "进行中");
+    assert.equal(s.comments.get(saved.issueMessage!.id)!.body, record);
+    s.state.labels = ["agent"]; s.state.archived = s.state.blocked = false;
+    assert.deepEqual(await s.resume(), { stale: false });
+    assert.equal(s.saved.pending!.id, saved.id); assert.equal(s.saved.pending!.invocationId, saved.invocationId);
+    assert.equal(s.state.status, "AI Review");
+    assert.equal(s.calls.filter((c) => c.query.includes("createPullRequest")).length, 1);
+  });
+}
+
+test("publication rereads eligibility after local Git validation before the push", async (t) => {
+  const s = publicationSetup({ review: false, target: "AI Review" });
+  await s.control.accept({ kind: "implement", head: "head1", title: "Repair", summary: "Full evidence" }, "/nonexistent/work");
+  const git: string[][] = [];
+  t.mock.method(s.tracker as any, "git", async (_cwd: string, args: string[]) => {
+    git.push(args);
+    if (args[0] === "status") { s.state.labels = []; return ""; }
+    return args[0] === "rev-parse" ? "head1" : "";
+  });
+  await assert.rejects(s.resume(), /not routable/);
+  assert.ok(!git.some((c) => c[0] === "push"));
+  assert.equal(s.saved.pending!.pushed, false); assert.equal(s.saved.pending!.stale, false);
+  assert.equal(s.state.status, "进行中"); assert.equal(s.prComments.length, 0);
+});
+
+for (const phase of ["issue comment", "PR create", "review mirror", "status", "finalization"] as const) {
+  test(`label removal during ${phase} preparation prevents the next publication mutation`, async (t) => {
+    const isReview = phase !== "PR create";
+    const s = publicationSetup({ review: isReview, target: "待验证" });
+    if (!isReview) { mockImplementationGit(t, s); s.state.pr = null; }
+    let revoked = false, writesAtRevocation = -1;
+    const writes = () => s.calls.filter((c) => /mutation/.test(c.query)).length;
+    s.state.after = (q) => {
+      if (revoked) return;
+      const mirrorDone = s.reviews.length > 0;
+      const trigger = phase === "issue comment" ? q.includes("comments(first") && !s.comments.size
+        : phase === "PR create" ? q.includes("pullRequests(headRefName") && s.saved.pending?.pushed
+        : phase === "review mirror" ? q.includes("reviews(first")
+        : phase === "status" ? q.includes("... on IssueComment") && mirrorDone
+        : q.includes("... on IssueComment") && s.saved.pending?.statusApplied;
+      if (trigger) { revoked = true; s.state.labels = []; writesAtRevocation = writes(); }
+    };
+    const result = await s.call(isReview ? "tracker_submit_review" : "tracker_submit_for_review", isReview ? changes : { title: "Repair", summary: "Full evidence" });
+    assert.equal(revoked, true, `fixture must exercise ${phase}`);
+    assert.equal(result.resultType, "failure"); assert.match(result.textResultForLlm, /not routable/);
+    assert.equal(writes(), writesAtRevocation, "no additional issue/PR/status writes after observed revocation");
+    assert.equal(s.saved.pending!.stale, false); assert.deepEqual(s.saved.finishes, []);
+  });
+}
+
+test("usage footer does not edit the issue after required-label removal", async () => {
+  const s = publicationSetup();
+  await s.call("tracker_submit_review", changes);
+  const p = s.saved.pending!, before = s.calls.filter((c) => /mutation/.test(c.query)).length;
+  s.state.after = (q) => { if (q.includes("... on IssueComment")) s.state.labels = []; };
+  await s.tracker.updateUsageFooter(s.issue, p.issueMessage!, p.invocationId, "用量（本轮）：1.00 · 轮次 1/20 · 模型：test");
+  assert.equal(s.calls.filter((c) => /mutation/.test(c.query)).length, before);
+});
+
+test("empty required-label policy permits unlabeled publication without inferring labels from the old snapshot", async () => {
+  const s = publicationSetup({ requiredLabels: [] });
+  s.state.labels = [];
+  assert.equal((await s.call("tracker_submit_review", changes)).stale, false);
+  assert.equal(s.state.status, "返工");
 });
 
 test("new PR create response loss resumes from stable branch and result marker without duplicate PR/comment", async (t) => {
