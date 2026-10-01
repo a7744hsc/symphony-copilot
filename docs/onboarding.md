@@ -62,6 +62,8 @@ This copies two [agent skills](https://code.visualstudio.com/docs/copilot/custom
 
 The skills refer to templates in your symphony-copilot folder by absolute path, so run `install-skills` again after moving or updating it. The agents symphony-copilot runs on cards never load these skills.
 
+Unattended planning is built into the runner; no personal planning skill installation is needed. Interactive `brainstorming`, `grill-me` and `grilling` are disabled for card workers, not removed from your own editor. Symphony supplies its own autonomous planning/self-questioning instructions instead of their human interview/approval gates.
+
 ## 2. Write WORKFLOW.md, AGENTS.md and REVIEW.md
 
 Open the repository in VS Code (or start `copilot` in it) and run `/symphony-onboard`. You do not need to know or preselect board columns. The skill first inspects the repository, then asks which operating capabilities you want:
@@ -107,6 +109,8 @@ Each column has a role derived from the selected behavior. The names are localiz
 | Done, Canceled | Terminal | Human merges the PR or closes the issue; workspace cleanup follows |
 
 **Working agreement, not a permission lock:** people start new cards in Todo and return existing cards only from waiting columns (Human Review/Blocked) to Todo. This renews the allowance and clears the no-progress streak while preserving work and issue history. Do not manually move cards into or out of In Progress, Rework or AI Review; those belong to the scheduler. Other board automation must not return existing cards to Todo. Automatic conflict return to Rework and process restarts never reset the allowance or restart paused/exhausted work.
+
+Planning is part of In Progress/Rework, not a new column or approval step. The implementer investigates the repository, chooses an approach, self-grills material assumptions and publishes a concise Implementation plan on the issue before product edits, then implements in the same session. Existing plans are reused and materially revised on rework. People do not answer a planning interview; automated replies are not human approval, and missing consequential decisions or authority still go to Blocked. Independent AI review, when enabled, challenges the plan as well as the code rather than treating self-grill as approval. These are behavioral instructions, not a filesystem write gate; see the [method and limits](reference.md#implementation-and-review-method).
 
 A session counts when SDK creation succeeds; preparation/startup failures beforehand pause without a charge or endless retry. Reviews can continue while making progress: the first reviewed no-progress rework needs a changed approach, two consecutive ones pause, and human-required results pause immediately. Initial findings and infrastructure failures do not add strikes. Missing review evidence uses `unable_to_verify`, not a silent comment-and-stop. There is no separate review-round, credit or absolute elapsed-time cap; operational startup/inactivity timeouts still apply.
 

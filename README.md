@@ -37,8 +37,10 @@ flowchart LR
 
 1. You label an issue `agent` and put its card in `tracker.provider.start_state` (for example Todo), regardless of active-column order.
 2. symphony-copilot claims the card, creates a workspace for it (in the example workflow, the `after_create` hook clones the repo and checks out `agent/<number>`), and starts a Copilot session with the prompt from `WORKFLOW.md`.
-3. The agent works, runs your checks, commits, and calls `tracker_submit_for_review`. The orchestrator pushes the branch, opens a PR that closes the issue, saves the full handoff on the issue, and moves the card to AI Review if enabled, otherwise Human Review.
+3. In the same session, the agent investigates, drafts and self-grills a plan, records it on the issue before product edits, then implements, checks, commits and calls `tracker_submit_for_review`. It reuses an applicable plan and revises material decisions on rework, without waiting for chat approval. The orchestrator pushes the branch, opens a PR that closes the issue, saves the full handoff on the issue, and moves the card to AI Review if enabled, otherwise Human Review.
 4. You review. Merge the PR or close the issue to finish. For more work, leave comments and return the waiting card to Todo; the agent keeps the workspace and history with a fresh session allowance. In Progress, Rework and AI Review are scheduler-managed: do not move cards into or out of them manually.
+
+Planning adds no agent session or board column. Automated answers are not human approval: the agent decides within scope, while genuinely missing requirements or authority go to Blocked. Self-grill is not independent review; the reviewer checks assumptions and code against the issue, not just the plan. The runtime supplies this behavior without installing interactive planning skills. It is prompt-level guidance, not an enforced write barrier or a convergence guarantee. See [autonomous planning and review](docs/reference.md#implementation-and-review-method).
 
 ## Compared with
 

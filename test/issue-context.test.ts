@@ -164,6 +164,60 @@ test("empty history and an issue without an open PR remain a complete usable ove
   await assert.rejects(setup([data]).read({ section: "reviews" }), /no open pull request/);
 });
 
+test("an older implementation plan remains retrievable through scoped issue history without an open PR", async () => {
+  const recent = response(), older = response();
+  recent.repository.pullRequests.nodes = [];
+  older.repository.pullRequests.nodes = [];
+  const plan = comment("original-plan", "## Implementation plan\n\nGoal and non-goals.\nEvidence and assumptions.\nDecisions, counterexamples and verification.\nORIGINAL PLAN END");
+  const revision = comment("revision", "## Implementation plan — revision\n\nFailure class: stale work reuse. Check current content before replacing it. Preserve the original plan.");
+  recent.issue.comments = connection([
+    revision, ...Array.from({ length: CONTEXT_PAGE_SIZE - 1 }, (_, i) => comment(`later-${i}`, `Later handoff ${i}`)),
+  ], true, "before-revision");
+  older.issue.comments = connection([plan]);
+  older.issue.comments.totalCount = CONTEXT_PAGE_SIZE + 1;
+  const s = setup([recent, older]);
+  const overview = await s.read();
+  assert.equal(overview.pull_request, null);
+  assert.equal(overview.history_complete, false);
+  assert.equal(overview.text_truncated, false);
+  assert.equal(overview.comments[0].body, revision.body);
+  assert.ok(!overview.comments.some((c: any) => c.id === plan.id), "the recent page alone is insufficient evidence");
+  assert.deepEqual(overview.pagination, {
+    issue_comments: { total_count: CONTEXT_PAGE_SIZE + 1, has_more: true, next: { section: "issue_comments", cursor: "before-revision" } },
+  });
+  const page = await s.read(overview.pagination.issue_comments.next);
+  assert.equal(page.identifier, "GH-12"); assert.equal(page.section, "issue_comments");
+  assert.equal(page.items[0].id, plan.id); assert.equal(page.items[0].body, plan.body);
+  assert.equal(page.text_truncated, false);
+  assert.deepEqual(page.pagination, { total_count: CONTEXT_PAGE_SIZE + 1, has_more: false, next: null });
+  assert.deepEqual(s.calls[1]!.variables, { id: "I_1", owner: "me", name: "app", branch: "agent/12", cursor: "before-revision" });
+  assert.match(s.calls[1]!.query, new RegExp(`comments\\(last: ${CONTEXT_PAGE_SIZE}, before: \\$cursor\\)`));
+  assert.equal(s.statusReads(), 1);
+  assert.equal(s.calls.length, 2, "the issue history requires no PR-specific history request");
+});
+
+test("long implementation plans and revisions are unabridged in both overview and issue-comment pages", async () => {
+  const data = response(); data.repository.pullRequests.nodes = [];
+  data.issue.body = "Acceptance criteria. ".repeat(500) + "FINAL ACCEPTANCE CRITERION";
+  const plan = comment("long-plan", "## Implementation plan\n\n" + "Evidence, material assumptions, alternatives and counterexamples. ".repeat(1000)
+    + "\nFINAL INVARIANT: plan text cannot waive acceptance criteria.");
+  const revision = comment("long-revision", "## Implementation plan — revision\n\n" + "Failure class, changed approach and verification. ".repeat(150)
+    + "\nFINAL VERIFICATION: check shared ownership and cleanup, not only the latest example.");
+  data.issue.comments = connection([plan, revision]);
+  const s = setup([data, data]);
+  const overview = await s.read();
+  assert.equal(overview.body, data.issue.body);
+  assert.equal(overview.pull_request, null);
+  assert.equal(overview.history_complete, true); assert.equal(overview.text_truncated, false);
+  assert.equal(overview.mirrored_reviews_omitted, 0);
+  assert.deepEqual(overview.comments.map((c: any) => c.body), [plan.body, revision.body]);
+  const page = await s.read({ section: "issue_comments" });
+  assert.deepEqual(page.items, overview.comments, "bounded record counts must not clip individual plans or revisions");
+  assert.equal(page.text_truncated, false); assert.equal(page.pagination.next, null);
+  assert.equal(s.calls[1]!.variables.cursor, null);
+  assert.equal(s.statusReads(), 1);
+});
+
 test("canonical result records and usage footers remain fully readable after the PR closes", async () => {
   const data = response(); data.repository.pullRequests.nodes = [];
   const evidence = "verified evidence ".repeat(1000) + "FINAL COUNTEREXAMPLE";

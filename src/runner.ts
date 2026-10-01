@@ -5,7 +5,7 @@ import { CopilotClient, RuntimeConnection, type CopilotSession, type SessionEven
 import { isActiveState, isRoutable, roleFor, type Role, type ServiceConfig } from "./config.ts";
 import { truncate, type Logger } from "./log.ts";
 import { createPermissionHandler, isInside } from "./policy.ts";
-import { renderContinuationPrompt, renderIssuePrompt, renderTemplate } from "./template.ts";
+import { composeAgentPrompt, renderContinuationPrompt, renderIssuePrompt, renderTemplate } from "./template.ts";
 import type { TrackerAdapter } from "./tracker/index.ts";
 import type { AgentControl } from "./tracker/types.ts";
 import { issueForTemplate, type Issue } from "./types.ts";
@@ -299,8 +299,8 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
         model: (review?.model ?? config.copilot.model) ?? undefined,
         reasoningEffort: ((review?.reasoningEffort ?? config.copilot.reasoningEffort) ?? undefined) as "low" | "medium" | "high" | "xhigh" | "max" | undefined,
         largeOutput: { enabled: true, maxSizeBytes: 51_200, outputDirectory: outputDirectory! },
-        // Installed for people setting up a repository, not for agents working a card.
-        disabledSkills: ["symphony-onboard", "symphony-write-card"],
+        // Setup and interactive planning skills require people. Use the host's unattended protocol.
+        disabledSkills: ["symphony-onboard", "symphony-write-card", "brainstorming", "grill-me", "grilling"],
         tools: p.tracker.agentTools({
           issue: p.issue,
           workspacePath: workspace.path,
@@ -365,7 +365,7 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
       if (p.control?.accepted()) break;
       p.control?.assertActive();
       if (p.signal.aborted) throw new RunError("canceled", String(p.signal.reason ?? "canceled"));
-      const prompt = turn === 1
+      const repositoryPrompt = turn === 1
         ? review
           ? renderTemplate(readReviewPrompt(review.promptFile), {
             issue: issueForTemplate(issue),
@@ -377,6 +377,7 @@ export async function runAgentAttempt(p: AttemptParams): Promise<void> {
             : "a formally handed-off rework is ready; assess it as made_progress or no_progress with evidence."} If verification is impossible, use unable_to_verify with not_assessed and human_required.`
           : renderIssuePrompt(p.promptTemplate, issue, p.attempt)
         : renderContinuationPrompt(review ? review.continuationPrompt : config.agent.continuationPrompt, issue, turn, config.agent.maxTurns);
+      const prompt = composeAgentPrompt(repositoryPrompt, role, turn === 1);
       p.onUpdate({ event: "turn_started", timestamp: new Date(), sessionId, turn });
       turns = turn;
       await runTurn({

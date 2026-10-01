@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,6 +42,7 @@ function publicationFetch() {
   const headReads: Array<{ at: number; head: string | null; remoteHead: string }> = [];
   const state = {
     status: "Todo", localHead: "", remoteHead: "", delayPrHead: false,
+    loseNextIssueCommentResponse: false,
     pr: null as null | { id: string; number: number; url: string; headRefOid: string; body: string },
   };
   const issueMessages = () => [...messages.values()].filter((m) => m.issue?.id === issueId);
@@ -55,7 +56,7 @@ function publicationFetch() {
       labels: { nodes: [{ name: "agent" }] }, assignees: { nodes: [] }, blockedBy: { nodes: [] },
     },
   });
-  const connection = (nodes: unknown[]) => ({ nodes, pageInfo: { hasNextPage: false, endCursor: null } });
+  const connection = (nodes: unknown[]) => ({ nodes, pageInfo: { hasNextPage: false, endCursor: null, hasPreviousPage: false, startCursor: null } });
   const impl: FetchLike = async (url, init) => {
     assert.equal(url, provider.endpoint);
     assert.equal(init.method, "POST");
@@ -67,12 +68,14 @@ function publicationFetch() {
       assert.equal(v.owner + "/" + v.name, repo);
       assert.equal(v.branch, "agent/12");
       assert.ok(q.includes("comments(last: 5"));
-      const all = issueMessages(), end = v.cursor === null ? all.length : Number(v.cursor);
+      const all = issueMessages(), end = v.cursor == null ? all.length : Number(v.cursor);
       const start = Math.max(0, end - 5);
-      data = { issue: { id: issueId, comments: {
+      data = { issue: { ...item().content, comments: {
         nodes: all.slice(start, end), totalCount: all.length,
         pageInfo: { hasPreviousPage: start > 0, startCursor: start > 0 ? String(start) : null },
-      } }, repository: { pullRequests: { nodes: state.pr ? [state.pr] : [] } } };
+      } }, repository: { pullRequests: { nodes: state.pr ? [{
+        ...state.pr, reviews: connection(reviews), comments: connection(prComments), reviewThreads: connection([]),
+      }] : [] } } };
     } else if (q.includes("items(first: 100")) {
       data = { owner: { projectV2: { items: connection([item()]) } } };
     } else if (q.includes("projectV2(number")) {
@@ -109,6 +112,10 @@ function publicationFetch() {
       messages.set(id, message);
       if (review) reviews.push(message);
       else if (v.id !== issueId) prComments.push(message);
+      if (!review && v.id === issueId && state.loseNextIssueCommentResponse) {
+        state.loseNextIssueCommentResponse = false;
+        throw new Error("offline plan comment persisted; response lost");
+      }
       data = review ? { addPullRequestReview: { pullRequestReview: message } } : { addComment: { commentEdge: { node: message } } };
     } else if (q.includes("createPullRequest")) {
       assert.equal(state.pr, null);
@@ -166,7 +173,10 @@ async function offlineRuntime(t: TestContext) {
   return { runAgentAttempt, GitHubProjectTracker, setGit(handler: typeof git) { git = handler; } };
 }
 
-interface Plan { role: Role; progress?: "initial" | "no_progress"; hold?: boolean; failCreate?: boolean; pendingHeadMismatch?: boolean }
+interface Plan {
+  role: Role; progress?: "initial" | "no_progress"; hold?: boolean; failCreate?: boolean; pendingHeadMismatch?: boolean;
+  issuePlan?: { body: string; product: string; loseResponse?: boolean };
+}
 
 function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime>>, plans: Plan[]) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "iteration-integration-")));
@@ -194,9 +204,10 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
     blocker: `Blocker ${index + 1}: complete reproduction and observed versus expected results.`,
     head: (index + 1).toString(16).padStart(40, "0"), credits: index + 1.25,
     model: `offline-actual-${plan.role}`, session: undefined as SessionConfig | undefined,
-    history: [] as string[], prompt: "", metricsRead: false,
+    history: [] as string[], actions: [] as string[], prompt: "", metricsRead: false,
     submittedPending: null as PendingHandoff | null,
   }));
+  const scriptedPlanning = plans.some((p) => p.issuePlan);
   const counts = { start: 0, create: 0, created: 0, send: 0, metrics: 0, disconnect: 0, stop: 0, forceStop: 0, abort: 0 };
   t.mock.method(workspaces, "hook", async (_config: unknown, name: string, workspace: Workspace) => {
     hooks.push(`${workspace.role}:${name}`);
@@ -254,8 +265,12 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
     const tool = async (name: string, args: Record<string, unknown>): Promise<any> => {
       const handler = session.tools?.find((tool) => tool.name === name)?.handler;
       assert.ok(handler, `real tracker must expose ${name}`);
+      step.actions.push(name);
       const result: any = await handler(args, { sessionId: session.sessionId!, toolCallId: `${step.index}:${name}`, toolName: name, arguments: args });
-      if (step.pendingHeadMismatch && name === "tracker_submit_for_review") {
+      if (step.issuePlan?.loseResponse && name === "tracker_comment") {
+        assert.equal(result?.resultType, "failure");
+        assert.match(result.textResultForLlm, /offline plan comment persisted; response lost/);
+      } else if (step.pendingHeadMismatch && name === "tracker_submit_for_review") {
         assert.equal(result?.resultType, "failure", "post-push metadata lag must be a retryable publication error, not accepted stale completion");
         assert.equal(workers[step.index]!.params.control.accepted(), true);
         const pending = ledger.get(controlKey)!.pending;
@@ -278,16 +293,73 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
           const cycle = ledger.get(controlKey)!;
           assert.equal(cycle.invocation!.sessionId, session.sessionId, "host confirms the actual session before the first prompt");
           assert.equal(cycle.invocation!.phase, "running");
-          let args: Record<string, unknown> | null = { section: "issue_comments" };
-          while (args) {
-            const history = await tool("tracker_get_issue", args);
-            assert.equal(history.text_truncated, false);
-            step.history.unshift(...history.items.map((message: Message) => message.body));
-            args = history.pagination.next;
+          if (scriptedPlanning) {
+            const issue = await tool("tracker_get_issue", {});
+            assert.equal(issue.identifier, "GH-12");
+            assert.equal(issue.body, workers[step.index]!.params.issue.description);
+            assert.equal(issue.text_truncated, false);
+            if (step.index === 0) assert.equal(issue.pull_request, null);
           }
-          assert.deepEqual(step.history, api.issueMessages().map((m) => m.body));
-          assert.equal(step.history.length, step.index);
+          const readHistory = async (): Promise<Message[]> => {
+            const messages: Message[] = [];
+            let args: Record<string, unknown> | null = { section: "issue_comments" };
+            while (args) {
+              const history = await tool("tracker_get_issue", args);
+              assert.equal(history.text_truncated, false);
+              messages.unshift(...history.items);
+              args = history.pagination.next;
+            }
+            assert.deepEqual(messages.map((m) => m.body), api.issueMessages().map((m) => m.body));
+            return messages;
+          };
+          step.history = (await readHistory()).map((m) => m.body);
+          const priorPlans = steps.slice(0, step.index).filter((s) => s.issuePlan);
+          assert.equal(step.history.length, step.index + priorPlans.length);
           if (step.hold) { step.sent.resolve(); return "held-message"; }
+          // Scripted model behavior through real tools, not a host write gate or proof of LLM quality.
+          if (step.issuePlan) {
+            assert.equal(step.role, "implement");
+            assert.match(prompt, /## Autonomous planning/);
+            assert.match(prompt, /tracker_comment before product edits/);
+            const work = join(session.workingDirectory!, "work"), product = join(work, "product.txt");
+            const previous = priorPlans.at(-1);
+            if (previous) assert.equal(readFileSync(product, "utf8"), previous.issuePlan!.product);
+            else assert.equal(existsSync(product), false, "first plan precedes any fixture product write");
+            const authorization = cycle.authorizationId, stateBeforePlan = api.state.status;
+            api.state.loseNextIssueCommentResponse = step.issuePlan.loseResponse === true;
+            const posted = await tool("tracker_comment", { body: step.issuePlan.body });
+            if (step.issuePlan.loseResponse) {
+              // The fake server persisted the comment before losing its reply. The script chooses
+              // to reread scoped history and reuse it; tracker_comment has no exactly-once recovery.
+              assert.equal(existsSync(product), false, "no product write before recovering the uncertain plan publication");
+              const reread = await readHistory();
+              const matching = reread.filter((m) => m.body.startsWith(`${step.issuePlan!.body}\n\n`));
+              assert.equal(matching.length, 1, "reuse the matching persisted plan without posting again");
+            } else assert.ok(api.messages.get(posted.comment_id)?.body.startsWith(`${step.issuePlan.body}\n\n`));
+            assert.equal(cycle.authorizationId, authorization);
+            assert.equal(cycle.sessions, step.index + 1);
+            assert.equal(counts.created, step.index + 1);
+            assert.equal(Object.keys(cycle.allocations).length, step.index + 1);
+            assert.equal(cycle.allocations[session.sessionId!]!.resultId, null, "a plan is not a formal handoff");
+            assert.equal(cycle.pending, null);
+            assert.equal(workers[step.index]!.params.control.accepted(), false);
+            assert.equal(api.state.status, stateBeforePlan, "planning needs no approval lane");
+            mkdirSync(work, { recursive: true });
+            writeFileSync(product, step.issuePlan.product);
+            step.actions.push("product_write");
+            writeFileSync(join(work, "handoff.md"), step.summary);
+            step.actions.push("handoff_write");
+          } else if (scriptedPlanning && step.role === "review") {
+            assert.match(prompt, /## Independent plan assessment/);
+            assert.match(prompt, /Independently check the requirements, code/);
+            const implementation = priorPlans.at(-1)!;
+            assert.notEqual(session.workingDirectory, implementation.session!.workingDirectory);
+            assert.ok(!session.tools?.some((tool) => tool.name === "tracker_submit_for_review"));
+            const work = join(implementation.session!.workingDirectory!, "work");
+            assert.equal(readFileSync(join(work, "product.txt"), "utf8"), implementation.issuePlan!.product);
+            assert.equal(readFileSync(join(work, "handoff.md"), "utf8"), implementation.summary);
+            step.actions.push("review_fixture_work");
+          }
           api.state.localHead = step.role === "implement" ? step.head : api.state.remoteHead;
           const result = step.role === "implement"
             ? await tool("tracker_submit_for_review", { title: `Implementation ${step.index + 1}`, summary: step.summary })
@@ -370,6 +442,95 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
 
 test("offline iteration integration: real scheduler, runner, ledger and GitHub tracker", { timeout: 15_000 }, async (t) => {
   const runtime = await offlineRuntime(t);
+  await t.test("scripted plan publication/reuse, independent review and revision share the existing session allowance", async (t) => {
+    const plan = "## Implementation plan\n\n"
+      + "Goal: preserve fixture work across implementation/review handoffs; no new role or board lane.\n"
+      + "Evidence: each role has its own workspace. Assumption: the existing work file is reusable.\n"
+      + "Approach: retain the work file, rather than create another planning session.\n"
+      + "Verify: check replacement and cleanup ownership, then write work and publish the complete handoff.\n"
+      + "PLAN END: acceptance criteria still apply independently of this plan.";
+    const revision = "## Implementation plan — revision\n\n"
+      + "The first review found stale work reuse: file existence does not establish current content.\n"
+      + "Change the shared reuse check to validate content before replacement; keep the original plan as history.\n"
+      + "Verify both initial work and replacement in the same implementation workspace. REVISION END.";
+    const s = setup(t, runtime, [
+      { role: "implement", issuePlan: { body: plan, product: "initial fixture work\n", loseResponse: true } },
+      { role: "review", progress: "initial" },
+      { role: "implement", issuePlan: { body: revision, product: "revised fixture work\n" } },
+      { role: "review", progress: "no_progress" },
+    ]);
+    s.steps[1]!.reason = "Independent counterexample: an existing work file can contain stale content.";
+    s.steps[1]!.nextStep = "Validate content, not existence alone, before reusing or replacing work.";
+    s.steps[1]!.blocker = "The same workspace can retain an earlier version; verify the replacement path.";
+    await s.orchestrator.start();
+    await s.orchestrator.tick();
+    const targets = ["AI Review", "Rework", "AI Review", "Rework"];
+    let authorization = "";
+    const preservedPlans: Message[] = [];
+    for (let i = 0; i < 4; i++) {
+      if (i > 0) t.mock.timers.tick(1_000);
+      await s.finish(i);
+      const cycle = s.ledger.get(controlKey)!, step = s.steps[i]!;
+      authorization ||= cycle.authorizationId;
+      assert.equal(cycle.authorizationId, authorization, "neither planning nor automatic rework reauthorizes");
+      assert.equal(cycle.limit, 20);
+      assert.equal(cycle.sessions, i + 1, "one allocation per actual implementation/review SDK session");
+      assert.equal(s.counts.create, i + 1); assert.equal(s.counts.created, i + 1); assert.equal(s.counts.send, i + 1);
+      assert.equal(s.workers.length, i + 1); assert.equal(Object.keys(cycle.allocations).length, i + 1);
+      assert.equal(cycle.invocation!.ordinal, i + 1); assert.equal(cycle.invocation!.phase, "finished");
+      assert.equal(cycle.reviewRounds, Math.floor((i + 1) / 2));
+      assert.equal(cycle.noProgress, i === 3 ? 1 : 0);
+      assert.equal(cycle.reworkReady, i === 2);
+      assert.equal(cycle.pending, null); assert.equal(cycle.halted, null);
+      assert.equal(cycle.lastState, targets[i]); assert.equal(s.api.state.status, targets[i]);
+      const allocation = cycle.allocations[step.session!.sessionId!]!;
+      assert.equal(allocation.authorizationId, authorization); assert.equal(allocation.ordinal, i + 1);
+      assert.ok(allocation.resultId);
+      const record = s.api.issueMessages().at(-1)!;
+      assert.ok(record.body.includes(step.summary), "the complete final handoff stays on the issue");
+      assert.ok(record.body.includes(`<!-- symphony-result:${allocation.resultId} -->`));
+      assert.deepEqual(record.body.match(/^用量（本轮）：.*$/gm), [
+        `用量（本轮）：${step.credits.toFixed(2)} · 轮次 ${i + 1}/20 · 模型：${step.model}`,
+      ]);
+      if (step.issuePlan) {
+        const comments = s.api.issueMessages().filter((m) => m.body.startsWith(`${step.issuePlan!.body}\n\n`));
+        assert.equal(comments.length, 1, "the scripted reread/reuse does not duplicate a persisted plan");
+        const message = comments[0]!;
+        assert.ok(message.body.includes(`<!-- symphony-invocation:${step.session!.sessionId} -->`));
+        assert.doesNotMatch(message.body, /symphony-result:|用量（本轮）/, "formal handoff, not the earlier plan, receives final usage");
+        preservedPlans.push(structuredClone(message));
+        assert.deepEqual(step.actions, [
+          "tracker_get_issue", "tracker_get_issue", "tracker_comment",
+          ...(step.issuePlan.loseResponse ? ["tracker_get_issue"] : []),
+          "product_write", "handoff_write", "tracker_submit_for_review",
+        ]);
+      } else {
+        for (const message of preservedPlans) assert.ok(step.history.includes(message.body), "independent reviewer receives the full plan/revision");
+        assert.deepEqual(step.actions, ["tracker_get_issue", "tracker_get_issue", "review_fixture_work", "tracker_submit_review"]);
+      }
+      for (const message of preservedPlans) assert.deepEqual(s.api.messages.get(message.id), message, "later usage and revisions never overwrite earlier plans");
+      assert.deepEqual(new RunLedger(s.ledger.path!).get(controlKey), cycle);
+    }
+    assert.ok(s.steps[2]!.history.some((body) => body.includes(s.steps[1]!.reason) && body.includes(s.steps[1]!.nextStep) && body.includes(s.steps[1]!.blocker)));
+    assert.ok(s.steps[2]!.history.includes(preservedPlans[0]!.body), "rework retains its original full plan alongside the review");
+    assert.equal(s.steps[2]!.session!.workingDirectory, s.steps[0]!.session!.workingDirectory);
+    assert.notEqual(s.steps[1]!.session!.sessionId, s.steps[0]!.session!.sessionId);
+    assert.match(s.steps[3]!.prompt, /formally handed-off rework/);
+    assert.deepEqual(s.workers.map((w) => w.params.role), ["implement", "review", "implement", "review"]);
+    assert.deepEqual(s.api.transitions, ["In Progress", ...targets]);
+    assert.equal(s.api.issueMessages().length, 6, "two plans plus four full results; no extra usage-only comments");
+    assert.equal(s.api.calls.filter((c) => c.query.includes("addComment") && c.variables.id === issueId && c.variables.body.startsWith("## Implementation plan")).length, 2);
+    assert.equal(s.api.calls.filter((c) => c.query.includes("updateIssueComment") && c.variables.body.includes("用量（本轮）")).length, 4);
+    assert.equal(s.gitCalls.filter((c) => c.args[0] === "push").length, 2);
+    assert.equal(s.api.reviews.length, 2);
+    assert.equal(s.ledger.get(controlKey)!.aiCredits, 11);
+    assert.equal(s.ledger.get(controlKey)!.totalAiCredits, 11);
+    await s.orchestrator.stop();
+    assert.deepEqual(s.errors, []);
+    assert.deepEqual(s.counts, { start: 4, create: 4, created: 4, send: 4, metrics: 4, disconnect: 4, stop: 4, forceStop: 0, abort: 0 });
+    t.diagnostic("Scripted SDK behavior only: plan -> fixture write -> handoff; persisted/lost comment reply -> scoped reread/reuse. Not host exactly-once recovery, an enforced write barrier or LLM planning-quality evidence.");
+  });
+
   await t.test("formal implementation/review chain pauses after two no-progress reworks, then Todo grants one new session", async (t) => {
     const s = setup(t, runtime, [
       { role: "implement" }, { role: "review", progress: "initial" },

@@ -723,15 +723,38 @@ test("publication refreshes the project item from native issue identity", async 
   assert.equal(s.calls.find((c) => c.query.includes("updateProjectV2ItemFieldValue"))!.variables.item, "PVTI_readded");
 });
 
-test("blocked handoff requires this invocation's prior comment and upgrades that exact message without duplication", async () => {
+test("planning/progress comments cannot become a blocking handoff without an explicit blocking reason", async () => {
+  const s = publicationSetup({ review: false, target: "受阻" });
+  for (const body of ["## Implementation plan\nInvestigate and verify before coding.", "Progress: checked the existing code."]) {
+    const plan = await s.call("tracker_comment", { body });
+    const savedBody = s.comments.get(plan.comment_id)!.body;
+    assert.match((await s.call("tracker_set_status", { status: "受阻" })).textResultForLlm, /blocking=true/);
+    assert.equal(s.saved.accepted, false);
+    assert.equal(s.saved.pending, null);
+    assert.equal(s.comments.get(plan.comment_id)!.body, savedBody, "never upgrade a plan/progress note to a blocker");
+    assert.ok(!s.calls.some((c) => c.query.includes("updateProjectV2ItemFieldValue")));
+  }
+  const before = s.calls.length;
+  assert.equal((await s.call("tracker_comment", { body: "Need access", blocking: "true" })).resultType, "failure");
+  assert.equal(s.calls.length, before, "invalid flags cannot publish or enable a blocking handoff");
+  await s.call("tracker_comment", { body: "Previously needed access.", blocking: true });
+  await s.call("tracker_comment", { body: "Access restored; continue the plan.", blocking: false });
+  assert.match((await s.call("tracker_set_status", { status: "受阻" })).textResultForLlm, /blocking=true/);
+  assert.equal(s.saved.accepted, false, "a later progress note must clear the previous comment's blocking flag");
+});
+
+test("blocked handoff requires this invocation's explicit blocking comment and upgrades that exact message without duplication", async () => {
   const s = publicationSetup({ review: false, target: "受阻" });
   assert.match((await s.call("tracker_set_status", { status: "受阻" })).textResultForLlm, /tracker_comment/);
   assert.equal(s.saved.accepted, false);
-  const posted = await s.call("tracker_comment", { body: "Tried the allowed repair. Need credentials from a human." });
+  const plan = await s.call("tracker_comment", { body: "## Implementation plan\nVerify credentials before repair." });
+  const planBody = s.comments.get(plan.comment_id)!.body;
+  const posted = await s.call("tracker_comment", { body: "Tried the allowed repair. Need credentials from a human.", blocking: true });
   s.comments.set("human", { id: "human", url: "human", body: "unrelated latest comment", issue: { id: "I_1" } });
   assert.equal((await s.call("tracker_set_status", { status: "受阻" })).status, "受阻");
   assert.equal(s.saved.pending!.issueMessage!.id, posted.comment_id);
-  assert.equal(s.comments.size, 2);
+  assert.equal(s.comments.size, 3);
+  assert.equal(s.comments.get(plan.comment_id)!.body, planBody);
   assert.match(s.comments.get(posted.comment_id)!.body, /symphony-result:result-1/);
   assert.equal(s.comments.get("human")!.body, "unrelated latest comment");
   assert.equal(s.saved.pending!.result.summary, "Tried the allowed repair. Need credentials from a human.");
@@ -739,7 +762,7 @@ test("blocked handoff requires this invocation's prior comment and upgrades that
 
 test("blocked comment upgrade response loss is reconciled without duplicating the semantic message", async () => {
   const s = publicationSetup({ review: false, target: "受阻" });
-  await s.call("tracker_comment", { body: "Need access; attempts and requested action recorded here." });
+  await s.call("tracker_comment", { body: "Need access; attempts and requested action recorded here.", blocking: true });
   s.state.lose = "updateIssueComment";
   assert.equal((await s.call("tracker_set_status", { status: "受阻" })).resultType, "failure");
   assert.deepEqual(await s.resume(), { stale: false });
@@ -772,7 +795,7 @@ test("state changes during marker pagination cancel the issue write, not just th
 
 test("blocked upgrade does not rewrite the prior comment after an unexpected remote transition", async () => {
   const s = publicationSetup({ review: false, target: "受阻" });
-  const ref = await s.call("tracker_comment", { body: "Need human input." });
+  const ref = await s.call("tracker_comment", { body: "Need human input.", blocking: true });
   const body = s.comments.get(ref.comment_id)!.body;
   s.state.status = "Done";
   assert.equal((await s.call("tracker_set_status", { status: "受阻" })).stale, true);
@@ -782,7 +805,7 @@ test("blocked upgrade does not rewrite the prior comment after an unexpected rem
 
 test("a human-edited blocking note is preserved and a separate complete result is used", async () => {
   const s = publicationSetup({ review: false, target: "受阻" });
-  const ref = await s.call("tracker_comment", { body: "Need human input." });
+  const ref = await s.call("tracker_comment", { body: "Need human input.", blocking: true });
   const original = s.comments.get(ref.comment_id)!; original.body += "\nHuman clarification";
   const body = original.body;
   assert.equal((await s.call("tracker_set_status", { status: "受阻" })).status, "受阻");

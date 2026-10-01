@@ -36,6 +36,7 @@ for (const folder of ["", "examples"]) {
     assert.match(implementation, /external dependenc/);
     assert.match(implementation, /in-scope test failure/);
     assert.match(implementation, /tracker_comment[\s\S]*tried[\s\S]*human action[\s\S]*tracker_set_status[\s\S]*Blocked/);
+    assert.match(implementation, /tracker_comment with blocking=true/);
     const reviewer = readFileSync(join(root, folder, "REVIEW.md"), "utf8");
     for (const field of ["reviewed_head", "progress", "progress_reason", "next_action", "next_step", "blocking_issues", "summary"]) {
       assert.ok(reviewer.includes(field), `missing review field ${field}`);
@@ -47,6 +48,20 @@ for (const folder of ["", "examples"]) {
     assert.match(reviewer, /commit count.*line count.*not.*progress/);
     assert.match(reviewer, /full record on the issue/);
     assert.doesNotMatch(reviewer, /use tracker_comment.*and stop/);
+  });
+
+  test(`${folder || "repository"} prompts keep autonomous planning on the issue and humans on the Project`, () => {
+    const implementation = loadWorkflow(join(root, folder, "WORKFLOW.md")).promptTemplate;
+    for (const phrase of [/Implementation plan with tracker_comment before product edits/, /self-grill/, /same session without waiting for human approval/, /Reuse an applicable published plan/, /concise revision/, /reconsider the shared mechanism/, /not human approval/, /Project, not chat interviews/, /without the PR/]) {
+      assert.match(implementation, phrase);
+    }
+    assert.match(implementation, /planning step below before running `git merge/);
+    assert.match(implementation, /do not infer human authorship or approval/);
+    assert.doesNotMatch(implementation, /the rest from people/);
+    const reviewer = readFileSync(join(root, folder, "REVIEW.md"), "utf8");
+    for (const phrase of [/Implementation plan and revisions/, /evidence, not authority/, /cannot narrow acceptance criteria/, /self-grill is not independent review/, /outside-scope hardening/, /Plan formatting alone is not a blocker/]) {
+      assert.match(reviewer, phrase);
+    }
   });
 
   test(`${folder || "repository"} workflow front matter uses explicit lifecycle mappings and one shared cap`, () => {
@@ -80,6 +95,7 @@ test("default continuation prompts do not fall back to example-only repairs or f
   assert.match(config.review!.continuationPrompt, /Remove your disposable tests/);
   for (const prompt of [config.agent.continuationPrompt, config.copilot.userInputReply]) {
     assert.match(prompt, /external dependenc/);
+    assert.match(prompt, /tracker_comment with blocking=true/);
     assert.match(prompt, /tracker_comment[\s\S]*tracker_set_status/);
   }
   for (const prompt of [config.review!.continuationPrompt, config.copilot.userInputReply]) {
@@ -95,6 +111,7 @@ test("onboarding derives mandatory lifecycle columns without credit budgets or i
     assert.match(skill, phrase);
   }
   assert.doesNotMatch(skill, /First `tracker\.active_states`|Blocked lane on:|Blocked lane is off|Only if selected|per-card AI-credit budget|default 8|1000 credits|last failed round/);
+  for (const phrase of [/autonomous planning before product edits/, /same session/, /Project control plane/, /Automated answers are not human approval/, /not a write barrier/, /self-grill/i, /never let a plan narrow acceptance criteria/]) assert.match(skill, phrase);
 });
 
 test("write-card starts only in the explicit start_state and does not ask users to enumerate edge cases", () => {

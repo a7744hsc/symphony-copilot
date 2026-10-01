@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { renderContinuationPrompt, renderIssuePrompt, TemplateError } from "../src/template.ts";
+import { composeAgentPrompt, renderContinuationPrompt, renderIssuePrompt, TemplateError } from "../src/template.ts";
 import { makeIssue } from "./helpers.ts";
 
 test("prompt renders issue fields, labels, and attempt", () => {
@@ -23,4 +23,53 @@ test("empty template falls back to a minimal prompt", () => {
 
 test("continuation prompt gets turn and max_turns", () => {
   assert.equal(renderContinuationPrompt("{{ issue.identifier }} {{ turn }}/{{ max_turns }}", makeIssue(), 2, 5), "GH-1 2/5");
+});
+
+test("implementer receives proportional planning and self-grill without replacing the repository prompt", () => {
+  const repository = "Use this project's checks. Literal {{ not_a_template }} stays intact.";
+  const prompt = composeAgentPrompt(repository, "implement", true);
+  assert.ok(prompt.endsWith(repository), "already rendered content is neither templated again nor dropped");
+  for (const rule of [/tracker_get_issue/, /pagination\.next/, /history_complete=false/, /Self-grill/, /evidence.*assumptions/, /unchanged callers/, /failure.*retry.*cleanup/, /alternatives/, /verification/, /tracker_comment/, /before product edits/, /same session/]) {
+    assert.match(prompt, rule);
+  }
+  assert.match(prompt, /Reuse an applicable existing plan/);
+  assert.match(prompt, /underlying failure class/);
+  assert.match(prompt, /reconsider the shared mechanism/);
+  assert.match(prompt, /read the issue again before retrying/);
+  assert.match(prompt, /stop without product edits/);
+  assert.match(prompt, /not human approval/);
+  assert.match(prompt, /Do not wait for a chat answer/);
+  assert.match(prompt, /tracker_set_status/);
+  assert.match(prompt, /blocking=true/);
+  assert.match(prompt, /progress comments must leave blocking unset or false/);
+  assert.match(prompt, /Do not invent requirements.*weaken acceptance criteria/);
+});
+
+test("reviewer independently challenges issue plans without an implementation or planning handoff", () => {
+  const prompt = composeAgentPrompt("Repository review rules and progress context.", "review", true);
+  assert.ok(prompt.endsWith("Repository review rules and progress context."));
+  assert.match(prompt, /plans and revisions.*current issue/);
+  assert.match(prompt, /not authority/);
+  assert.match(prompt, /cannot narrow acceptance criteria/);
+  assert.match(prompt, /independently/i);
+  assert.match(prompt, /outside-scope hardening/);
+  assert.match(prompt, /tracker_submit_review[\s\S]*unable_to_verify[\s\S]*human_required/);
+  assert.doesNotMatch(prompt, /tracker_comment|tracker_set_status|tracker_submit_for_review/);
+});
+
+test("both roles get short continuation reminders, not a fresh planning exercise", () => {
+  for (const role of ["implement", "review"] as const) {
+    const prompt = composeAgentPrompt("Continue custom task.", role, false);
+    assert.ok(prompt.endsWith("Continue custom task."));
+    assert.match(prompt, /not human approval/);
+    assert.doesNotMatch(prompt, /## Autonomous planning|## Independent plan assessment/);
+    if (role === "implement") {
+      assert.match(prompt, /Continue the existing plan/);
+      assert.match(prompt, /do not republish an unchanged plan/);
+      assert.match(prompt, /still missing/);
+    } else {
+      assert.match(prompt, /remaining independent checks/);
+      assert.doesNotMatch(prompt, /tracker_comment|tracker_set_status/);
+    }
+  }
 });

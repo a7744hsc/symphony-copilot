@@ -143,6 +143,33 @@ async function permission(config: SessionConfig, request: PermissionRequest) {
 const hasCode = (code: RunErrorCode) => (error: unknown) => error instanceof RunError && error.code === code;
 
 for (const role of ["implement", "review"] as const) {
+  test(`${role} receives autonomous policy even with a minimal custom prompt, in one SDK session`, async (t) => {
+    const s = setup(t, role);
+    s.config.agent.maxTurns = 2;
+    s.params.tracker.fetchIssuesByIds = async () => [s.params.issue];
+    await runAgentAttempt(s.params);
+    assert.equal(s.sessions.length, 1);
+    assert.equal(s.events.filter((event) => event === "create").length, 1);
+    assert.equal(s.prompts.length, 2);
+    assert.deepEqual(s.sessions[0]!.disabledSkills, ["symphony-onboard", "symphony-write-card", "brainstorming", "grill-me", "grilling"]);
+    assert.match(s.prompts[0]!, /not human approval/);
+    if (role === "implement") {
+      assert.match(s.prompts[0]!, /## Autonomous planning[\s\S]*Self-grill[\s\S]*tracker_comment/);
+      assert.ok(s.prompts[0]!.endsWith("Work on GH-1"));
+      assert.match(s.prompts[1]!, /Continue the existing plan/);
+      assert.doesNotMatch(s.prompts[1]!, /## Autonomous planning/);
+    } else {
+      assert.match(s.prompts[0]!, /## Independent plan assessment/);
+      assert.match(s.prompts[0]!, /Review GH-1[\s\S]*initial review; use progress=initial/);
+      assert.match(s.prompts[1]!, /remaining independent checks/);
+      assert.doesNotMatch(s.prompts[0]!, /tracker_comment|tracker_set_status/);
+    }
+    const reply = await s.sessions[0]!.onUserInputRequest!({ question: "Approve the plan?" }, { sessionId: "test" });
+    assert.match(reply.answer, /not human approval/);
+  });
+}
+
+for (const role of ["implement", "review"] as const) {
   test(`${role} session spills large output into its private, canonical, read-only directory`, async (t) => {
     const s = setup(t, role);
     const originalReadAllow = [...s.config.copilot.readAllow];

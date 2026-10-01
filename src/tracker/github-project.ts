@@ -430,7 +430,7 @@ export class GitHubProjectTracker implements TrackerAdapter {
   }
 
   agentTools(context: AgentToolContext): Tool<any>[] {
-    let lastComment: { summary: string; body: string; message: IssueMessageRef } | null = null;
+    let lastComment: { summary: string; body: string; message: IssueMessageRef; blocking: boolean } | null = null;
     let mutating = false;
     const wrap = <T>(name: string, fn: (args: T) => Promise<unknown>) => async (args: T) => {
       context.log.info("tracker tool called", { tool: name });
@@ -472,15 +472,23 @@ export class GitHubProjectTracker implements TrackerAdapter {
         handler: wrap("tracker_get_issue", (args: unknown) => this.issueContext(context.issue, args)),
       }),
       defineTool("tracker_comment", {
-        description: "Post a Markdown comment on the current issue (progress notes, assumptions, blockers).",
-        parameters: { type: "object", properties: { body: { type: "string", description: "Markdown comment body" } }, required: ["body"], additionalProperties: false },
+        description: "Post a Markdown comment on the current issue (plans, progress, assumptions or blockers). Before setting Blocked, post the complete blocking reason with blocking=true; ordinary plans/progress do not satisfy that handoff.",
+        parameters: {
+          type: "object",
+          properties: {
+            body: { type: "string", description: "Markdown comment body" },
+            blocking: { type: "boolean", description: "Default false. True only for a complete blocking reason: attempted steps/results, missing condition and concrete human action needed; not for a plan or routine progress." },
+          },
+          required: ["body"], additionalProperties: false,
+        },
         skipPermission: true,
-        handler: wrap("tracker_comment", async ({ body }: { body: string }) => {
+        handler: wrap("tracker_comment", async ({ body, blocking }: { body: string; blocking?: boolean }) => {
           if (typeof body !== "string" || body.trim() === "") return { failure: "body must be a non-empty string" };
+          if (blocking !== undefined && typeof blocking !== "boolean") return { failure: "blocking must be a boolean" };
           const postedBody = context.control ? `${body}\n\n${invocationMarker(context.control.id)}\n${usageBlock(context.control.id)}` : body;
           context.control?.assertActive();
           const message = await this.addComment(this.issueNodeId(context.issue), postedBody);
-          lastComment = { summary: body, body: postedBody, message };
+          lastComment = { summary: body, body: postedBody, message, blocking: blocking === true };
           context.control?.onIssueMessage(message);
           return { comment_id: message.id, comment_url: message.url };
         }),
@@ -552,14 +560,14 @@ export class GitHubProjectTracker implements TrackerAdapter {
     );
     if (this.settings.agentStates.length > 0) {
       tools.push(defineTool("tracker_set_status", {
-        description: `Move the current issue's card to another status. Allowed: ${this.settings.agentStates.join(", ")}. Comment with the reason before setting a blocked status.`,
+        description: `Move the current issue's card to another status. Allowed: ${this.settings.agentStates.join(", ")}. Before a blocked status, the latest tracker_comment in this invocation must contain the complete blocking reason and use blocking=true, not a plan/progress note.`,
         parameters: { type: "object", properties: { status: { type: "string", enum: this.settings.agentStates } }, required: ["status"], additionalProperties: false },
         skipPermission: true,
         handler: wrap("tracker_set_status", async ({ status }: { status: string }) => {
           const allowed = this.settings.agentStates.find((s) => normalizeState(s) === normalizeState(String(status)));
           if (!allowed) return { failure: `status must be one of: ${this.settings.agentStates.join(", ")}` };
           if (normalizeState(allowed) === normalizeState(this.settings.blockedState)) {
-            if (!lastComment) return { failure: "post the complete blocking reason with tracker_comment in this invocation first" };
+            if (!lastComment?.blocking) return { failure: "post the complete blocking reason with tracker_comment and blocking=true in this invocation first; a plan/progress comment is not a blocker" };
             const control = this.handoffControl(context);
             const p = await control.accept({ kind: "blocked", summary: lastComment.summary }, context.workspacePath);
             // Upgrade the exact prior comment, never whichever comment happens to be last remotely.

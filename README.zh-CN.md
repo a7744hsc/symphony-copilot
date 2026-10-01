@@ -39,8 +39,10 @@ flowchart LR
 
 1. 给 Issue 打上 `agent` 标签，把卡片放进 `tracker.provider.start_state`（比如 Todo），不按活跃列的排列顺序推断入口。
 2. symphony-copilot 领取卡片，为它建工作区（示例工作流里，`after_create` hook 会克隆仓库并切到 `agent/<编号>`），然后用 `WORKFLOW.md` 里的提示词启动 Copilot 会话。
-3. agent 干活、跑检查、提交，然后调用 `tracker_submit_for_review`。调度器推送分支，开一个会关闭该 Issue 的 PR，把完整交接记录写进 Issue；启用独立审核时进入 AI Review，否则进入 Human Review。
+3. agent 在同一次会话内调查代码、拟定计划并自我质询，在修改产品代码前把计划写入 Issue，再实现、跑检查、提交并调用 `tracker_submit_for_review`。已有适用计划直接复用，返工时修订重要决策，不等待聊天批准。调度器推送分支，开一个会关闭该 Issue 的 PR，把完整交接记录写进 Issue；启用独立审核时进入 AI Review，否则进入 Human Review。
 4. 你来审核。合并 PR 或关闭 Issue 才算完成。需要继续工作时，留言后把等待中的卡片放回 Todo，保留工作区和历史、重新获得会话额度。In Progress、Rework、AI Review 由调度器管理，不要手动移入或移出。
+
+规划不增加 agent 会话或看板列。自动回答不等于人工批准：agent 在授权范围内自主决定，真正缺少关键需求或权限时进入 Blocked。自我质询不能替代独立审核；审核者根据 Issue 检查假设和代码，而不只是核对是否符合计划。运行时自带此流程，无需安装交互式规划 skill。这是提示词层面的工作要求，不是文件写入门禁，也不保证任务一定收敛。详见[自主规划与审核](docs/reference.md#implementation-and-review-method)（英文）。
 
 ## 对比
 
