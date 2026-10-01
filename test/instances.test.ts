@@ -9,7 +9,7 @@ import { RunLedger } from "../src/ledger.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { requestRunner, serveRunner } from "../src/runner-control.ts";
 import { WorkflowStore } from "../src/workflow.ts";
-import { makeConfig, makeIssue, quietLog, workflowText } from "./helpers.ts";
+import { makeConfig, makeIssue, quietLog, reviewWorkflowText, workflowText } from "./helpers.ts";
 
 function fixture(t: TestContext) {
   const dir = mkdtempSync(join(tmpdir(), "symphony-instances-"));
@@ -21,10 +21,17 @@ function fixture(t: TestContext) {
   const registry = new RunnerRegistry(join(dir, "registry"));
   const record = (id: string, patch: Partial<RunnerRecord> = {}): RunnerRecord => ({
     id, workflow: join(dir, `${id}.md`), workspace: join(dir, "work", id),
+    inputs: [patch.workflow ?? join(dir, `${id}.md`)],
     directory: join(dir, "logs", id), project: `https://api.github.com/me/${id}`, scope: id,
     run: { pid: process.pid, nonce: randomUUID(), socket: join(dir, `${id}.sock`) }, ...patch,
   });
-  return { dir, registry, record, cleanup };
+  const reviewRecord = (id: string, promptFile: string): RunnerRecord => {
+    const r = record(id);
+    writeFileSync(r.workflow, reviewWorkflowText(r.workspace, id === "alpha" ? 1 : 2, promptFile));
+    const store = new WorkflowStore(r.workflow, quietLog, {});
+    return { ...r, ...runnerIdentity(store.workflow.config) };
+  };
+  return { dir, registry, record, reviewRecord, cleanup };
 }
 
 test("registry atomically admits independent workflows, retains stopped state and releases only its own run", async (t) => {
@@ -171,6 +178,109 @@ test("pre-existing ledger temporary files fail startup without overwriting crash
   }
 });
 
+for (const [kind, link] of [["symlink", symlinkSync], ["hard link", linkSync]] as const) {
+  test(`reviewer inputs reject cross-runner ${kind} writes in either claim order, live or stopped`, async (t) => {
+    for (const resource of ["log", "ledger"] as const) {
+      for (const readerFirst of [false, true]) {
+        for (const stopped of [false, true]) {
+          const { dir, registry, record, reviewRecord } = fixture(t);
+          const prompt = join(dir, "REVIEW.md");
+          writeFileSync(prompt, "alpha review instructions");
+          const a = reviewRecord("alpha", prompt), b = record("beta");
+          mkdirSync(b.directory, { recursive: true });
+          mkdirSync(b.workspace, { recursive: true });
+          const destination = resource === "log" ? join(b.directory, "orchestrator.log") : join(b.workspace, ".symphony-ledger.json");
+          link(prompt, destination);
+          const [first, second] = readerFirst ? [a, b] : [b, a];
+          await registry.claim(first);
+          if (stopped) await registry.release(first.id, first.run!.nonce);
+          const before = readFileSync(registry.path, "utf8");
+          await assert.rejects(registry.claim(second), /state path collision/, `${resource}, readerFirst=${readerFirst}, stopped=${stopped}`);
+          assert.equal(readFileSync(prompt, "utf8"), "alpha review instructions");
+          assert.equal(readFileSync(registry.path, "utf8"), before);
+        }
+      }
+    }
+  });
+
+  test(`reviewer inputs reject intra-runner and registry ${kind} aliases`, async (t) => {
+    for (const resource of ["log", "ledger", "temporary", "registry"] as const) {
+      const { dir, registry, reviewRecord } = fixture(t);
+      const prompt = join(dir, "REVIEW.md");
+      const a = reviewRecord("alpha", prompt);
+      mkdirSync(a.directory, { recursive: true });
+      mkdirSync(a.workspace, { recursive: true });
+      mkdirSync(registry.root, { recursive: true });
+      const target = resource === "log" ? join(a.directory, "orchestrator.log")
+        : resource === "registry" ? registry.path
+        : join(a.workspace, `.symphony-ledger.json${resource === "temporary" ? ".tmp" : ""}`);
+      writeFileSync(target, "[]");
+      link(target, prompt);
+      await assert.rejects(registry.claim(a), resource === "registry" ? /shared registry/ : /must not overlap/, resource);
+      assert.equal(readFileSync(prompt, "utf8"), "[]");
+      assert.equal(readFileSync(target, "utf8"), "[]");
+      assert.deepEqual(registry.list(), []);
+    }
+  });
+}
+
+test("reviewer input ancestry and dangling aliases are reserved before files exist", async (t) => {
+  for (const own of [false, true]) {
+    const { dir, registry, record, reviewRecord } = fixture(t);
+    const b = record("beta");
+    const prompt = join(own ? join(dir, "work", "alpha") : b.workspace, "GH-1", "REVIEW.md");
+    const a = reviewRecord("alpha", prompt);
+    if (!own) await registry.claim(b);
+    await assert.rejects(registry.claim(a), own ? /must not overlap/ : /state path collision/);
+    assert.equal(existsSync(prompt), false);
+  }
+  const { dir, registry, record, reviewRecord } = fixture(t);
+  const prompt = join(dir, "future-review.md");
+  const a = reviewRecord("alpha", prompt), b = record("beta");
+  mkdirSync(b.directory, { recursive: true });
+  symlinkSync(prompt, join(b.directory, "orchestrator.log"));
+  await registry.claim(a);
+  await assert.rejects(registry.claim(b), /state path collision/);
+  assert.equal(existsSync(prompt), false);
+});
+
+test("input links inside a writable workspace reserve both their entry and external target", async (t) => {
+  for (const input of ["workflow", "review"] as const) {
+    for (const kind of ["file", "directory"] as const) {
+      const { dir, registry, reviewRecord } = fixture(t);
+      const workspace = join(dir, "work", "alpha"), outside = join(dir, "outside");
+      mkdirSync(workspace, { recursive: true });
+      mkdirSync(outside);
+      const target = join(outside, "input.md"), link = join(workspace, "link");
+      writeFileSync(target, "instructions");
+      symlinkSync(kind === "file" ? target : outside, link);
+      const alias = kind === "file" ? link : join(link, "input.md");
+      const a = reviewRecord("alpha", input === "review" ? alias : join(dir, "REVIEW.md"));
+      if (input === "workflow") {
+        writeFileSync(target, readFileSync(a.workflow));
+        const store = new WorkflowStore(alias, quietLog, {});
+        Object.assign(a, runnerIdentity(store.workflow.config));
+      }
+      await assert.rejects(registry.claim(a), /must not overlap/, `${input}: ${kind}`);
+      assert.equal(existsSync(alias), true);
+      assert.equal(existsSync(a.directory), false);
+    }
+  }
+});
+
+test("registry rejects incomplete workflow input inventories without rewriting them", async (t) => {
+  const { registry, record } = fixture(t);
+  const a = record("alpha");
+  mkdirSync(registry.root, { recursive: true });
+  for (const inputs of [undefined, [], ["relative-review.md"], [a.workflow, null]]) {
+    const text = JSON.stringify([{ ...a, inputs }]);
+    writeFileSync(registry.path, text);
+    assert.throws(() => registry.list(), /invalid runner registry.*input paths/);
+    await assert.rejects(registry.claim(record("beta")), /invalid runner registry/);
+    assert.equal(readFileSync(registry.path, "utf8"), text);
+  }
+});
+
 test("dangling symlinks reserve their eventual targets before state files exist", async (t) => {
   const { dir, registry, record } = fixture(t);
   const a = record("alpha"), b = record("beta");
@@ -255,6 +365,58 @@ test("identity-changing reloads keep the old config, but prompt edits and recove
   assert.equal(edit(text.replace("prompt-1", "new prompt")).definition.promptTemplate, "new prompt");
   assert.equal(store.reloadError, null);
   store.close();
+});
+
+test("reviewer input changes require restart; reload failures retain last-good configuration and recover", async (t) => {
+  const { dir, registry, record } = fixture(t);
+  const b = record("beta");
+  mkdirSync(b.directory, { recursive: true });
+  const log = join(b.directory, "orchestrator.log");
+  writeFileSync(log, "beta log");
+  await registry.claim(b);
+  const path = join(dir, "alpha.md"), workspace = join(dir, "work", "alpha"), prompt = join(dir, "REVIEW.md");
+  const text = reviewWorkflowText(workspace, 1, prompt);
+  writeFileSync(path, text);
+  writeFileSync(prompt, "original review");
+  let pinned: ReturnType<typeof runnerIdentity> | undefined;
+  const store = new WorkflowStore(path, quietLog, {}, (c) => { if (pinned) assertRunnerIdentity(pinned, c); });
+  pinned = runnerIdentity(store.workflow.config);
+  const a = { ...record("alpha"), ...pinned };
+  await registry.claim(a);
+  let time = 2_000_000_000;
+  const edit = (contents: string) => { writeFileSync(path, contents); utimesSync(path, ++time, time); return store.refresh(); };
+  for (const changed of [
+    reviewWorkflowText(workspace, 1, log),
+    reviewWorkflowText(workspace, 1, join(dir, "other-review.md")),
+    workflowText(workspace, 1),
+  ]) {
+    const before = store.workflow;
+    assert.equal(edit(changed), before);
+    assert.equal(store.workflow.config.review?.promptFile, prompt);
+    assert.match(store.reloadError!, /runner identity changed.*restart/);
+  }
+  writeFileSync(prompt, "revised review");
+  const recovered = edit(text.replace("prompt-1", "new implementation prompt").replace("  states: [AI Review]", "  model: different-model\n  states: [AI Review]"));
+  assert.equal(store.reloadError, null);
+  assert.equal(recovered.definition.promptTemplate, "new implementation prompt");
+  assert.equal(recovered.config.review?.model, "different-model");
+  assert.equal(readFileSync(recovered.config.review!.promptFile, "utf8"), "revised review");
+  assert.equal(readFileSync(log, "utf8"), "beta log");
+  await registry.release(a.id, a.run!.nonce);
+  edit(reviewWorkflowText(workspace, 1, log));
+  const colliding = new WorkflowStore(path, quietLog, {});
+  await assert.rejects(registry.claim({ ...a, ...runnerIdentity(colliding.workflow.config) }), /state path collision/);
+  edit(reviewWorkflowText(workspace, 1, join(dir, "other-review.md")));
+  const restarted = new WorkflowStore(path, quietLog, {});
+  await registry.claim({ ...a, ...runnerIdentity(restarted.workflow.config) });
+  writeFileSync(path, workflowText(workspace, 1));
+  const disabled = new WorkflowStore(path, quietLog, {});
+  const noReview = runnerIdentity(disabled.workflow.config);
+  assert.throws(() => assertRunnerIdentity(noReview, recovered.config), /runner identity changed/);
+  const sameFileReview = { ...disabled.workflow.config, review: { ...recovered.config.review!, promptFile: path } };
+  assert.throws(() => assertRunnerIdentity(noReview, sameFileReview), /runner identity changed/);
+  assert.throws(() => assertRunnerIdentity(runnerIdentity(sameFileReview), disabled.workflow.config), /runner identity changed/);
+  for (const s of [store, colliding, restarted, disabled]) s.close();
 });
 
 test("control targets a run nonce, never a possibly reused PID", async (t) => {

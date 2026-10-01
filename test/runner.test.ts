@@ -125,6 +125,17 @@ function outputDirectory(config: SessionConfig): string {
   return config.largeOutput.outputDirectory;
 }
 
+test("reviewer sessions reread edited prompt contents without changing the input path", async (t) => {
+  const s = setup(t, "review");
+  await runAgentAttempt(s.params);
+  writeFileSync(s.config.review!.promptFile, "Updated review for {{ issue.identifier }}");
+  await runAgentAttempt(s.params);
+  assert.equal(s.prompts.length, 2);
+  assert.match(s.prompts[0]!, /Review GH-1/);
+  assert.doesNotMatch(s.prompts[0]!, /Updated review/);
+  assert.match(s.prompts[1]!, /Updated review for GH-1/);
+});
+
 const read = (path: string) => ({ kind: "read", path, intention: "Inspect output" }) as PermissionRequest;
 const write = (fileName: string) => ({ kind: "write", fileName, diff: "", intention: "Change output", canOfferSessionApproval: false }) as PermissionRequest;
 function shell(path: string, cwd: string, readOnly = true, redirection = false): PermissionRequest {

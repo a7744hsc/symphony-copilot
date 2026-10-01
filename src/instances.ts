@@ -9,6 +9,7 @@ import { parseSettings } from "./tracker/github-project.ts";
 
 export interface RunnerIdentity {
   workflow: string;
+  inputs: string[];
   workspace: string;
   project: string;
   scope: string;
@@ -40,20 +41,23 @@ export function canonicalPath(path: string): string {
   }
 }
 
-function pathKey(path: string): string {
-  const canonical = canonicalPath(path);
+function locationKey(path: string): string {
   // Conservatively reject aliases on platforms commonly using case-insensitive volumes.
-  return process.platform === "darwin" || process.platform === "win32" ? canonical.toLowerCase() : canonical;
+  return process.platform === "darwin" || process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
+}
+
+function pathKey(path: string): string {
+  return locationKey(canonicalPath(path));
 }
 
 export function pathsOverlap(a: string, b: string): boolean {
-  const left = pathKey(a);
-  const right = pathKey(b);
+  const left = [locationKey(a), pathKey(a)];
+  const right = [locationKey(b), pathKey(b)];
   const contains = (root: string, target: string) => {
     const rel = relative(root, target);
     return rel === "" || (rel !== ".." && !rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && !isAbsolute(rel));
   };
-  if (contains(left, right) || contains(right, left)) return true;
+  if (left.some((l) => right.some((r) => contains(l, r) || contains(r, l)))) return true;
   const sa = statSync(a, { throwIfNoEntry: false });
   const sb = statSync(b, { throwIfNoEntry: false });
   return Boolean(sa && sb && sa.dev === sb.dev && sa.ino === sb.ino);
@@ -72,6 +76,20 @@ export function workflowId(path: string): string {
   return `${/^[a-z0-9]/.test(label) ? label : "workflow"}-${createHash("sha256").update(canonical).digest("hex").slice(0, 12)}`;
 }
 
+function workflowInputs(config: ServiceConfig): string[] {
+  const paths = [config.workflowPath, ...(config.review ? [config.review.promptFile] : [])];
+  // Cleanup can remove an input's symlink entry or an ancestor link, not just its read target.
+  return [...new Set(paths.flatMap((path) => {
+    const locations = [canonicalPath(path)];
+    let parent = resolve(path);
+    while (dirname(parent) !== parent) {
+      parent = dirname(parent);
+      locations.push(join(canonicalPath(parent), relative(parent, path)));
+    }
+    return locations;
+  }))];
+}
+
 export function runnerIdentity(config: ServiceConfig): RunnerIdentity {
   if (config.tracker.kind !== "github_project") throw new Error(`unsupported tracker kind: ${config.tracker.kind}`);
   const settings = parseSettings({ ...config.tracker.provider, token: "identity-only" }, {});
@@ -82,16 +100,18 @@ export function runnerIdentity(config: ServiceConfig): RunnerIdentity {
   const project = `${endpoint.host.toLowerCase()}/${settings.owner.toLowerCase()}/${settings.projectNumber}`;
   return {
     workflow: canonicalPath(config.workflowPath),
+    inputs: workflowInputs(config),
     workspace: canonicalPath(config.workspace.root),
     project,
-    scope: JSON.stringify([project, createHash("sha256").update(endpoint.href).digest("hex"), settings.ownerType, `${settings.repoOwner}/${settings.repoName}`.toLowerCase(), settings.identifierPrefix, settings.branchPrefix]),
+    scope: JSON.stringify([project, createHash("sha256").update(endpoint.href).digest("hex"), settings.ownerType, `${settings.repoOwner}/${settings.repoName}`.toLowerCase(), settings.identifierPrefix, settings.branchPrefix, config.review?.promptFile ?? null]),
   };
 }
 
 export function assertRunnerIdentity(expected: RunnerIdentity, config: ServiceConfig): void {
   const actual = runnerIdentity(config);
-  if (pathKey(actual.workflow) !== pathKey(expected.workflow) || pathKey(actual.workspace) !== pathKey(expected.workspace) || actual.scope !== expected.scope) {
-    throw new Error("runner identity changed (workflow, workspace.root or tracker scope); restore it, stop this runner, then restart with the new configuration");
+  if (pathKey(actual.workflow) !== pathKey(expected.workflow) || pathKey(actual.workspace) !== pathKey(expected.workspace) || actual.scope !== expected.scope ||
+    actual.inputs.length !== expected.inputs.length || actual.inputs.some((path, i) => locationKey(path) !== locationKey(expected.inputs[i]!))) {
+    throw new Error("runner identity changed (workflow inputs, review.prompt_file, workspace.root or tracker scope); restore it, stop this runner, then restart with the new configuration");
   }
 }
 
@@ -111,14 +131,15 @@ function workspaceResources(record: RunnerRecord): string[] {
 }
 
 function resources(record: RunnerRecord): string[] {
-  return [record.workflow, ...workspaceResources(record), record.directory, join(record.directory, "orchestrator.log")];
+  return [...record.inputs, ...workspaceResources(record), record.directory, join(record.directory, "orchestrator.log")];
 }
 
 function recordValid(value: unknown): value is RunnerRecord {
   if (!value || typeof value !== "object") return false;
   const r = value as Partial<RunnerRecord>;
-  return typeof r.id === "string" && validateId(r.id) === r.id &&
+  return typeof r.id === "string" && validateId(r.id) === r.id && typeof r.workflow === "string" &&
     [r.workflow, r.workspace, r.directory].every((p) => typeof p === "string" && isAbsolute(p)) &&
+    Array.isArray(r.inputs) && r.inputs.includes(r.workflow) && r.inputs.every((p) => typeof p === "string" && isAbsolute(p)) &&
     typeof r.project === "string" && typeof r.scope === "string" &&
     (r.run === null || Boolean(r.run && Number.isSafeInteger(r.run.pid) && r.run.pid > 0 &&
       typeof r.run.nonce === "string" && typeof r.run.socket === "string"));
@@ -143,12 +164,13 @@ export class RunnerRegistry {
       throw new Error(`cannot read runner registry ${this.path}: ${(error as Error).message}`);
     }
     if (!Array.isArray(data) || !data.every(recordValid) || new Set(data.map((r) => r.id)).size !== data.length) {
-      throw new Error(`invalid runner registry ${this.path}; restore it before starting runners`);
+      throw new Error(`invalid runner registry ${this.path} (complete workflow input paths are required); restore it with all runners stopped before starting runners`);
     }
     return data;
   }
 
   async claim(record: RunnerRecord): Promise<void> {
+    if (!recordValid(record)) throw new Error("invalid runner record; complete workflow input paths are required");
     await this.transaction((records) => {
       const own = records.find((r) => r.id === record.id);
       if (own && pathKey(own.workflow) !== pathKey(record.workflow)) {
@@ -162,9 +184,9 @@ export class RunnerRegistry {
       const workspacePaths = workspaceResources(record);
       const [ledger, temporary] = ledgerWritePaths(join(record.workspace, ".symphony-ledger.json"));
       const logPaths = [record.directory, join(record.directory, "orchestrator.log")];
-      if (workspacePaths.some((p) => [...logPaths, record.workflow].some((other) => pathsOverlap(p, other))) ||
-        logPaths.some((p) => pathsOverlap(record.workflow, p))) {
-        throw new Error("workspace.root, workflow file and runner log directory must not overlap");
+      if (workspacePaths.some((p) => logPaths.some((other) => pathsOverlap(p, other))) ||
+        record.inputs.some((p) => [...workspacePaths, ...logPaths].some((other) => pathsOverlap(p, other)))) {
+        throw new Error("workspace.root, workflow inputs (including review.prompt_file) and runner log directory must not overlap");
       }
       if (pathsOverlap(ledger, temporary)) throw new Error("ledger and temporary file must not overlap");
       for (const other of records) {
@@ -181,7 +203,7 @@ export class RunnerRegistry {
         }
         for (const path of requested) {
           const collision = resources(other).find((p) => pathsOverlap(path, p));
-          if (collision) throw new Error(`state path collision with runner "${other.id}": ${path} overlaps ${collision}; choose separate, non-nested workspace/log paths`);
+          if (collision) throw new Error(`state path collision with runner "${other.id}": ${path} overlaps ${collision}; choose separate, non-nested input/workspace/log paths`);
         }
       }
       if (lstatSync(temporary, { throwIfNoEntry: false })) {

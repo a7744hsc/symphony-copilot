@@ -81,3 +81,15 @@ workspace:
 ${prompt}
 `;
 }
+
+export function reviewWorkflowText(workspace: string, number: number, promptFile: string, endpoint?: string): string {
+  return workflowText(workspace, number, endpoint)
+    .replace("handoff_state: Human Review", "handoff_state: AI Review")
+    .replace("active_states: [Todo, In Progress]", "active_states: [Todo, In Progress, AI Review, Rework]")
+    .replace("polling:", `review:
+  states: [AI Review]
+  prompt_file: ${JSON.stringify(promptFile)}
+  pass_state: Human Review
+  fail_state: Rework
+polling:`);
+}

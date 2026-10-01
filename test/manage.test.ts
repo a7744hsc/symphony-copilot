@@ -9,7 +9,7 @@ import { test, type TestContext } from "node:test";
 import { canonicalPath, processAlive, RunnerRegistry, workflowId } from "../src/instances.ts";
 import { RunLedger } from "../src/ledger.ts";
 import { requestRunner } from "../src/runner-control.ts";
-import { makeIssue, workflowText } from "./helpers.ts";
+import { makeIssue, reviewWorkflowText, workflowText } from "./helpers.ts";
 
 const wrapper = join(import.meta.dirname, "..", "bin", "symphony");
 const cli = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -83,10 +83,12 @@ async function fixture(t: TestContext) {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(home, { recursive: true, force: true });
   });
-  const workflow = (number: number, options: { workspace?: string; name?: string; seed?: boolean } = {}) => {
+  const workflow = (number: number, options: { workspace?: string; name?: string; seed?: boolean; reviewPrompt?: string } = {}) => {
     const workspace = options.workspace ?? join(home, "work", `app-${number}`);
     const path = join(home, options.name ?? `workflow-${number}.md`);
-    writeFileSync(path, workflowText(workspace, number, endpoint));
+    writeFileSync(path, options.reviewPrompt
+      ? reviewWorkflowText(workspace, number, options.reviewPrompt, endpoint)
+      : workflowText(workspace, number, endpoint));
     if (options.seed !== false) {
       const ledger = new RunLedger(join(workspace, ".symphony-ledger.json"));
       ledger.authorize(makeIssue({
@@ -169,6 +171,56 @@ test("state path collision is rejected even for different projects, including di
 });
 
 for (const [kind, link] of [["symlink", symlinkSync], ["hard link", linkSync]] as const) {
+  test(`real runners reject log ${kind} aliases to reviewer prompts before polling or writes`, { timeout: 40_000 }, async (t) => {
+    const { command, workflow, registry, env, home, calls } = await fixture(t);
+    const prompt = join(home, "REVIEW.md");
+    writeFileSync(prompt, "alpha review instructions");
+    const a = workflow(1, { reviewPrompt: prompt }), b = workflow(2);
+    assert.equal((await command(["start", a.path, "--id", "alpha"])).code, 0);
+    const alpha = registry.list()[0]!;
+    const originalLedger = readFileSync(b.ledger, "utf8");
+    const betaDirectory = join(home, "state", "runners", "beta");
+    mkdirSync(betaDirectory, { recursive: true });
+    const betaLog = join(betaDirectory, "orchestrator.log");
+    link(prompt, betaLog);
+    const rejected = await capture(spawn(process.execPath, [cli, b.path, "--id", "beta", "--once"], {
+      env, stdio: ["ignore", "pipe", "pipe"],
+    }));
+    assert.equal(rejected.code, 1, rejected.stderr);
+    assert.match(rejected.stderr, /state path collision.*alpha/);
+    assert.equal(readFileSync(prompt, "utf8"), "alpha review instructions");
+    assert.equal(readFileSync(b.ledger, "utf8"), originalLedger);
+    assert.equal(registry.list().length, 1);
+    assert.equal(calls.some((c) => c.number === 2), false);
+    assert.equal(await requestRunner(alpha, "status"), "running");
+    const polls = calls.filter((c) => c.number === 1).length;
+    await until(() => calls.filter((c) => c.number === 1).length > polls);
+    rmSync(betaLog);
+    assert.equal((await command(["start", b.path, "--id", "beta"])).code, 0);
+    assert.equal((await command(["stop", "beta"])).code, 0);
+    assert.equal(await requestRunner(alpha, "status"), "running");
+  });
+
+  test(`a real runner rejects its own log ${kind} to its reviewer prompt`, { timeout: 30_000 }, async (t) => {
+    const { workflow, registry, env, home, calls } = await fixture(t);
+    const prompt = join(home, "REVIEW.md");
+    writeFileSync(prompt, "review instructions");
+    const a = workflow(1, { reviewPrompt: prompt });
+    const directory = join(home, "state", "runners", "alpha");
+    mkdirSync(directory, { recursive: true });
+    link(prompt, join(directory, "orchestrator.log"));
+    const ledger = readFileSync(a.ledger, "utf8");
+    const result = await capture(spawn(process.execPath, [cli, a.path, "--id", "alpha", "--once"], {
+      env, stdio: ["ignore", "pipe", "pipe"],
+    }));
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /must not overlap/);
+    assert.equal(readFileSync(prompt, "utf8"), "review instructions");
+    assert.equal(readFileSync(a.ledger, "utf8"), ledger);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(registry.list(), []);
+  });
+
   test(`a real runner rejects a ledger temporary ${kind} to a live runner's log before startup`, { timeout: 40_000 }, async (t) => {
     const { command, workflow, registry, env, home, calls } = await fixture(t);
     const a = workflow(1), b = workflow(2);
