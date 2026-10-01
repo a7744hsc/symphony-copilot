@@ -57,3 +57,39 @@ export function makeWorkflow(config: ServiceConfig, promptTemplate = "Work on {{
 export async function flush(rounds = 20): Promise<void> {
   for (let i = 0; i < rounds; i++) await new Promise((resolve) => setImmediate(resolve));
 }
+
+export function workflowText(workspace: string, number: number, endpoint = "https://api.github.com/graphql", prompt = `prompt-${number}`): string {
+  return `---
+tracker:
+  kind: github_project
+  provider:
+    owner: me
+    project_number: ${number}
+    repo: me/app-${number}
+    endpoint: ${endpoint}
+    start_state: Todo
+    working_state: In Progress
+    blocked_state: Blocked
+    handoff_state: Human Review
+  active_states: [Todo, In Progress]
+  terminal_states: [Done]
+polling:
+  interval_ms: 1000
+workspace:
+  root: ${JSON.stringify(workspace)}
+---
+${prompt}
+`;
+}
+
+export function reviewWorkflowText(workspace: string, number: number, promptFile: string, endpoint?: string): string {
+  return workflowText(workspace, number, endpoint)
+    .replace("handoff_state: Human Review", "handoff_state: AI Review")
+    .replace("active_states: [Todo, In Progress]", "active_states: [Todo, In Progress, AI Review, Rework]")
+    .replace("polling:", `review:
+  states: [AI Review]
+  prompt_file: ${JSON.stringify(promptFile)}
+  pass_state: Human Review
+  fail_state: Rework
+polling:`);
+}

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { Role, ServiceConfig } from "./config.ts";
@@ -50,6 +50,11 @@ export interface RunCycle {
 }
 type LegacyCycle = Pick<RunCycle, "identifier" | "startedAt" | "sessions" | "aiCredits" | "reviewRounds" | "halted" | "returnedFor">;
 export class LedgerError extends Error {}
+
+export function ledgerWritePaths(path: string): [string, string] {
+  return [path, `${path}.tmp`];
+}
+
 const text = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 const nullableText = (v: unknown) => v === null || text(v);
 const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
@@ -259,8 +264,18 @@ export class RunLedger {
       validateData(data);
       if (!this.path || this.readOnly) return;
       mkdirSync(dirname(this.path), { recursive: true });
-      const temp = `${this.path}.tmp`;
-      writeFileSync(temp, `${JSON.stringify(data, null, 2)}\n`); renameSync(temp, this.path);
+      const [path, temp] = ledgerWritePaths(this.path);
+      const fd = openSync(temp, "wx", 0o600);
+      let renamed = false;
+      try {
+        try { writeFileSync(fd, `${JSON.stringify(data, null, 2)}\n`); }
+        finally { closeSync(fd); }
+        renameSync(temp, path);
+        renamed = true;
+      } finally {
+        // An unsuccessful exclusive open never reaches this cleanup.
+        if (!renamed) unlinkSync(temp);
+      }
     } catch (error) {
       this.failure = new LedgerError(`run ledger save failed; instance unusable, stop scheduling: ${(error as Error).message}`);
       throw this.failure;
