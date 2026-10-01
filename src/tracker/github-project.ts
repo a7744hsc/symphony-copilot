@@ -3,14 +3,21 @@ import { basename, extname, isAbsolute, resolve } from "node:path";
 import { defineTool, type Tool, type ToolResultObject } from "@github/copilot-sdk";
 import { resolveEnvRef } from "../config.ts";
 import { ExecError, run } from "../exec.ts";
+import { IMPLEMENTATION_HEAD_CHECK_LIMIT, IMPLEMENTATION_HEAD_RETRY_MS, validateReviewResult, type IssueMessageRef, type PendingHandoff } from "../iteration.ts";
 import { truncate, type Logger } from "../log.ts";
 import { isInside } from "../policy.ts";
 import { normalizeState, type BlockerRef, type Issue } from "../types.ts";
 import { graphqlRequest, restRequest, type FetchLike, type GitHubApi } from "./github-api.ts";
-import { TrackerError, type AgentToolContext, type MergeConflict, type ReviewToolContext, type TrackerAdapter } from "./types.ts";
+import { CONTEXT_SECTIONS, readIssueContext } from "./issue-context.ts";
+import { TrackerError, type AgentControl, type AgentToolContext, type MergeConflict, type TrackerAdapter } from "./types.ts";
 
 interface ReviewArgs {
   verdict: string;
+  reviewed_head?: string | null;
+  progress: string;
+  progress_reason: string;
+  next_action?: string | null;
+  next_step?: string | null;
   summary: string;
   blocking_issues?: string[];
   attachments?: string[];
@@ -29,9 +36,11 @@ export interface GitHubProjectSettings {
   priorityField: string;
   identifierPrefix: string;
   branchPrefix: string;
+  startState: string;
+  workingState: string;
   agentStates: string[];
   handoffState: string | null;
-  blockedState: string | null;
+  blockedState: string;
   /** Branch that holds screenshots attached to submissions; never merged. */
   evidenceBranch: string;
   /** Where agents file out-of-scope problems; null means agents cannot create issues. */
@@ -113,8 +122,6 @@ export function parseSettings(provider: Record<string, unknown>, env: NodeJS.Pro
   }
   const handoff = provider.handoff_state;
   if (handoff !== undefined && handoff !== null && typeof handoff !== "string") throw new TrackerError("invalid_tracker_config", "tracker.provider.handoff_state must be a string");
-  const blocked = provider.blocked_state;
-  if (blocked !== undefined && blocked !== null && typeof blocked !== "string") throw new TrackerError("invalid_tracker_config", "tracker.provider.blocked_state must be a string");
   return {
     endpoint: str("endpoint", "https://api.github.com/graphql"),
     token,
@@ -128,9 +135,11 @@ export function parseSettings(provider: Record<string, unknown>, env: NodeJS.Pro
     priorityField: str("priority_field", "Priority"),
     identifierPrefix: str("identifier_prefix", "GH-"),
     branchPrefix: str("branch_prefix", "agent/"),
+    startState: str("start_state"),
+    workingState: str("working_state"),
     agentStates: agentStates as string[],
     handoffState: typeof handoff === "string" && handoff.trim() !== "" ? handoff.trim() : null,
-    blockedState: typeof blocked === "string" && blocked.trim() !== "" ? blocked.trim() : null,
+    blockedState: str("blocked_state"),
     evidenceBranch: str("evidence_branch", "symphony-evidence"),
     followups: parseFollowups(provider.followups),
   };
@@ -211,6 +220,7 @@ export function normalizeItem(item: RawItem, s: GitHubProjectSettings): Normaliz
   if (typeof content.id !== "string" || !Number.isInteger(content.number) || typeof content.title !== "string" || content.title.trim() === "") {
     return { kind: "malformed", reason: `item ${item.id} lacks issue id, number or title` };
   }
+  if (content.state !== "OPEN" && content.state !== "CLOSED") return { kind: "malformed", reason: `item ${item.id} lacks a valid native issue state` };
   const number = content.number as number;
   const labels = [...new Set((content.labels?.nodes ?? [])
     .map((node) => (typeof node?.name === "string" ? node.name.trim().toLowerCase() : ""))
@@ -236,6 +246,7 @@ export function normalizeItem(item: RawItem, s: GitHubProjectSettings): Normaliz
       description: typeof content.body === "string" && content.body.trim() !== "" ? content.body : null,
       priority: parsePriority(item.priority),
       state,
+      contentState: content.state,
       branchName: `${s.branchPrefix}${number}`,
       url: typeof content.url === "string" ? content.url : null,
       assigneeId: content.assignees?.nodes?.find((n) => typeof n?.login === "string")?.login ?? null,
@@ -287,18 +298,52 @@ function toolFailure(message: string): ToolResultObject {
   return { resultType: "failure", textResultForLlm: message, error: message };
 }
 
+const resultMarker = (p: PendingHandoff) => `<!-- symphony-result:${p.id} -->`;
+const invocationMarker = (id: string) => `<!-- symphony-invocation:${id} -->`;
+const usageBlock = (id: string, footer = "") => `<!-- symphony-usage:${id}:start -->\n${footer ? `${footer}\n` : ""}<!-- symphony-usage:${id}:end -->`;
+const statusBlock = (p: PendingHandoff, text: string) => `<!-- symphony-handoff:${p.id}:start -->\n${text}\n<!-- symphony-handoff:${p.id}:end -->`;
+function resultBody(p: PendingHandoff): string {
+  const r = p.result;
+  const details = r.kind === "review" ? [
+    `**AI review · ${r.verdict}**`, `Reviewed HEAD: ${r.reviewedHead ?? "unavailable (no quality verdict)"}`,
+    r.summary, `**Progress: ${r.progress}**\n\n${r.progressReason}`,
+    r.nextAction ? `**Next action: ${r.nextAction}**\n\n${r.nextStep}` : "",
+    r.blockingIssues.length ? `**Blocking issues**\n\n${r.blockingIssues.map((b, i) => `${i + 1}. ${b}`).join("\n")}` : "",
+  ] : r.kind === "implement" ? [`**Implementation handoff: ${r.title}**`, `HEAD: ${r.head}`, r.summary] : ["**Blocked**", r.summary];
+  return [...details, p.haltReason ? `**Stop reason: ${p.haltReason}**${p.haltReason === "session_limit_unreviewed" ? " — latest implementation has not been reviewed." : ""}` : "",
+    resultMarker(p), invocationMarker(p.invocationId)].filter(Boolean).join("\n\n");
+}
+
+interface OpenPullRequest { id: string; number: number; url: string; headRefOid: string; body: string }
+
+function replaceMarkedBlock(body: string, start: string, end: string, replacement: string): string | null {
+  if (body.split(start).length !== 2 || body.split(end).length !== 2) return null;
+  const from = body.indexOf(start), to = body.indexOf(end);
+  if (to < from) return null;
+  return body.slice(0, from) + replacement + body.slice(to + end.length);
+}
+
+/** Canonical identity and the host-owned status block are critical; the usage footer is not. */
+function isIssueResult(body: string, p: PendingHandoff): boolean {
+  return body.split(resultMarker(p)).length === 2 && body.split(invocationMarker(p.invocationId)).length === 2 &&
+    replaceMarkedBlock(body, `<!-- symphony-handoff:${p.id}:start -->`, `<!-- symphony-handoff:${p.id}:end -->`, "") !== null;
+}
+
 export class GitHubProjectTracker implements TrackerAdapter {
   readonly kind = "github_project";
   readonly settings: GitHubProjectSettings;
   private readonly log: Logger;
   private readonly fetchImpl: FetchLike;
+  private readonly publicationEligible: (issue: Issue) => boolean;
   private meta: Promise<ProjectMeta> | null = null;
   private repoMeta: Promise<{ id: string; defaultBranch: string }> | null = null;
 
-  constructor(provider: Record<string, unknown>, env: NodeJS.ProcessEnv, log: Logger, fetchImpl: FetchLike = fetch) {
+  constructor(provider: Record<string, unknown>, env: NodeJS.ProcessEnv, log: Logger, fetchImpl: FetchLike = fetch,
+    publicationEligible: (issue: Issue) => boolean = (issue) => issue.dispatchable) {
     this.settings = parseSettings(provider, env);
     this.log = log;
     this.fetchImpl = fetchImpl;
+    this.publicationEligible = publicationEligible;
   }
 
   secretEnvironmentNames(): string[] {
@@ -388,9 +433,19 @@ export class GitHubProjectTracker implements TrackerAdapter {
   }
 
   agentTools(context: AgentToolContext): Tool<any>[] {
+    let lastComment: { summary: string; body: string; message: IssueMessageRef; blocking: boolean } | null = null;
+    let mutating = false;
     const wrap = <T>(name: string, fn: (args: T) => Promise<unknown>) => async (args: T) => {
       context.log.info("tracker tool called", { tool: name });
+      const mutation = name !== "tracker_get_issue";
+      let locked = false;
       try {
+        context.control?.assertActive(); // Accepted handoffs remain readable until the invocation is drained.
+        if (mutation) {
+          if (context.control?.accepted()) throw new Error("a result has already been accepted; no further mutations are allowed");
+          if (mutating) throw new Error("another mutating tracker tool is still running");
+          mutating = locked = true;
+        }
         const result = await fn(args);
         if (result && typeof result === "object" && "failure" in result) {
           context.log.warn("tracker tool failed", { tool: name, error: (result as ToolFailure).failure });
@@ -400,22 +455,45 @@ export class GitHubProjectTracker implements TrackerAdapter {
       } catch (error) {
         context.log.warn("tracker tool failed", { tool: name, error: (error as Error).message });
         return toolFailure(`${name} failed: ${(error as Error).message}`);
+      } finally {
+        if (locked) mutating = false;
       }
     };
     const tools: Tool<any>[] = [
       defineTool("tracker_get_issue", {
-        description: "Read the current issue: live board status, body, labels, recent comments, and the open pull request for this issue's branch with its mergeability, reviews and review threads. Use it at the start of a retry or rework.",
-        parameters: { type: "object", properties: {}, additionalProperties: false },
+        description: "Read the current issue and its open PR, including full text and unabridged blocking_feedback from reviews. No arguments returns the overview and small pages of recent feedback. Follow pagination.next (including each thread's pagination) by passing those exact arguments to this tool; history_complete=false means more history exists. Text is never clipped; read any runtime-saved output file in sections before claiming a check is complete. Use at the start of work, rework and review.",
+        parameters: {
+          type: "object",
+          properties: {
+            section: { type: "string", enum: [...CONTEXT_SECTIONS], description: "Default overview; use the section returned in pagination.next to read more history" },
+            cursor: { type: "string", description: "Opaque cursor from pagination.next; comments/reviews go backwards to older pages, threads go forwards" },
+            thread_id: { type: "string", description: "Required only for thread_comments; must belong to this issue's open PR" },
+          },
+          additionalProperties: false,
+        },
         skipPermission: true,
-        handler: wrap("tracker_get_issue", () => this.issueContext(context.issue)),
+        handler: wrap("tracker_get_issue", (args: unknown) => this.issueContext(context.issue, args)),
       }),
       defineTool("tracker_comment", {
-        description: "Post a Markdown comment on the current issue (progress notes, assumptions, blockers).",
-        parameters: { type: "object", properties: { body: { type: "string", description: "Markdown comment body" } }, required: ["body"], additionalProperties: false },
+        description: "Post a Markdown comment on the current issue (plans, progress, assumptions or blockers). Before setting Blocked, post the complete blocking reason with blocking=true; ordinary plans/progress do not satisfy that handoff.",
+        parameters: {
+          type: "object",
+          properties: {
+            body: { type: "string", description: "Markdown comment body" },
+            blocking: { type: "boolean", description: "Default false. True only for a complete blocking reason: attempted steps/results, missing condition and concrete human action needed; not for a plan or routine progress." },
+          },
+          required: ["body"], additionalProperties: false,
+        },
         skipPermission: true,
-        handler: wrap("tracker_comment", async ({ body }: { body: string }) => {
+        handler: wrap("tracker_comment", async ({ body, blocking }: { body: string; blocking?: boolean }) => {
           if (typeof body !== "string" || body.trim() === "") return { failure: "body must be a non-empty string" };
-          return { comment_url: await this.addComment(this.issueNodeId(context.issue), body) };
+          if (blocking !== undefined && typeof blocking !== "boolean") return { failure: "blocking must be a boolean" };
+          const postedBody = context.control ? `${body}\n\n${invocationMarker(context.control.id)}\n${usageBlock(context.control.id)}` : body;
+          context.control?.assertActive();
+          const message = await this.addComment(this.issueNodeId(context.issue), postedBody);
+          lastComment = { summary: body, body: postedBody, message, blocking: blocking === true };
+          context.control?.onIssueMessage(message);
+          return { comment_id: message.id, comment_url: message.url };
         }),
       }),
     ];
@@ -440,20 +518,25 @@ export class GitHubProjectTracker implements TrackerAdapter {
     const review = context.review;
     if (review) {
       tools.push(defineTool("tracker_submit_review", {
-        description: `Finish your review (round ${review.round} of ${review.maxRounds}). Posts the review on the pull request and the issue, then moves the card to "${review.passState}" if you approve or "${review.failState}" if you request changes${review.round >= review.maxRounds ? ` (this is the last round: requesting changes hands the card to a human in "${review.passState}" instead)` : ""}. You cannot change code or push.`,
+        description: `Finish a complete risk-focused review (review ${review.round}). Saves the full record on the issue before mirroring it to the PR. The host decides continuation or Blocked from progress, human requirements and remaining sessions; this is not a fixed review-round cap. Use unable_to_verify when required access or evidence is unavailable. Do not change implementation or commit/push; remove disposable verification tests first. Do not approve unread material.`,
         parameters: {
           type: "object",
           properties: {
-            verdict: { type: "string", enum: ["approve", "request_changes"] },
-            summary: { type: "string", description: "Markdown: what you checked (acceptance criteria one by one, commands you ran and their results) and non-blocking suggestions" },
+            verdict: { type: "string", enum: ["approve", "request_changes", "unable_to_verify"] },
+            reviewed_head: { type: ["string", "null"], description: "Exact checked commit SHA; nullable only for unable_to_verify" },
+            progress: { type: "string", enum: ["initial", "made_progress", "no_progress", "not_assessed"] },
+            progress_reason: { type: "string", description: "Evidence for progress or the missing verification conditions" },
+            next_action: { type: ["string", "null"], enum: ["continue", "human_required", null] },
+            next_step: { type: ["string", "null"], description: "Changed approach or concrete human action needed; null for approval" },
+            summary: { type: "string", description: "Markdown: criteria and inferred invariants checked, independent counterexamples, commands/results, earlier blockers verified, unverified areas and non-blocking suggestions" },
             blocking_issues: { type: "array", items: { type: "string" }, description: "Required when requesting changes: each problem that must be fixed before a human reviews, with file and line where possible" },
             attachments: { type: "array", items: { type: "string" }, description: `Optional: images in your workspace (at most ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each) that show a visible problem or confirm a visible change. One per scenario; leave out when nothing visible is involved.` },
           },
-          required: ["verdict", "summary"],
+          required: ["verdict", "reviewed_head", "progress", "progress_reason", "summary"],
           additionalProperties: false,
         },
         skipPermission: true,
-        handler: wrap("tracker_submit_review", (args: ReviewArgs) => this.submitReview(context, review, args)),
+        handler: wrap("tracker_submit_review", (args: ReviewArgs) => this.submitReview(context, args)),
       }));
       return tools;
     }
@@ -480,13 +563,28 @@ export class GitHubProjectTracker implements TrackerAdapter {
     );
     if (this.settings.agentStates.length > 0) {
       tools.push(defineTool("tracker_set_status", {
-        description: `Move the current issue's card to another status. Allowed: ${this.settings.agentStates.join(", ")}. Comment with the reason before setting a blocked status.`,
+        description: `Move the current issue's card to another status. Allowed: ${this.settings.agentStates.join(", ")}. Before a blocked status, the latest tracker_comment in this invocation must contain the complete blocking reason and use blocking=true, not a plan/progress note.`,
         parameters: { type: "object", properties: { status: { type: "string", enum: this.settings.agentStates } }, required: ["status"], additionalProperties: false },
         skipPermission: true,
         handler: wrap("tracker_set_status", async ({ status }: { status: string }) => {
           const allowed = this.settings.agentStates.find((s) => normalizeState(s) === normalizeState(String(status)));
           if (!allowed) return { failure: `status must be one of: ${this.settings.agentStates.join(", ")}` };
-          await this.setStatus(context.issue, allowed);
+          if (normalizeState(allowed) === normalizeState(this.settings.blockedState)) {
+            if (!lastComment?.blocking) return { failure: "post the complete blocking reason with tracker_comment and blocking=true in this invocation first; a plan/progress comment is not a blocker" };
+            const control = this.handoffControl(context);
+            const p = await control.accept({ kind: "blocked", summary: lastComment.summary }, context.workspacePath);
+            // Upgrade the exact prior comment, never whichever comment happens to be last remotely.
+            const previous = await this.issueMessage(context.issue, lastComment.message);
+            if (previous?.body === lastComment.body && await this.handoffIssue(context.issue, p)) {
+              control.assertActive();
+              await this.editIssueMessage(lastComment.message.id, this.issueResultBody(p));
+              p.issueMessage = lastComment.message;
+              control.checkpoint();
+            }
+            return this.publishAccepted(context, control, p);
+          }
+          context.control?.assertActive();
+          await this.setStatus(context.issue, allowed, () => context.control?.assertActive());
           return { status: allowed };
         }),
       }));
@@ -524,6 +622,7 @@ export class GitHubProjectTracker implements TrackerAdapter {
     const source = context.issue.nativeRef?.issue_number;
     const role = context.review ? "reviewer" : "implementer";
     const body = `${args.body.trim()}\n\n---\n_Filed by symphony-copilot's ${role} while working on #${source}._`;
+    context.control?.assertActive();
     const created: any = await this.graphql(
       `mutation($repo: ID!, $title: String!, $body: String!, $labels: [ID!]) { createIssue(input: { repositoryId: $repo, title: $title, body: $body, labelIds: $labels }) { issue { id number url } } }`,
       { repo: repo.id, title, body, labels: labelIds },
@@ -532,15 +631,17 @@ export class GitHubProjectTracker implements TrackerAdapter {
     if (!issue?.id) throw new TrackerError("tracker_response", "createIssue returned no issue");
     filed.count++;
     const meta = await this.projectMeta();
+    context.control?.assertActive();
     const added: any = await this.graphql(
       `mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } } }`,
       { project: meta.projectId, content: issue.id },
     );
     const itemId = added?.addProjectV2ItemById?.item?.id;
     const warnings: string[] = [];
-    if (itemId && f.state) await this.setOption(itemId, meta.statusFieldId, meta.statusOptions, f.state).catch((e: Error) => warnings.push(e.message));
+    context.control?.assertActive();
+    if (itemId && f.state) await this.setOption(itemId, meta.statusFieldId, meta.statusOptions, f.state, () => context.control?.assertActive()).catch((e: Error) => warnings.push(e.message));
     if (itemId && f.priority) {
-      if (meta.priorityFieldId) await this.setOption(itemId, meta.priorityFieldId, meta.priorityOptions, f.priority).catch((e: Error) => warnings.push(e.message));
+      if (meta.priorityFieldId) await this.setOption(itemId, meta.priorityFieldId, meta.priorityOptions, f.priority, () => context.control?.assertActive()).catch((e: Error) => warnings.push(e.message));
       else warnings.push(`priority field "${this.settings.priorityField}" is not a single-select field`);
     }
     for (const warning of warnings) context.log.warn("follow-up board update failed", { issue: issue.url, error: warning });
@@ -548,55 +649,58 @@ export class GitHubProjectTracker implements TrackerAdapter {
     return { issue_url: issue.url, number: issue.number, ...(warnings.length > 0 ? { warnings } : {}) };
   }
 
-  private async submitReview(context: AgentToolContext, review: ReviewToolContext, args: ReviewArgs): Promise<unknown> {
-    const { issue } = context;
-    if (args.verdict !== "approve" && args.verdict !== "request_changes") return { failure: 'verdict must be "approve" or "request_changes"' };
-    if (typeof args.summary !== "string" || args.summary.trim() === "") return { failure: "summary must be a non-empty string" };
-    const blocking = args.blocking_issues ?? [];
-    if (!Array.isArray(blocking) || !blocking.every((b) => typeof b === "string" && b.trim() !== "")) return { failure: "blocking_issues must be a list of non-empty strings" };
-    if (args.verdict === "request_changes" && blocking.length === 0) return { failure: "list the blocking issues when requesting changes" };
-    if (args.verdict === "approve" && blocking.length > 0) return { failure: "an approval cannot have blocking issues; request changes, or move them to the summary as suggestions" };
+  private handoffControl(context: AgentToolContext): AgentControl {
+    if (!context.control) throw new Error("mutating handoff requires an invocation control");
+    context.control.assertActive();
+    if (context.control.accepted()) throw new Error("a result has already been accepted");
+    return context.control;
+  }
+
+  private async publishAccepted(context: AgentToolContext, control: AgentControl, p: PendingHandoff): Promise<unknown> {
+    let outcome: { stale: boolean };
+    try {
+      outcome = await this.publishHandoff(context.issue, p, () => control.checkpoint(), () => control.assertActive());
+    } finally {
+      if (p.issueMessage) control.onIssueMessage(p.issueMessage);
+    }
+    control.finish(outcome.stale);
+    return { accepted: true, stale: outcome.stale, status: outcome.stale ? null : p.targetState, pull_request: p.pr?.url ?? null };
+  }
+
+  private async attachmentSummary(context: AgentToolContext, summary: string, files: Attachment[]): Promise<string> {
+    if (!files.length) return summary;
+    context.control?.assertActive();
+    try {
+      const images = (await this.uploadEvidence(context.issue, files, () => context.control?.assertActive())).map((u) => `![${u.name}](${u.url})`).join("\n");
+      return `${summary}\n\n${images}`;
+    } catch (error) {
+      context.log.warn("attachment upload failed", { error: (error as Error).message });
+      return `${summary}\n\n_Screenshots could not be attached: ${truncate((error as Error).message, 300)}_`;
+    }
+  }
+
+  private async submitReview(context: AgentToolContext, args: ReviewArgs): Promise<unknown> {
+    const control = this.handoffControl(context);
+    const result = validateReviewResult({ kind: "review", verdict: args.verdict, summary: args.summary,
+      reviewedHead: args.reviewed_head ?? null, progress: args.progress, progressReason: args.progress_reason,
+      nextAction: args.next_action ?? null, nextStep: args.next_step ?? null, blockingIssues: args.blocking_issues ?? [],
+    }, control.initialReview);
     const attachments = readAttachments(context.workspacePath, args.attachments);
     if ("failure" in attachments) return attachments;
-    const branch = issue.branchName ?? "";
-    const found: any = await this.graphql(
-      `query($owner: String!, $name: String!, $branch: String!) { repository(owner: $owner, name: $name) {
-        pullRequests(headRefName: $branch, states: [OPEN], first: 1) { nodes { id number url } } } }`,
-      { owner: this.settings.repoOwner, name: this.settings.repoName, branch },
-    );
-    const pr = found?.repository?.pullRequests?.nodes?.[0];
-    if (!pr) return { failure: `there is no open pull request for ${branch} to review` };
-
-    let images = "";
-    if (attachments.files.length > 0) {
-      try {
-        images = (await this.uploadEvidence(issue, attachments.files)).map((u) => `![${u.name}](${u.url})`).join("\n");
-      } catch (error) {
-        images = `_Screenshots could not be attached: ${truncate((error as Error).message, 300)}_`;
+    let pr: OpenPullRequest | null = null;
+    if (result.verdict !== "unable_to_verify") {
+      pr = await this.openPullRequest(context.issue);
+      if (!pr) return { failure: `there is no open pull request for ${context.issue.branchName} to review` };
+      if (pr.headRefOid !== result.reviewedHead) return { failure: "reviewed_head does not match the current PR head; read and verify the new head first" };
+      if (await this.git(context.workspacePath, ["rev-parse", "HEAD"]) !== result.reviewedHead) {
+        return { failure: "reviewed_head does not match the local checkout HEAD" };
       }
     }
-    const lastRound = review.round >= review.maxRounds;
-    const escalate = args.verdict === "request_changes" && lastRound;
-    const next = args.verdict === "approve" || escalate ? review.passState : review.failState;
-    const outcome = args.verdict === "approve" ? "approved"
-      : escalate ? `changes requested; that was the last round, so a human decides` : "changes requested";
-    const body = [
-      `**AI review · round ${review.round} of ${review.maxRounds} · ${outcome}**`,
-      args.summary,
-      blocking.length > 0 ? `**Blocking issues**\n\n${blocking.map((b, i) => `${i + 1}. ${b}`).join("\n")}` : "",
-      images,
-    ].filter(Boolean).join("\n\n");
-    // GitHub does not let the PR's author approve or request changes, so the verdict lives in the card state.
-    const posted: any = await this.graphql(
-      `mutation($pr: ID!, $body: String!) { addPullRequestReview(input: { pullRequestId: $pr, event: COMMENT, body: $body }) { pullRequestReview { url } } }`,
-      { pr: pr.id, body },
-    );
-    const reviewUrl = posted?.addPullRequestReview?.pullRequestReview?.url ?? pr.url;
-    await this.addComment(this.issueNodeId(issue), `${body}\n\n[Review on PR #${pr.number}](${reviewUrl})`);
-    await this.setStatus(issue, next);
-    review.onVerdict(args.verdict);
-    context.log.info("review submitted", { verdict: args.verdict, round: review.round, status: next, pull_request: pr.url });
-    return { verdict: args.verdict, status: next, pull_request: pr.url, round: review.round };
+    result.summary = await this.attachmentSummary(context, result.summary, attachments.files);
+    control.assertActive();
+    const p = await control.accept(result, context.workspacePath);
+    if (pr) { p.pr = { id: pr.id, number: pr.number, url: pr.url }; control.checkpoint(); }
+    return this.publishAccepted(context, control, p);
   }
 
   private issueNodeId(issue: Issue): string {
@@ -605,73 +709,44 @@ export class GitHubProjectTracker implements TrackerAdapter {
     return id;
   }
 
-  private async issueContext(issue: Issue): Promise<unknown> {
-    const query = `query($id: ID!, $owner: String!, $name: String!, $branch: String!) {
-      issue: node(id: $id) { ... on Issue { number title body state url
-        labels(first: 50) { nodes { name } }
-        comments(last: 30) { nodes { author { login } body createdAt } } } }
-      repository(owner: $owner, name: $name) {
-        pullRequests(headRefName: $branch, states: [OPEN], first: 1, orderBy: { field: CREATED_AT, direction: DESC }) { nodes {
-          number url title mergeable baseRefName
-          reviews(last: 20) { nodes { author { login } state body submittedAt } }
-          reviewThreads(first: 50) { nodes { isResolved path line comments(first: 20) { nodes { author { login } body } } } }
-          comments(last: 20) { nodes { author { login } body createdAt } }
-        } } } }`;
-    const data: any = await this.graphql(query, {
-      id: this.issueNodeId(issue), owner: this.settings.repoOwner, name: this.settings.repoName, branch: issue.branchName ?? "",
-    });
-    const [fresh] = await this.fetchIssuesByIds([issue.id]);
-    const text = (value: unknown, max: number) => (typeof value === "string" ? truncate(value, max) : null);
-    const pr = data?.repository?.pullRequests?.nodes?.[0] ?? null;
-    return {
-      identifier: issue.identifier,
-      status: fresh?.state ?? null,
-      title: data?.issue?.title ?? issue.title,
-      url: data?.issue?.url ?? issue.url,
-      body: text(data?.issue?.body, 8000),
-      labels: (data?.issue?.labels?.nodes ?? []).map((l: any) => l?.name).filter(Boolean),
-      comments: (data?.issue?.comments?.nodes ?? []).map((c: any) => ({ author: c?.author?.login ?? null, at: c?.createdAt, body: text(c?.body, 2000) })),
-      pull_request: pr && {
-        number: pr.number,
-        url: pr.url,
-        title: pr.title,
-        mergeable: pr.mergeable ?? null,
-        base_branch: pr.baseRefName ?? null,
-        reviews: (pr.reviews?.nodes ?? []).map((r: any) => ({ author: r?.author?.login ?? null, state: r?.state, body: text(r?.body, 2000) })),
-        review_threads: (pr.reviewThreads?.nodes ?? []).map((t: any) => ({
-          resolved: t?.isResolved, path: t?.path, line: t?.line,
-          comments: (t?.comments?.nodes ?? []).map((c: any) => ({ author: c?.author?.login ?? null, body: text(c?.body, 2000) })),
-        })),
-        comments: (pr.comments?.nodes ?? []).map((c: any) => ({ author: c?.author?.login ?? null, at: c?.createdAt, body: text(c?.body, 2000) })),
-      },
-    };
+  private async issueContext(issue: Issue, args: unknown): Promise<unknown> {
+    return readIssueContext({
+      issue, issueId: this.issueNodeId(issue), repoOwner: this.settings.repoOwner, repoName: this.settings.repoName,
+      graphql: (query, variables) => this.graphql(query, variables),
+      readStatus: async () => (await this.fetchIssuesByIds([issue.id]))[0]?.state ?? null,
+    }, args);
   }
 
-  private async addComment(subjectId: string, body: string): Promise<string | null> {
+  private async addComment(subjectId: string, body: string): Promise<IssueMessageRef> {
     const data: any = await this.graphql(
-      `mutation($id: ID!, $body: String!) { addComment(input: { subjectId: $id, body: $body }) { commentEdge { node { url } } } }`,
+      `mutation($id: ID!, $body: String!) { addComment(input: { subjectId: $id, body: $body }) { commentEdge { node { id url } } } }`,
       { id: subjectId, body },
     );
-    return data?.addComment?.commentEdge?.node?.url ?? null;
+    const node = data?.addComment?.commentEdge?.node;
+    if (!node?.id) throw new TrackerError("tracker_response", "addComment returned no comment id");
+    return { id: node.id, url: node.url ?? null };
   }
 
-  private async setStatus(issue: Issue, statusName: string): Promise<void> {
+  private async setStatus(issue: Issue, statusName: string, assertActive: () => void = () => {}): Promise<void> {
     const meta = await this.projectMeta();
-    await this.setOption(issue.id, meta.statusFieldId, meta.statusOptions, statusName);
+    await this.setOption(issue.id, meta.statusFieldId, meta.statusOptions, statusName, assertActive);
   }
 
-  private async setOption(itemId: string, fieldId: string, options: Array<{ id: string; name: string }>, optionName: string): Promise<void> {
+  private async setOption(itemId: string, fieldId: string, options: Array<{ id: string; name: string }>, optionName: string, assertActive: () => void = () => {}): Promise<void> {
     const meta = await this.projectMeta();
     const option = options.find((o) => normalizeState(o.name) === normalizeState(optionName));
     if (!option) throw new TrackerError("invalid_tracker_config", `"${optionName}" is not an option of that project field`);
-    await this.graphql(
+    assertActive();
+    const data: any = await this.graphql(
       `mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
         updateProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field, value: { singleSelectOptionId: $option } }) { projectV2Item { id } } }`,
       { project: meta.projectId, item: itemId, field: fieldId, option: option.id },
     );
+    if (data?.updateProjectV2ItemFieldValue?.projectV2Item?.id !== itemId) throw new TrackerError("tracker_response", "status mutation returned no matching project item");
   }
 
   private async submitForReview(context: AgentToolContext, args: { title: string; summary: string; attachments?: string[] }): Promise<unknown> {
+    const control = this.handoffControl(context);
     const { issue, workspacePath } = context;
     if (typeof args.title !== "string" || args.title.trim() === "") return { failure: "title must be a non-empty string" };
     if (typeof args.summary !== "string" || args.summary.trim() === "") return { failure: "summary must be a non-empty string" };
@@ -679,74 +754,340 @@ export class GitHubProjectTracker implements TrackerAdapter {
     if (!branch) return { failure: "issue has no branch name" };
     const attachments = readAttachments(workspacePath, args.attachments);
     if ("failure" in attachments) return attachments;
-    const git = (gitArgs: string[]) => run("git", gitArgs, { cwd: workspacePath, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).then((r) => r.stdout.trim());
+    const git = (gitArgs: string[]) => this.git(workspacePath, gitArgs);
 
     const dirty = await git(["status", "--porcelain"]);
     if (dirty) return { failure: `the workspace has uncommitted changes; commit them first:\n${truncate(dirty, 1500)}` };
     const repo = await this.repository();
+    control.assertActive();
     await git(["fetch", "--quiet", "origin", repo.defaultBranch]);
+    const head = await git(["rev-parse", "HEAD"]);
+    const existing = await this.openPullRequest(issue);
     const ahead = Number(await git(["rev-list", "--count", `origin/${repo.defaultBranch}..HEAD`]));
-    if (!ahead) return { failure: `HEAD has no commits beyond origin/${repo.defaultBranch}; nothing to review` };
+    if (!ahead && existing?.headRefOid !== head) return { failure: `HEAD has no commits beyond origin/${repo.defaultBranch}; nothing to review` };
     const conflicts = await conflictingFiles(workspacePath, `origin/${repo.defaultBranch}`, { ...process.env, GIT_TERMINAL_PROMPT: "0" });
     if (conflicts.length > 0) {
       return { failure: `HEAD conflicts with origin/${repo.defaultBranch} in: ${truncate(conflicts.join(", "), 1000)}. Run \`git merge origin/${repo.defaultBranch}\`, resolve the conflicts keeping the intent of both sides, rerun the checks, commit, and submit again.` };
     }
-    try {
-      await git(["push", "--quiet", "origin", `HEAD:refs/heads/${branch}`]);
-    } catch (error) {
-      const detail = error instanceof ExecError ? error.stderr : (error as Error).message;
-      return { failure: `git push to ${branch} failed (if the branch was rewritten, rebase onto the remote branch instead of force-pushing):\n${truncate(detail, 1500)}` };
+    const summary = await this.attachmentSummary(context, args.summary, attachments.files);
+    control.assertActive();
+    const p = await control.accept({ kind: "implement", head, title: args.title, summary }, workspacePath);
+    if (existing) { p.pr = { id: existing.id, number: existing.number, url: existing.url }; control.checkpoint(); }
+    return this.publishAccepted(context, control, p);
+  }
+
+  private git(cwd: string, args: string[]): Promise<string> {
+    return run("git", args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).then((r) => r.stdout.trim());
+  }
+
+  private async openPullRequest(issue: Issue): Promise<OpenPullRequest | null> {
+    const data: any = await this.graphql(
+      `query($owner: String!, $name: String!, $branch: String!) { repository(owner: $owner, name: $name) {
+        pullRequests(headRefName: $branch, states: [OPEN], first: 1, orderBy: { field: CREATED_AT, direction: DESC }) { nodes { id number url headRefOid body } } } }`,
+      { owner: this.settings.repoOwner, name: this.settings.repoName, branch: issue.branchName ?? "" },
+    );
+    if (!data?.repository?.pullRequests?.nodes) throw new TrackerError("tracker_response", "missing pull request lookup");
+    const pr = data.repository.pullRequests.nodes[0];
+    if (!pr) return null;
+    if (!pr.id || !pr.number || !pr.url || !pr.headRefOid) throw new TrackerError("tracker_response", "incomplete pull request identity/head");
+    return pr;
+  }
+
+  /** Resolve the current project item from native identity, including remove/re-add of the same issue. */
+  private async publicationIssue(issue: Issue): Promise<Issue | null> {
+    const { projectId } = await this.projectMeta();
+    let after: string | null = null;
+    const cursors = new Set<string>();
+    let current: Issue | null = null;
+    for (;;) {
+      const data: any = await this.graphql(
+        `query($id: ID!, $after: String, $statusField: String!, $priorityField: String!) {
+          node(id: $id) { ... on Issue { id state repository { nameWithOwner }
+            projectItems(first: 100, after: $after) { nodes { ${ITEM_FIELDS} } pageInfo { hasNextPage endCursor } }
+          } } }`,
+        { id: this.issueNodeId(issue), after, statusField: this.settings.statusField, priorityField: this.settings.priorityField },
+      );
+      const node = data?.node;
+      if (!node || node.state === "CLOSED") return null;
+      if (node.id !== this.issueNodeId(issue) || node.state !== "OPEN" ||
+        node.repository?.nameWithOwner?.toLowerCase() !== `${this.settings.repoOwner}/${this.settings.repoName}`.toLowerCase()) {
+        throw new TrackerError("tracker_response", "publication issue identity/state mismatch");
+      }
+      const connection = node.projectItems;
+      if (!Array.isArray(connection?.nodes) || typeof connection.pageInfo?.hasNextPage !== "boolean") throw new TrackerError("tracker_response", "missing issue project items/pagination");
+      for (const raw of connection.nodes) {
+        if (raw?.project?.id !== projectId) continue;
+        const normalized = normalizeItem(raw, this.settings);
+        if (normalized.kind !== "issue" || this.issueNodeId(normalized.issue) !== node.id) throw new TrackerError("tracker_response", "invalid publication item");
+        if (current) throw new TrackerError("tracker_response", "ambiguous publication item");
+        current = normalized.issue;
+      }
+      if (!connection.pageInfo.hasNextPage) return current;
+      after = connection.pageInfo.endCursor;
+      if (typeof after !== "string" || !after || cursors.has(after)) throw new TrackerError("tracker_pagination", "project item cursor did not advance");
+      cursors.add(after);
+    }
+  }
+
+  /** Search only the current result's marker, with full bodies and complete pagination. */
+  private async findResultMessage(subjectId: string, p: PendingHandoff, kind: "Issue" | "PullRequest", reviews = false): Promise<IssueMessageRef | null> {
+    const field = reviews ? "reviews" : "comments";
+    let after: string | null = null;
+    const cursors = new Set<string>();
+    for (;;) {
+      const data: any = await this.graphql(
+        `query($id: ID!, $after: String) { node(id: $id) { ... on ${kind} { id
+          ${field}(first: 100, after: $after) { nodes { id url body ${reviews ? "commit { oid }" : ""} } pageInfo { hasNextPage endCursor } }
+        } } }`, { id: subjectId, after },
+      );
+      const connection = data?.node?.[field];
+      if (data?.node?.id !== subjectId || !Array.isArray(connection?.nodes) || typeof connection.pageInfo?.hasNextPage !== "boolean") {
+        throw new TrackerError("tracker_response", `missing ${field} for result reconciliation`);
+      }
+      for (const node of connection.nodes) {
+        if (typeof node?.body !== "string" || !node.body.includes(resultMarker(p)) || !node.body.includes(invocationMarker(p.invocationId))) continue;
+        if (kind === "Issue" && !isIssueResult(node.body, p)) continue;
+        if (reviews && p.result.kind === "review" && node.commit?.oid !== p.result.reviewedHead) continue;
+        if (!node.id) throw new TrackerError("tracker_response", "result comment has no identity");
+        return { id: node.id, url: node.url ?? null };
+      }
+      if (!connection.pageInfo.hasNextPage) return null;
+      after = connection.pageInfo.endCursor;
+      if (typeof after !== "string" || !after || cursors.has(after)) throw new TrackerError("tracker_pagination", "result comment cursor did not advance");
+      cursors.add(after);
+    }
+  }
+
+  private issueResultBody(p: PendingHandoff): string {
+    return `${resultBody(p)}\n\n${statusBlock(p, p.stale ? "Stale result: source evidence only; no target state or progress applied." : `Publication pending; target: ${p.targetState}. This is not yet a completed handoff.`)}\n\n${usageBlock(p.invocationId)}`;
+  }
+
+  private async handoffIssue(issue: Issue, p: PendingHandoff): Promise<Issue | null> {
+    const current = await this.publicationIssue(issue);
+    if (!current) return null;
+    // Ineligibility suspends the accepted result, unlike closure or a superseding state.
+    // Keep the pending evidence/accounting intact; a failed read also never permits a write.
+    if (!current.dispatchable || !this.publicationEligible(current)) throw new Error("handoff publication suspended: issue is not routable");
+    const needsPr = p.haltReason !== "head_mismatch" && (p.result.kind === "implement" || (p.result.kind === "review" && p.result.verdict !== "unable_to_verify"));
+    const completed = p.issueMessage && (!needsPr || p.prPublished && (p.result.kind !== "implement" || p.pushed));
+    // Board automation may advance to the intended target before PR metadata catches up.
+    // Retain the pending SHA fence there rather than clear it and dispatch a reviewer early.
+    const reconcilingHead = p.result.kind === "implement" && p.pushed && p.issueMessage && p.headMismatch;
+    return normalizeState(current.state) === normalizeState(p.sourceState) ||
+      (completed || reconcilingHead) && normalizeState(current.state) === normalizeState(p.targetState) ? current : null;
+  }
+
+  private async ensureIssueResult(issue: Issue, p: PendingHandoff, checkpoint: () => void, assertActive: () => void): Promise<{ body: string } | null> {
+    if (p.issueMessage) {
+      const current = await this.issueMessage(issue, p.issueMessage);
+      assertActive();
+      if (current && isIssueResult(current.body, p)) return current;
+    }
+    // A saved reference is not evidence the comment still exists or remains invocation-owned.
+    // Preserve edited comments; reconcile a replacement only within the original native issue.
+    const found = await this.findResultMessage(this.issueNodeId(issue), p, "Issue");
+    if (!await this.handoffIssue(issue, p)) return null;
+    assertActive();
+    p.issueMessage = found ?? await this.addComment(this.issueNodeId(issue), this.issueResultBody(p));
+    checkpoint();
+    const current = await this.issueMessage(issue, p.issueMessage);
+    assertActive();
+    if (!current || !isIssueResult(current.body, p)) throw new TrackerError("tracker_response", "canonical issue result unavailable or changed during publication");
+    return current;
+  }
+
+  private async issueMessage(issue: Issue, message: IssueMessageRef): Promise<{ body: string } | null> {
+    const data: any = await graphqlRequest(this.api(),
+      `query($id: ID!) { node(id: $id) { ... on IssueComment { id body issue { id } } } }`,
+      { id: message.id }, { allowNotFound: true });
+    const node = data?.node;
+    if (!node || node.id !== message.id || node.issue?.id !== this.issueNodeId(issue) || typeof node.body !== "string") return null;
+    return { body: node.body };
+  }
+
+  private async editIssueMessage(id: string, body: string): Promise<void> {
+    const data: any = await this.graphql(
+      `mutation($id: ID!, $body: String!) { updateIssueComment(input: { id: $id, body: $body }) { issueComment { id } } }`, { id, body });
+    if (data?.updateIssueComment?.issueComment?.id !== id) throw new TrackerError("tracker_response", "updateIssueComment returned no matching comment");
+  }
+
+  private async finalizeIssueResult(issue: Issue, p: PendingHandoff, checkpoint: () => void, assertActive: () => void): Promise<boolean> {
+    const current = await this.ensureIssueResult(issue, p, checkpoint, assertActive);
+    if (!current) return false;
+    const start = `<!-- symphony-handoff:${p.id}:start -->`, end = `<!-- symphony-handoff:${p.id}:end -->`;
+    const text = p.haltReason === "head_mismatch" && p.result.kind === "implement" && p.headMismatch
+      ? `Handoff blocked: ${p.targetState}. Stop reason: head_mismatch after ${p.headMismatch.attempts} host checks; expected HEAD: ${p.result.head}; actual PR HEAD: ${p.headMismatch.actualHead}. Latest implementation has not been reviewed. Check the branch/PR, then return the card to "${this.settings.startState}" to reauthorize.`
+      : p.stale ? "Stale result: source evidence only; no target state or progress applied."
+      : `Handoff completed: ${p.targetState}.${p.pr ? ` [PR #${p.pr.number}](${p.pr.url})` : ""}`;
+    const body = replaceMarkedBlock(current.body, start, end, statusBlock(p, text));
+    if (body === null) throw new TrackerError("tracker_response", "canonical issue result has no unambiguous host status block");
+    if (body === current.body) return true;
+    if (!await this.handoffIssue(issue, p)) return false;
+    assertActive();
+    await this.editIssueMessage(p.issueMessage!.id, body);
+    return true;
+  }
+
+  /** Resume the one persisted semantic result. No model, policy decision, or current checkout substitution. */
+  async publishHandoff(issue: Issue, p: PendingHandoff, checkpoint: () => void, assertActive: () => void): Promise<{ stale: boolean }> {
+    assertActive();
+    if (p.headMismatch && p.haltReason !== "head_mismatch" && Date.now() < p.headMismatch.retryAt) {
+      throw new Error(`PR head check pending until ${new Date(p.headMismatch.retryAt).toISOString()}; host will retry without another agent`);
+    }
+    const needsPr = p.result.kind === "implement" || (p.result.kind === "review" && p.result.verdict !== "unable_to_verify");
+    const qualityReview = p.result.kind === "review" && p.result.verdict !== "unable_to_verify";
+    const stale = () => { p.stale = true; checkpoint(); return { stale: true }; };
+    const refresh = async (): Promise<Issue | null> => {
+      assertActive();
+      const current = await this.handoffIssue(issue, p);
+      assertActive();
+      return current;
+    };
+    let current = await refresh();
+    if (!current) return stale();
+    const staleHead = async () => {
+      p.stale = true; checkpoint();
+      await this.finalizeIssueResult(current!, p, checkpoint, assertActive);
+      return { stale: true };
+    };
+    const finishPublication = async () => {
+      current = await refresh();
+      if (!current) return stale();
+      if (!await this.ensureIssueResult(current, p, checkpoint, assertActive)) return stale();
+      current = await refresh();
+      if (!current) return stale();
+      assertActive();
+      if (normalizeState(current.state) !== normalizeState(p.targetState)) await this.setStatus(current, p.targetState, assertActive);
+      p.statusApplied = true; checkpoint();
+      if (!await this.finalizeIssueResult(current, p, checkpoint, assertActive)) return stale();
+      return { stale: false };
+    };
+    const mismatchedHead = async (actualHead: string): Promise<{ stale: boolean }> => {
+      if (p.result.kind !== "implement" || !p.pushed) return staleHead();
+      const attempts = (p.headMismatch?.attempts ?? 0) + 1;
+      p.headMismatch = { attempts, actualHead, retryAt: Date.now() + IMPLEMENTATION_HEAD_RETRY_MS };
+      if (attempts >= IMPLEMENTATION_HEAD_CHECK_LIMIT) {
+        // This is a publication failure, not another rework or a quality verdict.
+        p.sourceState = current!.state;
+        p.targetState = p.waitingState = this.settings.blockedState;
+        p.haltReason = "head_mismatch";
+      }
+      checkpoint();
+      const detail = `PR head mismatch: expected ${p.result.head}; actual ${actualHead}; host check ${attempts}/${IMPLEMENTATION_HEAD_CHECK_LIMIT}`;
+      this.log.warn("implementation handoff head mismatch", { issue_identifier: issue.identifier, expected_head: p.result.head, actual_head: actualHead, checks: attempts });
+      if (attempts < IMPLEMENTATION_HEAD_CHECK_LIMIT) throw new Error(`${detail}; publication pending, retry after ${new Date(p.headMismatch.retryAt).toISOString()}`);
+      return finishPublication();
+    };
+    const checkHead = async (): Promise<{ stale: boolean } | null> => {
+      if (!needsPr) return null;
+      const pr = await this.openPullRequest(current!);
+      assertActive();
+      const expected = p.result.kind === "review" ? p.result.reviewedHead : p.result.kind === "implement" ? p.result.head : null;
+      if (p.pr && pr?.id !== p.pr.id) return staleHead();
+      if ((qualityReview || p.pushed || p.prPublished) && pr && pr.headRefOid !== expected) return mismatchedHead(pr.headRefOid);
+      if ((qualityReview || p.prPublished) && !pr) return staleHead();
+      return null;
+    };
+    if (p.stale) return staleHead();
+    // Once Blocked is decided, retry only its publication; do not grant more SHA checks.
+    if (p.haltReason === "head_mismatch") return finishPublication();
+    const before = await checkHead();
+    if (before) return before;
+    if (!await this.ensureIssueResult(current, p, checkpoint, assertActive)) return stale();
+
+    if (p.result.kind === "implement" && !p.pushed) {
+      current = await refresh();
+      if (!current) return stale();
+      const git = (args: string[]) => this.git(p.workspacePath, args);
+      if (await git(["rev-parse", "HEAD"]) !== p.result.head || await git(["status", "--porcelain"])) {
+        throw new Error("accepted implementation no longer matches its clean workspace; refusing to push a different result");
+      }
+      // Git inspection can await long enough for a person to withdraw the dispatch label.
+      current = await refresh();
+      if (!current) return stale();
+      assertActive();
+      // The saved SHA, not a moving HEAD; never force-push.
+      await git(["push", "--quiet", "origin", `${p.result.head}:refs/heads/${current.branchName}`]);
+      p.pushed = true; checkpoint();
     }
 
-    const number = issue.nativeRef?.issue_number;
-    let images = "";
-    let imageNote = "";
-    if (attachments.files.length > 0) {
-      try {
-        const uploaded = await this.uploadEvidence(issue, attachments.files);
-        images = uploaded.map((u) => `![${u.name}](${u.url})`).join("\n");
-      } catch (error) {
-        imageNote = `_Screenshots could not be attached: ${truncate((error as Error).message, 300)}_`;
-        context.log.warn("attachment upload failed", { error: (error as Error).message });
+    if (needsPr && !p.prPublished) {
+      current = await refresh();
+      if (!current) return stale();
+      let pr = await this.openPullRequest(current);
+      assertActive();
+      if (p.pr && pr?.id !== p.pr.id) return staleHead();
+      const expected = p.result.kind === "review" ? p.result.reviewedHead : p.result.kind === "implement" ? p.result.head : null;
+      if (pr && pr.headRefOid !== expected) return mismatchedHead(pr.headRefOid);
+      if (qualityReview && !pr) return staleHead();
+      if (!pr && p.result.kind === "implement") {
+        const repo = await this.repository();
+        if (!await this.ensureIssueResult(current, p, checkpoint, assertActive)) return stale();
+        current = await refresh();
+        if (!current) return stale();
+        assertActive();
+        const data: any = await this.graphql(
+          `mutation($repo: ID!, $base: String!, $head: String!, $title: String!, $body: String!) {
+            createPullRequest(input: { repositoryId: $repo, baseRefName: $base, headRefName: $head, title: $title, body: $body }) { pullRequest { id number url headRefOid body } } }`,
+          { repo: repo.id, base: repo.defaultBranch, head: current.branchName, title: p.result.title,
+            body: `${resultBody(p)}\n\nCloses #${current.nativeRef?.issue_number}` },
+        );
+        pr = data?.createPullRequest?.pullRequest ?? null;
+        if (!pr?.id || !pr.number || !pr.url) throw new TrackerError("tracker_response", "createPullRequest returned no PR identity");
+        p.pr = { id: pr.id, number: pr.number, url: pr.url };
+        p.prPublished = true; checkpoint();
+      } else if (pr) {
+        p.pr = { id: pr.id, number: pr.number, url: pr.url }; checkpoint();
+        const inBody = p.result.kind === "implement" && pr.body?.includes(resultMarker(p)) && pr.body.includes(invocationMarker(p.invocationId));
+        const found = inBody || await this.findResultMessage(pr.id, p, "PullRequest", qualityReview);
+        assertActive();
+        if (!found) {
+          current = await refresh();
+          if (!current) return stale();
+          if (!await this.ensureIssueResult(current, p, checkpoint, assertActive)) return stale();
+          current = await refresh();
+          if (!current) return stale();
+          if (p.result.kind === "review") {
+            // COMMENT is intentional: GitHub does not allow self-approval. Bind the checked SHA explicitly.
+            const data: any = await this.graphql(
+              `mutation($pr: ID!, $head: GitObjectID!, $body: String!) { addPullRequestReview(input: { pullRequestId: $pr, commitOID: $head, event: COMMENT, body: $body }) { pullRequestReview { id url } } }`,
+              { pr: pr.id, head: p.result.reviewedHead, body: resultBody(p) },
+            );
+            if (!data?.addPullRequestReview?.pullRequestReview?.id) throw new TrackerError("tracker_response", "addPullRequestReview returned no review id");
+          } else await this.addComment(pr.id, resultBody(p));
+        }
+        p.prPublished = true; checkpoint();
       }
     }
-    const body = [args.summary, images, imageNote].filter(Boolean).join("\n\n");
-    const found: any = await this.graphql(
-      `query($owner: String!, $name: String!, $branch: String!) { repository(owner: $owner, name: $name) {
-        pullRequests(headRefName: $branch, states: [OPEN], first: 1) { nodes { id number url } } } }`,
-      { owner: this.settings.repoOwner, name: this.settings.repoName, branch },
-    );
-    let prUrl: string | null;
-    let prNumber: number | null;
-    const existing = found?.repository?.pullRequests?.nodes?.[0];
-    if (existing) {
-      await this.addComment(existing.id, `**Updated for review**\n\n${body}`);
-      prUrl = existing.url;
-      prNumber = existing.number ?? null;
-    } else {
-      const created: any = await this.graphql(
-        `mutation($repo: ID!, $base: String!, $head: String!, $title: String!, $body: String!) {
-          createPullRequest(input: { repositoryId: $repo, baseRefName: $base, headRefName: $head, title: $title, body: $body }) { pullRequest { number url } } }`,
-        { repo: repo.id, base: repo.defaultBranch, head: branch, title: args.title, body: `${body}\n\nCloses #${number}` },
-      );
-      prUrl = created?.createPullRequest?.pullRequest?.url ?? null;
-      prNumber = created?.createPullRequest?.pullRequest?.number ?? null;
-    }
-    const link = prUrl ? `[PR #${prNumber ?? "?"}](${prUrl})` : "the pull request";
-    await this.addComment(this.issueNodeId(issue), `**Submitted for review** (${existing ? "updated" : "new"} ${link})\n\n${body}`);
-    if (this.settings.handoffState) await this.setStatus(issue, this.settings.handoffState);
-    context.log.info("submitted for review", { pull_request: prUrl, branch, commits: ahead, attachments: attachments.files.length });
-    return { pull_request: prUrl, branch, commits_ahead_of_base: ahead, attachments: attachments.files.length, status: this.settings.handoffState ?? issue.state };
+
+    current = await refresh();
+    if (!current) return stale();
+    const after = await checkHead();
+    return after ?? finishPublication();
+  }
+
+  /** Cosmetic only. Read the typed, invocation-owned issue message; never guess the last comment. */
+  async updateUsageFooter(issue: Issue, message: IssueMessageRef, invocationId: string, footer: string): Promise<void> {
+    if (!invocationId || /[\r\n<>]/.test(invocationId) || !footer.trim() || /[\r\n<>]/.test(footer)) return;
+    const current = await this.issueMessage(issue, message);
+    if (!current || current.body.split(invocationMarker(invocationId)).length !== 2) return;
+    const start = `<!-- symphony-usage:${invocationId}:start -->`, end = `<!-- symphony-usage:${invocationId}:end -->`;
+    const body = replaceMarkedBlock(current.body, start, end, usageBlock(invocationId, footer));
+    if (body === null || body === current.body) return;
+    const eligible = await this.publicationIssue(issue);
+    if (!eligible?.dispatchable || !this.publicationEligible(eligible)) return;
+    await this.editIssueMessage(message.id, body);
   }
 
   /** Commits images to the evidence branch and returns links that render for people with repository access. */
-  async uploadEvidence(issue: Issue, files: Attachment[]): Promise<Array<{ name: string; url: string }>> {
+  async uploadEvidence(issue: Issue, files: Attachment[], assertActive: () => void = () => {}): Promise<Array<{ name: string; url: string }>> {
     const repoPath = `/repos/${this.settings.repoOwner}/${this.settings.repoName}`;
     const ref = `heads/${this.settings.evidenceBranch}`;
     const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
     const paths = files.map((f, i) => `${issue.identifier}/${stamp}-${i + 1}-${f.name}`);
     const blobs: string[] = [];
     for (const file of files) {
+      assertActive();
       const blob: any = await this.rest("POST", `${repoPath}/git/blobs`, { content: file.data.toString("base64"), encoding: "base64" });
       blobs.push(blob.sha);
     }
@@ -754,14 +1095,17 @@ export class GitHubProjectTracker implements TrackerAdapter {
       const head: any = await this.rest("GET", `${repoPath}/git/ref/${ref}`, undefined, true);
       const parent: string | null = head?.object?.sha ?? null;
       const baseTree: string | undefined = parent ? (await this.rest("GET", `${repoPath}/git/commits/${parent}`) as any).tree.sha : undefined;
+      assertActive();
       const tree: any = await this.rest("POST", `${repoPath}/git/trees`, {
         ...(baseTree ? { base_tree: baseTree } : {}),
         tree: paths.map((path, i) => ({ path, mode: "100644", type: "blob", sha: blobs[i] })),
       });
+      assertActive();
       const commit: any = await this.rest("POST", `${repoPath}/git/commits`, {
         message: `evidence: ${issue.identifier}`, tree: tree.sha, parents: parent ? [parent] : [],
       });
       try {
+        assertActive();
         if (parent) await this.rest("PATCH", `${repoPath}/git/refs/${ref}`, { sha: commit.sha, force: false });
         else await this.rest("POST", `${repoPath}/git/refs`, { ref: `refs/${ref}`, sha: commit.sha });
       } catch (error) {

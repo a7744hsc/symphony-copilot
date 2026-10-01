@@ -62,17 +62,18 @@ This copies two [agent skills](https://code.visualstudio.com/docs/copilot/custom
 
 The skills refer to templates in your symphony-copilot folder by absolute path, so run `install-skills` again after moving or updating it. The agents symphony-copilot runs on cards never load these skills.
 
+Unattended planning is built into the runner; no personal planning skill installation is needed. Interactive `brainstorming`, `grill-me` and `grilling` are disabled for card workers, not removed from your own editor. Symphony supplies its own autonomous planning/self-questioning instructions instead of their human interview/approval gates.
+
 ## 2. Write WORKFLOW.md, AGENTS.md and REVIEW.md
 
 Open the repository in VS Code (or start `copilot` in it) and run `/symphony-onboard`. You do not need to know or preselect board columns. The skill first inspects the repository, then asks which operating capabilities you want:
 
 1. Whether an independent AI reviewer should check each submission before it reaches you (human approval before merge is always retained).
 2. Whether to automatically detect merge conflicts on PRs waiting for a person and send them back to the implementer.
-3. Whether to show a Blocked lane for run limits and work that needs human input.
-4. Whether agents may file low-priority, unlabelled follow-up issues for unrelated problems.
-5. Whether to add the optional structured GitHub issue form for human-written agent tasks.
+3. Whether agents may file low-priority follow-up issues without the dispatch label for unrelated problems.
+4. Whether to add the optional structured GitHub issue form for human-written agent tasks.
 
-It asks these together once, recommends defaults, and explains cost/behavior tradeoffs. It also asks about implementer/reviewer model, concurrency, sessions and the per-card AI-credit budget (recommended starting cap: 1000 credits per run, shared by implementer and reviewer). It infers board owner, language, build/test commands and default branch where possible. From capability choices it derives and previews the columns; it does **not** expect you to invent a state machine. For example, independent AI review adds AI Review and Rework; turning it off removes AI Review and sends submissions directly to Human Review. Rework remains if conflict recovery is enabled. Human Review is always the final person-owned step. After your choices, the skill writes `WORKFLOW.md`, `AGENTS.md`, optional `REVIEW.md`, and the issue form only if selected, then runs `symphony check` until there are no errors.
+It asks once, recommends defaults, and explains cost/behavior tradeoffs. Onboarding defaults to concurrency 1, implementer/reviewer models `auto`, and 20 total successfully started sessions per issue authorization, shared by both roles—not 20 pairs. Fixed model IDs must be supplied by you or verified for your account; no guessed model list. Costs are recorded, not capped, so there is no credit-budget question. Blocked is mandatory, not an optional capability. The skill infers board owner, language, build/test commands and default branch where possible, then derives and previews columns rather than asking you to invent a state machine. AI review adds AI Review and Rework; without it submissions go directly to Human Review. Rework remains if conflict recovery is enabled. The skill writes the selected files and runs `symphony check` until there are no errors.
 
 | File | Purpose | Template |
 |---|---|---|
@@ -99,12 +100,21 @@ Each column has a role derived from the selected behavior. The names are localiz
 
 | Column | Listed in | Who works on it |
 |---|---|---|
-| Todo, In Progress | Always active | The implementer, on cards with the `agent` label |
+| Todo | Always active; required `start_state` | Human start/reauthorization entry, on cards with the dispatch label |
+| In Progress | Always active; required `working_state` | Scheduler-managed implementation |
 | Rework | Active when independent AI review or conflict recovery is on | The implementer addresses review requests and/or merge-conflict returns |
 | AI Review | Only when independent AI review is on | The independent reviewer |
 | Human Review | Always a waiting/handoff lane | You review and merge the PR; conflicts are monitored here if selected |
-| Blocked | Only when the visible blocked-lane capability is on | You unblock it; the agent or run limits can move cards here. With this lane off, the agent comments and stops without changing status |
-| Done, Canceled | Terminal | Nobody; the workspace is deleted |
+| Blocked | Always required `blocked_state`; never active or conflict-monitored | Waiting for human action after a blocker, startup failure, no progress or session exhaustion |
+| Done, Canceled | Terminal | Human merges the PR or closes the issue; workspace cleanup follows |
+
+**Working agreement, not a permission lock:** people start new cards in Todo and return existing cards only from waiting columns (Human Review/Blocked) to Todo. This renews the allowance and clears the no-progress streak while preserving work and issue history. Do not manually move cards into or out of In Progress, Rework or AI Review; those belong to the scheduler. Other board automation must not return existing cards to Todo. Automatic conflict return to Rework and process restarts never reset the allowance or restart paused/exhausted work.
+
+Planning is part of In Progress/Rework, not a new column or approval step. The implementer investigates the repository, chooses an approach, self-grills material assumptions and publishes a concise Implementation plan on the issue before product edits, then implements in the same session. Existing plans are reused and materially revised on rework. People do not answer a planning interview; automated replies are not human approval, and missing consequential decisions or authority still go to Blocked. Independent AI review, when enabled, challenges the plan as well as the code rather than treating self-grill as approval. These are behavioral instructions, not a filesystem write gate; see the [method and limits](reference.md#implementation-and-review-method).
+
+A session counts when SDK creation succeeds; preparation/startup failures beforehand pause without a charge or endless retry. Reviews can continue while making progress: the first reviewed no-progress rework needs a changed approach, two consecutive ones pause, and human-required results pause immediately. Initial findings and infrastructure failures do not add strikes. Missing review evidence uses `unable_to_verify`, not a silent comment-and-stop. There is no separate review-round, credit or absolute elapsed-time cap; operational startup/inactivity timeouts still apply.
+
+For older workflows, add the three explicit lifecycle mappings and remove retired credit/review caps and template variables; see [migration guidance](../README.md#run-limits). Run the offline checker before starting again.
 
 ## 3. Create the board
 
@@ -135,7 +145,7 @@ The `symphony` wrapper gets its token from `gh auth token`. Before running the d
 
 ## 4. Write the first card and run
 
-Run `/symphony-write-card` and describe the task. The skill drafts an issue with a goal, acceptance criteria, how to verify it, and what is out of scope, then creates it and adds it to the board. It only adds the `agent` label and moves the card to an active column if you want the agent to start now. Pick something small the first time.
+Run `/symphony-write-card` and describe the task. The skill drafts an issue with a goal, acceptance criteria, how to verify it, and what is out of scope, asks for confirmation, then creates it and adds it to the board. It only adds the dispatch label and moves the card to `tracker.provider.start_state` if you want to start now, never by guessing the first active column or option IDs. Pick something small the first time.
 
 See what the orchestrator would do, then start it:
 
@@ -145,4 +155,6 @@ symphony start WORKFLOW.md                                       # in the backgr
 symphony logs
 ```
 
-After every session the orchestrator comments on the issue with what the session did and used. When the agent submits, the card moves to AI Review, then to Human Review for you. Merge the pull request, or move the card to Rework with your comments.
+Implementation, review and blocking handoffs retain full records on the issue, including relevant human PR feedback and constraints, not just PR links. Usage is a best-effort footer on that result: `用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx`, using this session's credits and actual model(s). Detailed metrics stay in logs; missing metrics or a failed update may leave no footer. There is no separate usage-only comment or durable footer retry queue.
+
+After submission, independent review (if enabled) precedes Human Review. Merge the PR or close the issue to finish; to request more work, leave feedback and move the waiting card to Todo, not Rework.

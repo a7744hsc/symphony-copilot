@@ -16,7 +16,7 @@
         "provider": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["owner", "repo"],
+          "required": ["owner", "repo", "start_state", "working_state", "blocked_state"],
           "description": "Settings of the github_project adapter.",
           "properties": {
             "owner": { "type": "string", "description": "User or organization that owns the project board." },
@@ -29,9 +29,11 @@
             "priority_field": { "type": "string", "default": "Priority", "description": "Single-select field with options like P1, P2 (the number is the priority; lower runs first), or a number field." },
             "identifier_prefix": { "type": "string", "default": "GH-", "description": "Prefix of issue identifiers in logs, prompts and workspace names." },
             "branch_prefix": { "type": "string", "default": "agent/", "description": "Agent branches are <branch_prefix><issue number>." },
-            "agent_states": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Columns the agent may move its card to with tracker_set_status, typically the in-progress column and blocked_state. Without it that tool is not offered." },
-            "handoff_state": { "type": "string", "description": "Column tracker_submit_for_review moves the card to. With review, one of review.states; otherwise a waiting column such as Human Review. Never an implementer column, or the agent starts again right away." },
-            "blocked_state": { "type": "string", "description": "Column the orchestrator moves a card to when its run reaches a run limit. Not an active column and not in merge_conflicts.states. Without it, a halted card stays where it is." },
+            "start_state": { "type": "string", "minLength": 1, "examples": ["Todo", "待开始"], "description": "Required human start/reauthorization entry. Must be in tracker.active_states, distinct from working_state and review.states. Existing cards return here only by human authorization from a waiting column; no automatic transition may target it." },
+            "working_state": { "type": "string", "minLength": 1, "examples": ["In Progress", "进行中"], "description": "Required scheduler-managed implementer column, in tracker.active_states and distinct from start_state and review.states. The scheduler moves authorized cards here before starting an agent." },
+            "agent_states": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Columns the agent may move its existing card to with tracker_set_status, typically working_state and blocked_state. Must not contain start_state. Without it that tool is not offered." },
+            "handoff_state": { "type": "string", "description": "Column tracker_submit_for_review moves the card to. With review, one of review.states; otherwise a human waiting column such as Human Review. Never start_state, an implementer, blocked or terminal column." },
+            "blocked_state": { "type": "string", "minLength": 1, "description": "Required waiting column for startup failures, human blockers, no progress or exhausted sessions. Not active, terminal, or in merge_conflicts.states. A person resolves the blocker and moves the card to start_state to reauthorize." },
             "evidence_branch": { "type": "string", "default": "symphony-evidence", "description": "Branch that stores screenshots attached to submissions. Never merged; keep it, or the images stop loading." },
             "followups": {
               "type": "object",
@@ -39,7 +41,7 @@
               "description": "Lets agents file out-of-scope problems as new issues with tracker_create_followup.",
               "properties": {
                 "labels": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Labels of the new issues. Never a label from tracker.required_labels: a person decides when a follow-up is worked on." },
-                "state": { "type": "string", "description": "Column of the new card." },
+                "state": { "type": "string", "description": "Column of the new card; start_state is allowed for a new follow-up without dispatch labels. Follow-ups in active columns require nonempty tracker.required_labels so they cannot dispatch automatically." },
                 "priority": { "type": "string", "description": "Priority option of the new card, for example P4." },
                 "max_per_session": { "type": "integer", "minimum": 1, "default": 3 }
               }
@@ -47,7 +49,7 @@
           }
         },
         "required_labels": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Only issues with all these labels are dispatched (case-insensitive). Usually [agent]." },
-        "active_states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Columns agents work on, in board order. Includes review.states and merge_conflicts.return_state." },
+        "active_states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Routable columns in board order. Includes provider.start_state, provider.working_state, review.states and merge_conflicts.return_state; never overlaps terminal_states. Only start_state grants a new authorization; running columns are scheduler-managed." },
         "terminal_states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Finished columns. The workspace of a card here is deleted." }
       }
     },
@@ -83,8 +85,8 @@
       "properties": {
         "max_concurrent_agents": { "type": "integer", "minimum": 1, "default": 10 },
         "max_turns": { "type": "integer", "minimum": 1, "default": 20, "description": "Turns per Copilot session." },
-        "max_sessions": { "type": "integer", "minimum": 1, "default": 5, "description": "Copilot sessions per card per run. A run ends when the card leaves the active columns." },
-        "usage_comments": { "type": "boolean", "default": true, "description": "Comment the usage of every session on the issue." },
+        "max_sessions": { "type": "integer", "minimum": 1, "default": 20, "description": "Total successfully created implementer and reviewer agent sessions per issue authorization. Startup failures before session creation do not count. Only a new start_state authorization resets this allowance; automatic handoffs, retries and restarts do not. An open authorization keeps its original limit." },
+        "usage_comments": { "type": "boolean", "default": true, "description": "Best-effort usage footer on each session's issue result. Never a separate usage comment; failures only log and do not block handoff. Disabling the footer does not disable usage accounting or necessary failure messages." },
         "max_retry_backoff_ms": { "type": "integer", "minimum": 1000, "default": 300000 },
         "max_concurrent_agents_by_state": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1 }, "description": "Column name to the most agents working that column at once." },
         "continuation_prompt": { "type": "string", "description": "Liquid template sent at the start of every later turn. Variables: issue, turn, max_turns." }
@@ -97,8 +99,6 @@
         "cli_path": { "type": "string", "description": "Copilot CLI binary to run instead of the runtime bundled with the SDK." },
         "model": { "type": "string", "description": "Model for the implementer, for example auto or a model id. Omit for the runtime default." },
         "reasoning_effort": { "enum": ["low", "medium", "high", "xhigh", "max"] },
-        "max_ai_credits": { "type": "integer", "minimum": 1, "description": "Per-session cap enforced by the runtime, which tells the model; prefer max_ai_credits_per_issue." },
-        "max_ai_credits_per_issue": { "type": "integer", "minimum": 1, "description": "AI credits per card per run, enforced by the orchestrator without telling the model." },
         "startup_timeout_ms": { "type": "integer", "minimum": 1, "default": 60000 },
         "turn_timeout_ms": { "type": "integer", "minimum": 1, "default": 3600000, "description": "Longest silence between session events within a turn." },
         "stall_timeout_ms": { "type": "integer", "default": 300000, "description": "The orchestrator restarts an agent silent this long; <= 0 disables it." },
@@ -116,12 +116,11 @@
       "description": "An independent reviewer agent that checks every submission in its own session and workspace before a person sees it.",
       "properties": {
         "states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Columns worked by the reviewer; also listed in tracker.active_states. Make one of them tracker.provider.handoff_state." },
-        "prompt_file": { "type": "string", "description": "Reviewer prompt, a Liquid template relative to WORKFLOW.md. Variables: issue, attempt, review_round, max_review_rounds, implementer_workspace." },
+        "prompt_file": { "type": "string", "description": "Reviewer prompt, a Liquid template relative to WORKFLOW.md. Variables: issue, attempt, review_round (sequence only, not a cap), implementer_workspace." },
         "model": { "type": "string", "description": "Ideally a different model family from the implementer." },
         "reasoning_effort": { "enum": ["low", "medium", "high", "xhigh", "max"] },
-        "pass_state": { "type": "string", "description": "Column for approved work, a waiting column such as Human Review; not an active column." },
-        "fail_state": { "type": "string", "description": "Column for requested changes, an active column worked by the implementer such as Rework." },
-        "max_rounds": { "type": "integer", "minimum": 1, "default": 3, "description": "After the last round, a failing card goes to pass_state for a person to decide." },
+        "pass_state": { "type": "string", "description": "Column for approved work, a human waiting column such as Human Review; not active, blocked or terminal." },
+        "fail_state": { "type": "string", "description": "Column for requested changes, a scheduler-managed active implementer column such as Rework; never start_state. Automatic rework keeps the existing authorization." },
         "continuation_prompt": { "type": "string", "description": "Liquid template for later reviewer turns. Variables: issue, turn, max_turns." }
       }
     },
@@ -131,8 +130,8 @@
       "required": ["states", "return_state"],
       "description": "Sends a waiting card back to the implementer, ahead of other work, when its pull request stops merging.",
       "properties": {
-        "states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Waiting columns whose open pull requests are checked on every poll; not active, not terminal." },
-        "return_state": { "type": "string", "description": "Active implementer column the card is moved to, such as Rework." }
+        "states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Waiting columns whose open pull requests are checked on every poll; not active, terminal or blocked_state. Only normally handed-off cards with remaining authorization can return automatically." },
+        "return_state": { "type": "string", "description": "Scheduler-managed active implementer column such as Rework; never start_state. Conflict return preserves the existing authorization and session count." }
       }
     }
   }

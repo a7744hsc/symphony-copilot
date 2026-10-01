@@ -1,6 +1,20 @@
 import type { Tool } from "@github/copilot-sdk";
 import type { Logger } from "../log.ts";
 import type { Issue } from "../types.ts";
+import type { AgentResult, IssueMessageRef, PendingHandoff } from "../iteration.ts";
+
+/** Invocation-scoped authority; the host owns durable control, never the model. */
+export interface AgentControl {
+  id: string;
+  initialReview: boolean;
+  onSessionCreated(sessionId: string): Promise<number>;
+  assertActive(): void;
+  accepted(): boolean;
+  accept(result: AgentResult, workspacePath: string): Promise<PendingHandoff>;
+  checkpoint(): void;
+  finish(stale?: boolean): void;
+  onIssueMessage(message: IssueMessageRef): void;
+}
 
 export type TrackerErrorCategory =
   | "unsupported_tracker_kind"
@@ -24,16 +38,15 @@ export interface AgentToolContext {
   issue: Issue;
   workspacePath: string;
   log: Logger;
+  control?: AgentControl;
   /** Present when the agent is the reviewer; it then gets review tools instead of submit/status tools. */
   review?: ReviewToolContext;
 }
 
 export interface ReviewToolContext {
   round: number;
-  maxRounds: number;
   passState: string;
   failState: string;
-  onVerdict(verdict: "approve" | "request_changes"): void;
 }
 
 export interface MergeConflict {
@@ -57,4 +70,8 @@ export interface TrackerAdapter {
   /** Issues whose open pull request the host reports as conflicting with its base branch; undecided ones are left out. */
   findMergeConflicts?(issues: Issue[]): Promise<MergeConflict[]>;
   moveIssue?(issue: Issue, state: string): Promise<void>;
+  /** Resume one persisted semantic handoff without invoking another model. */
+  publishHandoff?(issue: Issue, pending: PendingHandoff, checkpoint: () => void, assertActive: () => void): Promise<{ stale: boolean }>;
+  /** Cosmetic, best effort only; must not post another comment on failure. */
+  updateUsageFooter?(issue: Issue, message: IssueMessageRef, invocationId: string, footer: string): Promise<void>;
 }

@@ -13,9 +13,9 @@ export interface HooksConfig {
 export interface AgentConfig {
   maxConcurrentAgents: number;
   maxTurns: number;
-  /** Copilot sessions allowed per issue per run (until the issue leaves the active states). */
+  /** Successfully created implementer and reviewer sessions per issue authorization. */
   maxSessions: number;
-  /** Post a usage summary on the issue after every session. */
+  /** Best-effort usage footer on the session's issue result; never a separate usage comment. */
   usageComments: boolean;
   maxRetryBackoffMs: number;
   /** Keys are normalized state names. */
@@ -28,9 +28,6 @@ export interface CopilotConfig {
   cliPath: string | null;
   model: string | null;
   reasoningEffort: string | null;
-  maxAiCredits: number | null;
-  /** Enforced by the orchestrator across sessions; the model is never told about it. */
-  maxAiCreditsPerIssue: number | null;
   startupTimeoutMs: number;
   turnTimeoutMs: number;
   stallTimeoutMs: number;
@@ -50,6 +47,11 @@ export interface ServiceConfig {
     requiredLabels: string[];
     activeStates: string[];
     terminalStates: string[];
+    /** Trimmed provider mappings, preserving column spelling; compare with normalizeState. */
+    startState: string;
+    workingState: string;
+    blockedState: string;
+    handoffState: string | null;
   };
   polling: { intervalMs: number };
   workspace: { root: string };
@@ -76,7 +78,6 @@ export interface ReviewConfig {
   reasoningEffort: string | null;
   passState: string;
   failState: string;
-  maxRounds: number;
   continuationPrompt: string;
 }
 
@@ -89,6 +90,13 @@ export class ConfigError extends Error {
     this.problems = problems;
   }
 }
+
+/** Shared migration diagnostics for startup, reload and the offline key checker. */
+export const REMOVED_CONFIG_KEYS: Readonly<Record<string, string>> = {
+  "copilot.max_ai_credits": "copilot.max_ai_credits was removed: remove this key; costs are recorded only. Use agent.max_sessions (default 20) for the shared session limit, not a credit limit.",
+  "copilot.max_ai_credits_per_issue": "copilot.max_ai_credits_per_issue was removed: remove this key; costs are recorded only. Use agent.max_sessions (default 20) for the shared session limit, not a credit limit.",
+  "review.max_rounds": "review.max_rounds was removed: remove this key and use agent.max_sessions (default 20), shared by implementer and reviewer sessions; review_round remains a sequence number only.",
+};
 
 /** Always allowed; `copilot.shell_allow` adds the project's own build and test commands. */
 export const DEFAULT_SHELL_ALLOW = [
@@ -105,12 +113,12 @@ export const DEFAULT_SHELL_DENY = [
 
 const DEFAULT_CONTINUATION = [
   "Continue working on {{ issue.identifier }} (turn {{ turn }} of {{ max_turns }}). The card is still in \"{{ issue.state }}\".",
-  "Check the current state of the workspace first, then finish the remaining work without repeating completed steps.",
-  "When you are done, submit for review as the workflow describes. If you hit a blocker you cannot resolve, comment with the reason and move the card to the blocked state.",
+  "Check the current state of the workspace first, then finish the remaining work without repeating completed steps. Recover any unread feedback, test counterexamples to the goal's invariants, and fix the failure class rather than only the reported example.",
+  "When done, submit a complete handoff for the issue: changes, verification evidence, prior blockers addressed, relevant human PR feedback, constraints and remaining risks. Keep solving in-scope failures. If a required external dependency, authorization, human decision or confirmed inability prevents progress, call tracker_comment with blocking=true and the reason, attempted steps/results and concrete human action needed, then tracker_set_status to the configured blocked state and stop.",
 ].join("\n");
 
 const DEFAULT_USER_INPUT_REPLY =
-  "This is an unattended run and nobody can answer questions. Make a reasonable decision yourself and write down your assumptions in an issue comment. If you really cannot continue, comment with the reason and move the card to the blocked state.";
+  "This is an automated unattended reply, not human approval; nobody can answer questions here. Follow the autonomous planning protocol using issue and repository evidence. Make reasonable in-scope decisions and record material assumptions on the issue; keep solving failures within current permissions. Do not invent requirements or broaden authorization. If a required external dependency, authorization, human decision or confirmed inability prevents progress, record what you tried, what is missing and the concrete human action needed. As implementer, call tracker_comment with blocking=true and that complete reason, then tracker_set_status to the configured blocked state. As reviewer, call tracker_submit_review with verdict=unable_to_verify, progress=not_assessed and next_action=human_required; supply summary, progress_reason and next_step, and reviewed_head (null only if unavailable). Do not merely comment and remain active.";
 
 const ENV_REF = /^\$([A-Za-z_][A-Za-z0-9_]*)$/;
 
@@ -143,10 +151,6 @@ function integer(value: unknown, fallback: number, name: string, problems: strin
   if (typeof n === "number" && Number.isInteger(n) && n >= min) return n;
   problems.push(`${name} must be an integer >= ${min}`);
   return fallback;
-}
-
-function optionalInteger(value: unknown, name: string, problems: string[], min: number): number | null {
-  return value === undefined || value === null ? null : integer(value, 0, name, problems, min);
 }
 
 function bool(value: unknown, fallback: boolean, name: string, problems: string[]): boolean {
@@ -182,10 +186,27 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
   const review = raw.review === undefined || raw.review === null ? null : section(raw, "review", problems);
   const conflicts = raw.merge_conflicts === undefined || raw.merge_conflicts === null ? null : section(raw, "merge_conflicts", problems);
 
+  for (const [path, message] of Object.entries(REMOVED_CONFIG_KEYS)) {
+    const [name, key] = path.split(".");
+    const source = name === "copilot" ? copilot : review;
+    // Presence, even null/undefined, is an error. Do not read retired keys through the schema drift Proxy.
+    if (source && Object.hasOwn(source, key!)) problems.push(message);
+  }
+
   const kind = text(tracker.kind, "tracker.kind", problems);
   if (!kind) problems.push("tracker.kind is required");
-  const provider = tracker.provider ?? {};
-  if (typeof provider !== "object" || Array.isArray(provider)) problems.push("tracker.provider must be a map");
+  const rawProvider = tracker.provider ?? {};
+  const provider = typeof rawProvider === "object" && !Array.isArray(rawProvider) ? rawProvider as Record<string, unknown> : {};
+  if (provider !== rawProvider) problems.push("tracker.provider must be a map");
+  const requiredState = (key: string): string => {
+    const value = text(provider[key], `tracker.provider.${key}`, problems)?.trim();
+    if (!value) problems.push(`tracker.provider.${key} is required; explicitly map the lifecycle column`);
+    return value ?? "";
+  };
+  const startState = requiredState("start_state");
+  const workingState = requiredState("working_state");
+  const blockedState = requiredState("blocked_state");
+  const handoffState = text(provider.handoff_state, "tracker.provider.handoff_state", problems)?.trim() || null;
   const activeStates = stringList(tracker.active_states, [], "tracker.active_states", problems);
   const terminalStates = stringList(tracker.terminal_states, [], "tracker.terminal_states", problems);
   if (activeStates.length === 0) problems.push("tracker.active_states is required");
@@ -212,10 +233,14 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
     workflowDir,
     tracker: {
       kind: kind ?? "",
-      provider: typeof provider === "object" && provider !== null && !Array.isArray(provider) ? provider as Record<string, unknown> : {},
+      provider,
       requiredLabels: stringList(tracker.required_labels, [], "tracker.required_labels", problems).map((l) => l.trim().toLowerCase()),
       activeStates,
       terminalStates,
+      startState,
+      workingState,
+      blockedState,
+      handoffState,
     },
     polling: { intervalMs: integer(polling.interval_ms, 30_000, "polling.interval_ms", problems, 1_000) },
     workspace: { root },
@@ -229,7 +254,7 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
     agent: {
       maxConcurrentAgents: integer(agent.max_concurrent_agents, 10, "agent.max_concurrent_agents", problems, 1),
       maxTurns: integer(agent.max_turns, 20, "agent.max_turns", problems, 1),
-      maxSessions: integer(agent.max_sessions, 5, "agent.max_sessions", problems, 1),
+      maxSessions: integer(agent.max_sessions, 20, "agent.max_sessions", problems, 1),
       usageComments: bool(agent.usage_comments, true, "agent.usage_comments", problems),
       maxRetryBackoffMs: integer(agent.max_retry_backoff_ms, 300_000, "agent.max_retry_backoff_ms", problems, 1_000),
       maxConcurrentAgentsByState: byState,
@@ -239,8 +264,6 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
       cliPath: cliPathValue ? expandPath(cliPathValue, workflowDir, env) : null,
       model: text(copilot.model, "copilot.model", problems),
       reasoningEffort: text(copilot.reasoning_effort, "copilot.reasoning_effort", problems),
-      maxAiCredits: optionalInteger(copilot.max_ai_credits, "copilot.max_ai_credits", problems, 1),
-      maxAiCreditsPerIssue: optionalInteger(copilot.max_ai_credits_per_issue, "copilot.max_ai_credits_per_issue", problems, 1),
       startupTimeoutMs: integer(copilot.startup_timeout_ms, 60_000, "copilot.startup_timeout_ms", problems, 1),
       turnTimeoutMs: integer(copilot.turn_timeout_ms, 3_600_000, "copilot.turn_timeout_ms", problems, 1),
       stallTimeoutMs: integer(copilot.stall_timeout_ms, 300_000, "copilot.stall_timeout_ms", problems, -Infinity),
@@ -253,8 +276,71 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
     review: reviewConfig,
     mergeConflicts: conflicts ? buildMergeConflicts(conflicts, activeStates, terminalStates, reviewConfig, problems) : null,
   };
+  validateLifecycle(config, problems);
   if (problems.length > 0) throw new ConfigError(problems);
   return config;
+}
+
+/** Safety rules belong in runtime config loading too, not just `symphony check`. */
+function validateLifecycle(config: ServiceConfig, problems: string[]): void {
+  const { provider, activeStates, terminalStates, startState, workingState, blockedState, handoffState, requiredLabels } = config.tracker;
+  const same = (a: string, b: string) => normalizeState(a) === normalizeState(b);
+  const has = (states: string[], state: string) => states.some((s) => same(s, state));
+  const reviewStates = config.review?.states ?? [];
+  const implementer = (state: string) => has(activeStates, state) && !has(terminalStates, state) && !has(reviewStates, state);
+  for (const state of activeStates) {
+    if (has(terminalStates, state)) problems.push(`tracker.active_states "${state}" must not also be in tracker.terminal_states`);
+  }
+  if (startState && workingState && same(startState, workingState)) {
+    problems.push("tracker.provider.start_state and tracker.provider.working_state must be different columns");
+  }
+  for (const [key, state] of [["start_state", startState], ["working_state", workingState]]) {
+    if (state && !implementer(state)) problems.push(`tracker.provider.${key} "${state}" must be an active state worked by the implementer, not a review or terminal state`);
+  }
+  const noStartTarget = (key: string, state: string | null) => {
+    if (state && startState && same(state, startState)) {
+      problems.push(`${key} "${state}" must not target tracker.provider.start_state: only people authorize existing cards there`);
+    }
+  };
+  for (const state of stringList(provider.agent_states, [], "tracker.provider.agent_states", problems)) {
+    noStartTarget("tracker.provider.agent_states", state);
+  }
+  noStartTarget("tracker.provider.handoff_state", handoffState);
+  if (blockedState) {
+    if (has(activeStates, blockedState)) problems.push(`tracker.provider.blocked_state "${blockedState}" must not be an active state: halted cards are moved there to take them away from agents`);
+    if (has(terminalStates, blockedState)) problems.push(`tracker.provider.blocked_state "${blockedState}" must be a waiting state, not in tracker.terminal_states`);
+    if (has(config.mergeConflicts?.states ?? [], blockedState)) {
+      problems.push(`tracker.provider.blocked_state "${blockedState}" must not be in merge_conflicts.states: conflict recovery must not restart halted cards`);
+    }
+  }
+  if (handoffState) {
+    if (implementer(handoffState)) problems.push(`tracker.provider.handoff_state "${handoffState}" must not be an implementer state: the agent would start again right after submitting`);
+    if (has(terminalStates, handoffState) || same(handoffState, blockedState)) {
+      problems.push(`tracker.provider.handoff_state "${handoffState}" must be a review or human waiting state, not a blocked or terminal state`);
+    }
+  }
+  if (config.review) {
+    const { passState, failState } = config.review;
+    noStartTarget("review.pass_state", passState);
+    noStartTarget("review.fail_state", failState);
+    if (has(activeStates, passState)) problems.push(`review.pass_state "${passState}" must not be an active state: approved work would be picked up again`);
+    if (has(terminalStates, passState) || same(passState, blockedState)) problems.push(`review.pass_state "${passState}" must be a human waiting state, not a blocked or terminal state`);
+    if (failState && !implementer(failState)) problems.push(`review.fail_state "${failState}" must be an active state worked by the implementer`);
+  }
+  noStartTarget("merge_conflicts.return_state", config.mergeConflicts?.returnState ?? null);
+
+  const followups = provider.followups;
+  if (followups && typeof followups === "object" && !Array.isArray(followups)) {
+    const f = followups as Record<string, unknown>;
+    for (const label of stringList(f.labels, [], "tracker.provider.followups.labels", problems)) {
+      if (requiredLabels.includes(label.trim().toLowerCase())) {
+        problems.push(`tracker.provider.followups.labels includes "${label}" from tracker.required_labels: follow-ups would be worked on without a person deciding`);
+      }
+    }
+    if (typeof f.state === "string" && has(activeStates, f.state) && requiredLabels.length === 0) {
+      problems.push("tracker.provider.followups.state in an active column requires nonempty tracker.required_labels: new follow-ups must not dispatch automatically");
+    }
+  }
 }
 
 function buildReview(raw: Record<string, unknown>, activeStates: string[], workflowDir: string, env: NodeJS.ProcessEnv, problems: string[]): ReviewConfig {
@@ -277,7 +363,6 @@ function buildReview(raw: Record<string, unknown>, activeStates: string[], workf
     reasoningEffort: text(raw.reasoning_effort, "review.reasoning_effort", problems),
     passState: required("pass_state"),
     failState: required("fail_state"),
-    maxRounds: integer(raw.max_rounds, 3, "review.max_rounds", problems, 1),
     continuationPrompt: text(raw.continuation_prompt, "review.continuation_prompt", problems) ?? DEFAULT_REVIEW_CONTINUATION,
   };
 }
@@ -298,7 +383,7 @@ function buildMergeConflicts(raw: Record<string, unknown>, activeStates: string[
 }
 
 const DEFAULT_REVIEW_CONTINUATION =
-  "Continue reviewing {{ issue.identifier }} (turn {{ turn }} of {{ max_turns }}). Do not repeat checks you already ran. When you have a verdict, call tracker_submit_review.";
+  "Continue reviewing {{ issue.identifier }} (turn {{ turn }} of {{ max_turns }}). Finish the remaining risk-based coverage, including affected unchanged lifecycle code and independent counterexamples; do not stop at the first defect or repeat completed checks. Recover missing context and mark unverified areas explicitly; do not approve material unread code or feedback. Remove your disposable tests before calling tracker_submit_review with all confirmed findings and a complete issue handoff, including relevant human PR feedback and constraints. Supply reviewed_head, progress and evidence in progress_reason using the initial-versus-formal-rework context already supplied; commit counts alone do not prove progress. For request_changes supply blocking_issues, next_action and a concrete next_step (a changed approach for no_progress); for approve leave blockers empty and next_action/next_step null. If required verification is impossible, submit verdict=unable_to_verify, progress=not_assessed and next_action=human_required, with missing conditions, attempted checks and the human action in next_step; reviewed_head may be null if unavailable. Do not just comment and stop or invent a quality defect.";
 
 /** Review states are worked by the reviewer; every other active state by the implementer. */
 export function roleFor(config: ServiceConfig, state: string): Role {

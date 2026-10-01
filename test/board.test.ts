@@ -15,6 +15,8 @@ tracker:
     owner: me
     owner_type: user
     repo: me/app
+    start_state: Todo
+    working_state: In Progress
     agent_states: [In Progress, Blocked]
     handoff_state: Human Review
     blocked_state: Blocked
@@ -44,13 +46,29 @@ function load(text: string) {
 test("board columns follow the workflow: parked, active in order, waiting, blocked, finished", () => {
   const { config, settings } = load(WORKFLOW);
   assert.deepEqual(boardStates(config, settings).map((s) => `${s.name}:${s.role}`), [
-    "Backlog:other", "Todo:implement", "In Progress:implement", "Rework:implement", "Human Review:waiting", "Blocked:blocked", "Done:terminal", "Canceled:terminal",
+    "Backlog:other", "Todo:start", "In Progress:implement", "Rework:implement", "Human Review:waiting", "Blocked:blocked", "Done:terminal", "Canceled:terminal",
   ]);
   const desired = desiredBoard(config, settings);
-  assert.deepEqual(desired.statusOptions.map((o) => o.color), ["GRAY", "BLUE", "BLUE", "BLUE", "ORANGE", "RED", "GREEN", "GRAY"]);
-  assert.equal(desired.statusOptions[1]!.description, 'Agents work on cards labeled "agent"');
+  assert.deepEqual(desired.statusOptions.map((o) => o.color), ["GRAY", "YELLOW", "BLUE", "BLUE", "ORANGE", "RED", "GREEN", "GRAY"]);
+  assert.match(desired.statusOptions[1]!.description, /Human.*authoriz.*agent/);
+  assert.match(desired.statusOptions[2]!.description, /Scheduler.*agent/);
   assert.deepEqual(desired.priorityOptions.map((o) => o.name), ["P1", "P2", "P3", "P4", "Later"]);
   assert.deepEqual(desired.labels.map((l) => l.name), ["agent", "tech-debt"]);
+});
+
+test("custom lifecycle columns are deduplicated and keep their configured active order", () => {
+  const text = WORKFLOW.replaceAll("Todo", "待开始").replaceAll("In Progress", "进行中")
+    .replaceAll("Rework", "返工").replaceAll("Human Review", "人工审查").replaceAll("Blocked", "阻塞")
+    .replace("state: Backlog", "state: 待开始")
+    .replace("[待开始, 进行中, 返工]", "[返工, 待开始, 进行中, AI Review]")
+    .replace("handoff_state: 人工审查", "handoff_state: AI Review")
+    .replace("merge_conflicts:", "review:\n  states: [AI Review]\n  prompt_file: REVIEW.md\n  pass_state: 人工审查\n  fail_state: 返工\nmerge_conflicts:");
+  const { config, settings } = load(text);
+  const states = boardStates(config, settings);
+  assert.deepEqual(states.map((s) => `${s.name}:${s.role}`), ["返工:implement", "待开始:start", "进行中:implement", "AI Review:review", "人工审查:waiting", "阻塞:blocked", "Done:terminal", "Canceled:terminal"]);
+  const options = desiredBoard(config, settings).statusOptions;
+  assert.match(options.find((s) => s.name === "AI Review")!.description, /Scheduler/);
+  assert.match(options.find((s) => s.name === "阻塞")!.description, /待开始/);
 });
 
 test("the board check names missing columns, labels and a disruptive project workflow", () => {

@@ -67,6 +67,7 @@ function main(): Promise<number> | number {
         attempt: p.attempt,
         role: p.role,
         reviewRound: p.reviewRound,
+        control: p.control,
         config: p.workflow.config,
         promptTemplate: p.workflow.definition.promptTemplate,
         tracker: p.tracker,
@@ -89,7 +90,7 @@ function main(): Promise<number> | number {
       if (args.values.once) {
         await orchestrator.runOnce();
         store.close();
-        return 0;
+        return orchestrator.snapshot().ledger_error ? 1 : 0;
       }
       await orchestrator.start();
     } catch (error) {

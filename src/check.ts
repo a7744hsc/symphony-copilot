@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { buildConfig, ConfigError, type ServiceConfig } from "./config.ts";
+import { buildConfig, ConfigError, REMOVED_CONFIG_KEYS, type ServiceConfig } from "./config.ts";
 import { parseSettings, type GitHubProjectSettings } from "./tracker/github-project.ts";
 import { TrackerError } from "./tracker/types.ts";
 import { renderContinuationPrompt, renderIssuePrompt, renderTemplate } from "./template.ts";
@@ -57,6 +57,10 @@ export function unknownKeys(value: unknown, schema: SchemaNode = WORKFLOW_SCHEMA
     } else if (typeof schema.additionalProperties === "object") {
       findings.push(...unknownKeys(child, schema.additionalProperties, where));
     } else if (schema.additionalProperties === false) {
+      if (Object.hasOwn(REMOVED_CONFIG_KEYS, where)) {
+        findings.push({ level: "error", message: REMOVED_CONFIG_KEYS[where]! });
+        continue;
+      }
       const [closest] = Object.keys(schema.properties ?? {})
         .map((name) => ({ name, d: distance(key, name) }))
         .filter((c) => c.d <= 2)
@@ -71,7 +75,9 @@ export function unknownKeys(value: unknown, schema: SchemaNode = WORKFLOW_SCHEMA
 export function checkWorkflow(path: string, env: NodeJS.ProcessEnv = process.env): CheckResult {
   const findings: Finding[] = [];
   const result: CheckResult = { findings, config: null, settings: null, hasProjectNumber: false, tokenAvailable: false };
-  const error = (message: string) => findings.push({ level: "error", message });
+  const error = (message: string) => {
+    if (!findings.some((f) => f.level === "error" && f.message === message)) findings.push({ level: "error", message });
+  };
   const warn = (message: string) => findings.push({ level: "warning", message });
 
   let definition: WorkflowDefinition;
@@ -92,7 +98,7 @@ export function checkWorkflow(path: string, env: NodeJS.ProcessEnv = process.env
   if (config) {
     if (config.tracker.kind === "github_project") result.settings = probeSettings(config.tracker.provider, env, result, error, warn);
     else error(`tracker.kind "${config.tracker.kind}" is not supported (supported: github_project)`);
-    if (result.settings) crossCheck(config, result.settings, error, warn);
+    if (result.settings) crossCheck(config, result.settings, warn);
     if (!config.hooks.afterCreate) warn("hooks.after_create is empty: workspaces start as empty folders; clone the repository there (see examples/WORKFLOW.md)");
     if (config.review && !config.hooks.beforeRun?.includes("SYMPHONY_ROLE")) {
       warn("hooks.before_run does not look at SYMPHONY_ROLE: the reviewer's workspace is not reset to the pushed branch (see examples/WORKFLOW.md)");
@@ -129,32 +135,15 @@ function probeSettings(provider: Record<string, unknown>, env: NodeJS.ProcessEnv
   }
 }
 
-function crossCheck(config: ServiceConfig, settings: GitHubProjectSettings, error: (m: string) => void, warn: (m: string) => void): void {
+function crossCheck(config: ServiceConfig, settings: GitHubProjectSettings, warn: (m: string) => void): void {
   const has = (list: string[], state: string) => list.some((s) => normalizeState(s) === normalizeState(state));
-  const active = config.tracker.activeStates;
   const reviewStates = config.review?.states ?? [];
-  const implementer = (state: string) => has(active, state) && !has(reviewStates, state);
-
-  const blocked = settings.blockedState;
-  if (blocked && has(active, blocked)) error(`tracker.provider.blocked_state "${blocked}" must not be an active state: halted cards are moved there to take them away from agents`);
-  if (blocked && config.mergeConflicts && has(config.mergeConflicts.states, blocked)) {
-    error(`tracker.provider.blocked_state "${blocked}" must not be in merge_conflicts.states: a halted card with a conflicting pull request would start again with fresh run limits`);
-  }
   const handoff = settings.handoffState;
-  if (handoff && implementer(handoff)) error(`tracker.provider.handoff_state "${handoff}" must not be an implementer state: the agent would start again right after submitting`);
   if (config.review) {
     if (!handoff) warn("tracker.provider.handoff_state is not set: submitted cards never reach the review agent");
     else if (!has(reviewStates, handoff)) warn(`tracker.provider.handoff_state "${handoff}" is not a review state: submissions skip the review agent`);
-    if (has(active, config.review.passState)) error(`review.pass_state "${config.review.passState}" must not be an active state: approved work would be picked up again`);
-    if (!implementer(config.review.failState)) error(`review.fail_state "${config.review.failState}" must be an active state worked by the implementer`);
   }
-  const dispatchLabels = new Set(config.tracker.requiredLabels);
-  for (const label of settings.followups?.labels ?? []) {
-    if (dispatchLabels.has(label.trim().toLowerCase())) {
-      error(`tracker.provider.followups.labels includes "${label}" from tracker.required_labels: follow-ups would be worked on without a person deciding`);
-    }
-  }
-  if (dispatchLabels.size === 0) warn("tracker.required_labels is empty: every open issue in an active column is worked on");
+  if (config.tracker.requiredLabels.length === 0) warn("tracker.required_labels is empty: every open issue in an active column is worked on");
 }
 
 function sampleIssue(config: ServiceConfig | null, settings: GitHubProjectSettings | null): Issue {
@@ -166,7 +155,7 @@ function sampleIssue(config: ServiceConfig | null, settings: GitHubProjectSettin
     title: "Sample issue",
     description: "Sample description.",
     priority: 2,
-    state: config?.tracker.activeStates[0] ?? "Todo",
+    state: config?.tracker.startState ?? "Todo",
     branchName: `${settings?.branchPrefix ?? "agent/"}1`,
     url: "https://github.com/owner/repo/issues/1",
     assigneeId: "someone",
@@ -203,7 +192,7 @@ function checkTemplates(definition: WorkflowDefinition, config: ServiceConfig | 
     const template = readFileSync(review.promptFile, "utf8");
     for (const attempt of [null, 2]) {
       render("review.prompt_file", () => renderTemplate(template, {
-        issue: issueForTemplate(issue), attempt, review_round: 1, max_review_rounds: review.maxRounds, implementer_workspace: `${config.workspace.root}/${issue.identifier}`,
+        issue: issueForTemplate(issue), attempt, review_round: 1, implementer_workspace: `${config.workspace.root}/${issue.identifier}`,
       }));
     }
   }

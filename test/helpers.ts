@@ -11,9 +11,10 @@ export function captureLog(): { log: Logger; lines: string[] } {
 }
 
 export function makeIssue(overrides: Partial<Issue> = {}): Issue {
+  const id = overrides.id ?? "item-1";
   return {
-    id: "item-1",
-    nativeRef: null,
+    id,
+    nativeRef: { provider: "fake", repository: "fake/repo", issue_id: `fake-${overrides.identifier ?? id}`, project_item_id: id },
     identifier: "GH-1",
     title: "Do the thing",
     description: null,
@@ -34,7 +35,15 @@ export function makeIssue(overrides: Partial<Issue> = {}): Issue {
 export function makeConfig(raw: Record<string, any> = {}): ServiceConfig {
   const { tracker = {}, ...rest } = raw;
   return buildConfig({
-    tracker: { kind: "fake", active_states: ["Todo", "In Progress"], terminal_states: ["Done", "Cancelled"], ...tracker },
+    tracker: {
+      kind: "fake", active_states: ["Todo", "In Progress"], terminal_states: ["Done", "Cancelled"], ...tracker,
+      provider: {
+        ...(tracker.kind === undefined || tracker.kind === "fake"
+          ? { start_state: "Todo", working_state: "In Progress", blocked_state: "Blocked", handoff_state: "Human Review" }
+          : {}),
+        ...tracker.provider,
+      },
+    },
     workspace: { root: "/tmp/symphony-test-root" },
     ...rest,
   }, "/tmp/WORKFLOW.md", {});

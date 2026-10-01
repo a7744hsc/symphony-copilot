@@ -9,7 +9,11 @@ import { captureLog } from "./helpers.ts";
 const VALID = `---
 tracker:
   kind: github_project
-  active_states: [Todo]
+  provider:
+    start_state: Todo
+    working_state: In Progress
+    blocked_state: Blocked
+  active_states: [Todo, In Progress]
   terminal_states: [Done]
 polling:
   interval_ms: 5000

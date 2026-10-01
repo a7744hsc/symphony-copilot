@@ -6,7 +6,7 @@ import { graphqlRequest, restRequest, type FetchLike, type GitHubApi } from "./t
 import type { GitHubProjectSettings } from "./tracker/github-project.ts";
 import { normalizeState } from "./types.ts";
 
-export type StateRole = "other" | "implement" | "review" | "waiting" | "blocked" | "terminal";
+export type StateRole = "other" | "start" | "implement" | "review" | "waiting" | "blocked" | "terminal";
 
 export interface BoardState {
   name: string;
@@ -42,8 +42,8 @@ export interface BoardSnapshot {
   repo: { id: string; labels: string[] } | null;
 }
 
-const ROLE_RANK: Record<StateRole, number> = { other: 0, implement: 1, review: 1, waiting: 2, blocked: 3, terminal: 4 };
-const ROLE_COLOR: Record<StateRole, string> = { other: "GRAY", implement: "BLUE", review: "PURPLE", waiting: "ORANGE", blocked: "RED", terminal: "GREEN" };
+const ROLE_RANK: Record<StateRole, number> = { other: 0, start: 1, implement: 1, review: 1, waiting: 2, blocked: 3, terminal: 4 };
+const ROLE_COLOR: Record<StateRole, string> = { other: "GRAY", start: "YELLOW", implement: "BLUE", review: "PURPLE", waiting: "ORANGE", blocked: "RED", terminal: "GREEN" };
 const PRIORITY_COLORS = ["RED", "ORANGE", "YELLOW", "GRAY"];
 
 /** Every column the workflow names, in board order: other, active (as listed), waiting, blocked, terminal. */
@@ -51,6 +51,7 @@ export function boardStates(config: ServiceConfig, settings: GitHubProjectSettin
   const has = (list: Array<string | null | undefined>, state: string) => list.some((s) => s && normalizeState(s) === normalizeState(state));
   const waiting = [settings.handoffState, config.review?.passState, ...(config.mergeConflicts?.states ?? [])];
   const role = (state: string): StateRole => {
+    if (has([settings.startState], state)) return "start";
     if (has(config.tracker.activeStates, state)) return has(config.review?.states ?? [], state) ? "review" : "implement";
     if (has(config.tracker.terminalStates, state)) return "terminal";
     if (has([settings.blockedState], state)) return "blocked";
@@ -58,6 +59,8 @@ export function boardStates(config: ServiceConfig, settings: GitHubProjectSettin
   };
   const named: Array<[string | null | undefined, string]> = [
     ...config.tracker.activeStates.map((s): [string, string] => [s, "tracker.active_states"]),
+    [settings.startState, "tracker.provider.start_state"],
+    [settings.workingState, "tracker.provider.working_state"],
     [settings.handoffState, "tracker.provider.handoff_state"],
     [config.review?.passState, "review.pass_state"],
     ...(config.mergeConflicts?.states ?? []).map((s): [string, string] => [s, "merge_conflicts.states"]),
@@ -80,10 +83,11 @@ export function desiredBoard(config: ServiceConfig, settings: GitHubProjectSetti
   const label = config.tracker.requiredLabels[0];
   const describe: Record<StateRole, string> = {
     other: "Not worked on by agents",
-    implement: label ? `Agents work on cards labeled "${label}"` : "Agents work on these cards",
-    review: "The review agent checks the pull request",
-    waiting: "Waiting for a person",
-    blocked: "Stopped; needs a person",
+    start: `Human start or reauthorization entry${label ? `; requires label "${label}"` : ""}`,
+    implement: `Scheduler-managed implementation${label ? `; requires label "${label}"` : ""}; do not move cards manually`,
+    review: "Scheduler-managed independent review; do not move cards manually",
+    waiting: `Waiting for a person; move to "${settings.startState}" to reauthorize`,
+    blocked: `Stopped; a person resolves the blocker, then moves to "${settings.startState}"`,
     terminal: "Finished",
   };
   const states = boardStates(config, settings);
