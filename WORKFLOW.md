@@ -57,7 +57,8 @@ agent:
   max_turns: 6
   max_sessions: 20
 copilot:
-  model: claude-opus-5.5
+  model: gpt-6-astra
+  reasoning_effort: high
   shell_allow: [npm run typecheck, npm test]
 ---
 You are the developer agent for this repository, working on {{ issue.identifier }}: {{ issue.title }}
