@@ -1,6 +1,7 @@
 # Copy to .github/ISSUE_TEMPLATE/ in your repository. The sections match what symphony-copilot's
 # agents are told to work from. It deliberately adds no labels: a maintainer adds the dispatch
 # label (usually "agent") after reading the issue, so nobody else can start an agent.
+# Onboarding may localize visible prose using WORKFLOW.md language; keep keys, IDs and validation unchanged.
 name: Agent task
 description: A change small enough for one pull request, written so an agent can do it and prove it.
 body:

@@ -15,7 +15,7 @@ symphony-copilot turns cards on a GitHub Project board into pull requests: it ru
 
 Templates to start from: `$SYMPHONY_HOME/examples/WORKFLOW.md`, `$SYMPHONY_HOME/examples/AGENTS.md`, `$SYMPHONY_HOME/examples/REVIEW.md`, `$SYMPHONY_HOME/examples/ISSUE_TEMPLATE/agent-task.yml`. The checker is `$SYMPHONY_HOME/bin/symphony check`.
 
-Write prose in the language the user writes to you. Keep YAML keys, tool names (`tracker_*`) and template variables as they are.
+Explicitly ask the user to choose the workflow's output language: English (`en`) or Simplified Chinese (`zh-CN`). Do not infer it from the conversation or repository, or silently accept English from “use the recommended setup.” Keep a single English prompt source: the generated WORKFLOW.md body and REVIEW.md stay in English in both modes, except configured column names. The runtime adds the output-language instruction; do not translate or duplicate these prompts. Keep YAML keys, tool names (`tracker_*`), template variables, identifiers and literal diagnostics unchanged.
 
 ## 1. Read the repository
 
@@ -30,10 +30,11 @@ Find out yourself instead of asking:
 
 ## 2. Ask the user, once
 
-Users should not have to know Symphony's internal state machine or invent a board. Infer facts from the repository first (owner/type, repository name, default branch, language, build/test commands). Ask, in one concise batch, only what the repository cannot answer. Explain capabilities in plain language, recommend a default, and allow “use the recommended setup.” Do not ask which columns they want.
+Users should not have to know Symphony's internal state machine or invent a board. Infer facts from the repository first (owner/type, repository name, default branch, programming languages, build/test commands), not the output language. Ask in one concise batch. Explain capabilities in plain language, recommend defaults for capabilities, and allow “use the recommended setup” for those capabilities only. Do not ask which columns they want.
 
 Ask:
 
+- Output language: “Which language should Symphony use for cards, plans, issue/PR handoffs and reviews: English (`en`) or Simplified Chinese (`zh-CN`)?” Require an explicit choice before generating files, even if the user accepts the recommended setup. If the answer omits the language, ask only for that missing choice; do not auto-default it.
 - Independent AI review before a person reviews/merges the PR? Explain the extra model usage/latency; human approval before merge remains final either way. If enabled, use reviewer model `auto` by default: Copilot chooses a model available to this account. Ask this as a normal-language question, not a technical model picker. Do not present a picker of guessed model IDs or ask the user to recognize names they may not know. Configure a fixed reviewer model only if the user explicitly requests it and provides an ID, or you have verified that exact ID is available to their Copilot account. A different model family can improve independence, but never invent an ID to achieve that.
 - Automatically detect PR merge conflicts while a PR waits for a person and return the card to the implementer? Recommend Yes; if No, explain a person can return a waiting card to Todo after leaving instructions.
 - Let agents file low-priority follow-up issues for unrelated problems? Recommend No if issue noise is a concern; when Yes, explain follow-ups use `tech-debt` and P4 and do not receive the dispatch label, so never start automatically. Clarify this is separate from the issue form below.
@@ -42,13 +43,13 @@ Ask:
 - Dispatch label (default `agent`); only issues with this label are eligible.
 - Add an optional GitHub task issue form? Recommend Yes. Explain it only adds a structured New issue form for human-written tasks (goal, acceptance, verification, scope, notes); it does not create, label, dispatch, or start issues. This is distinct from agent-generated follow-up issues.
 
-Use the user's conversation language for questions and generated column names. Do not ask for individual column names. Show the derived lane plan after the capability answers; the user may ask to rename lanes. Keep chosen names consistent in WORKFLOW.md, REVIEW.md and the handoff summary.
+After the choice, use the selected output language for onboarding explanations, generated column names and the handoff summary, regardless of the conversation language. Do not ask for individual column names. Show the derived lane plan after the capability answers; the user may ask to rename lanes. Keep chosen names consistent in WORKFLOW.md, REVIEW.md and the handoff summary. Do not rename existing columns or rewrite existing user content just to change language.
 
 Explain the fixed behavior, not as optional questions: Blocked is mandatory. A successful SDK session creation consumes one session; workspace/hook/runtime startup failures before that pause without charging or endless retry. Approval goes to Human Review; a human-only blocker, two consecutive reviewed no-progress reworks or the shared session limit pauses in Blocked. Initial review and infrastructure failures are not no-progress reworks. No credit cap or absolute elapsed-time cap is provided.
 
 ### Derive columns from the selected behavior
 
-Use these default names, localized to the user's language when appropriate, in this order, deduplicating shared roles:
+Use these default names, localized to the selected output language when appropriate, in this order, deduplicating shared roles:
 
 | Role | Default column | Mapping |
 |---|---|---|
@@ -62,6 +63,7 @@ Use these default names, localized to the user's language when appropriate, in t
 
 Generate config consistently from the answers:
 
+- All column names below are role examples: substitute the selected names consistently, without translating configuration keys or enum values.
 - Derive `tracker.active_states` exactly as follows (Blocked is never active):
 
   | AI review | Conflict recovery | `tracker.active_states` |
@@ -77,7 +79,7 @@ Generate config consistently from the answers:
 - Follow-ups on: configure `followups` with `state: Todo`, `labels: [tech-debt]`, and `priority: P4`; never attach the dispatch label. Todo is the human intake queue; an issue is not picked up until a person explicitly labels it for dispatch.
 - Set `terminal_states: [Done, Canceled]` and `agent_states: [In Progress, Blocked]`. Do not list every active state; AI Review, Rework and Human Review are set by submission/review/orchestrator tools, not `tracker_set_status`. Terminal means a person merges the PR or closes the issue, not an AI approval.
 
-Before writing, show a compact preview, for example: “AI reviewer: on; conflict return: on; Blocked: required; task issue form: yes; columns: Todo → In Progress → Rework → AI Review → Human Review → Blocked → Done → Canceled.” Then generate from this plan; do not copy the full-featured example unchanged.
+Before writing, show a compact preview, for example: “Output language: English (en); AI reviewer: on; conflict return: on; Blocked: required; task issue form: yes; columns: Todo → In Progress → Rework → AI Review → Human Review → Blocked → Done → Canceled.” Then generate from this plan; do not copy the full-featured example unchanged.
 
 Teach state ownership as a working agreement, not a GitHub permission lock: people start new work in Todo and return existing cards only from a waiting column (Blocked/Human Review) to Todo. This renews the session allowance and clears the no-progress streak, preserving work and issue history. Do not manually move cards into or out of In Progress, Rework or AI Review. Automatic conflict return to Rework does not reset anything and cannot restart paused or exhausted work; restarting Symphony does not reset it either. Other board automation must not send existing cards to Todo as if a person had authorized them.
 
@@ -86,6 +88,7 @@ Teach state ownership as a working agreement, not a GitHub permission lock: peop
 Start from the templates and change only what this repository needs and the user selected. The example WORKFLOW.md is a full-featured reference profile, not a requirement to keep every lane.
 
 - Leave `project_number:` empty. `symphony setup-board` creates the board later and writes the number.
+- Always write top-level `language: en` or `language: zh-CN` from the explicit choice. Omission defaults to `en` only for older or hand-written workflows; it is not an onboarding shortcut. Other values, including `null`, are invalid.
 - Apply the derived lane plan from step 2. Remove the `review` section and do not create REVIEW.md when independent AI review is off. Do not keep unused Rework or AI Review columns. Use each selected column name consistently; `symphony setup-board` creates exactly the states named by WORKFLOW.md. `symphony check` enforces these rules:
   - review states are also in `active_states`, and one of them is `handoff_state`;
   - required `start_state` and `working_state` are distinct implementer active columns; no automatic return or agent status targets `start_state`;
@@ -96,19 +99,19 @@ Start from the templates and change only what this repository needs and the user
 - `hooks.after_create`: keep the template's single-branch clone and branch switch, then install dependencies (hooks have network access; agents do not) and copy local-only files. `hooks.before_run`: keep the fetch and the reviewer reset. Replace `main` with the default branch in the hooks and the prompt.
 - `copilot.shell_allow`: the exact build, test and lint commands, as prefixes, for example `npm test` or `swift test`. Do not add entries that run arbitrary code: `node`, `python3`, `bash`, `sh`, `npx`, or a bare `npm run`. git and basic file commands are built in.
 - `workspace.root`: `~/symphony-workspaces/<repository name>`, outside the repository.
-- The prompt: keep the template's steps and rules, replace every example state with the generated localized name, and make verify fit this repository. Preserve the required `tracker_comment` with `blocking: true`, then `tracker_set_status` exit for missing external dependencies, authorization or confirmed inability; in-scope failures still need solving. Plans/progress leave `blocking` unset or false; only a complete blocking reason qualifies for the Blocked handoff. If follow-ups are off, remove the instruction to file follow-up issues; if conflict recovery is off, say a person can return a waiting card to Todo. The PR-submission/handoff step stays enabled even when AI review is off.
-- Use `agent.max_sessions: 20` unless the user chooses otherwise. Remove obsolete credit-cap and review-round-cap keys; costs belong only in detailed logs and a best-effort issue-result footer, e.g. `用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx` with actual model usage. Missing metrics or a failed footer update may leave no footer; there is no separate usage comment or durable footer retry queue.
+- The prompt: keep the template's English steps and rules in both language modes, replace every example state with the configured name, and make verify fit this repository. Preserve the required `tracker_comment` with `blocking: true`, then `tracker_set_status` exit for missing external dependencies, authorization or confirmed inability; in-scope failures still need solving. Plans/progress leave `blocking` unset or false; only a complete blocking reason qualifies for the Blocked handoff. If follow-ups are off, remove the instruction to file follow-up issues; if conflict recovery is off, say a person can return a waiting card to Todo. The PR-submission/handoff step stays enabled even when AI review is off.
+- Use `agent.max_sessions: 20` unless the user chooses otherwise. Remove obsolete credit-cap and review-round-cap keys; costs belong only in detailed logs and a best-effort issue-result footer in the selected language, with actual model usage. Missing metrics or a failed footer update may leave no footer; there is no separate usage comment or durable footer retry queue.
 - Preserve the implementer's responsibility to infer invariants and edge cases from the goal and code, trace the affected lifecycle (including unchanged callers and cleanup), test counterexamples, and fix the underlying failure class on rework. Do not ask users to enumerate edge cases. Keep the instructions to follow feedback pagination and read saved output fully rather than relying on previews.
 - Preserve autonomous planning before product edits, including conflict repair: inspect evidence, choose an approach, self-grill consequential assumptions, and publish a concise Implementation plan with `tracker_comment` on the issue. Planning and implementation stay in the same session, without a new agent, column or human approval gate. Reuse applicable plans; revise material decisions and verification on rework, reconsidering the shared mechanism when adjacent failures recur. Keep full plan context on the issue, not only the PR. Do not republish unchanged plans or blindly repeat a comment after a lost response. The runtime supplies this protocol even for custom prompts; it is behavioral guidance, not a write barrier.
 - People remain at the Project control plane. Automated answers are not human approval: infer facts, make reasonable in-scope choices and document assumptions, but do not invent requirements or broaden permissions. Use the existing Blocked path for genuinely missing decisions/authorization, not routine technical choices. Do not ask people to approve each task's plan or install/invoke interactive `brainstorming`, `grill-me` or `grilling` in unattended workers; those skills remain separate tools for people.
 
 ## 4. Write AGENTS.md
 
-If the repository has one, keep it and add only what is missing: a "Build and verify" section (commands, plus a table of what changed and what to run at least) and the hard rules "evidence first", "no push: only tracker_submit_for_review" and "no network or new dependencies". Keep it a short map with links, not a manual.
+New AGENTS.md prose may use the selected language. If the repository has one, keep its existing content and add only what is missing: a "Build and verify" section (commands, plus a table of what changed and what to run at least) and the hard rules "evidence first", "no push: only tracker_submit_for_review" and "no network or new dependencies". Keep it a short map with links, not a manual; keep section references consistent if headings are localized.
 
 ## 5. Write REVIEW.md only when selected
 
-If independent AI review is on, start from the template, point its verify step at AGENTS.md's "Build and verify", and keep the rule that changes to WORKFLOW.md, REVIEW.md, AGENTS.md or CI go to a person. If review is off, do not create a REVIEW.md just to satisfy the example; the human-review handoff still remains.
+If independent AI review is on, start from the English template and keep REVIEW.md in English in both modes, using configured column names and the actual AGENTS.md section heading. Point its verify step at AGENTS.md's "Build and verify", and keep the rule that changes to WORKFLOW.md, REVIEW.md, AGENTS.md or CI go to a person. If review is off, do not create a REVIEW.md just to satisfy the example; the human-review handoff still remains.
 
 Retain independent risk-based review, whole-change coverage before a verdict, explicit unverified areas, and evidence-backed findings rather than speculative requirements. Name this repository's existing test-discovery path and allowed test command so the reviewer can create new disposable regression tests in its own clone, run them, and remove them without changing implementation, existing tests, scripts or permissions. Include this narrow scratch-test allowance in AGENTS.md's "Build and verify"; do not grant bare interpreter access or introduce a new test framework just for review.
 
@@ -118,7 +121,7 @@ Keep the structured `tracker_submit_review` fields from the template: exact `rev
 
 ## 6. Apply the issue-form choice
 
-Use the Yes/No answer collected in step 2; do not ask a second time. If Yes, copy `$SYMPHONY_HOME/examples/ISSUE_TEMPLATE/agent-task.yml` to `.github/ISSUE_TEMPLATE/`. It deliberately adds no dispatch label; a maintainer decides whether a submitted issue should be added to the board and labeled to start work. If No, do not create the form.
+Use the Yes/No answer collected in step 2; do not ask a second time. If Yes, copy `$SYMPHONY_HOME/examples/ISSUE_TEMPLATE/agent-task.yml` to `.github/ISSUE_TEMPLATE/`. Its visible name, descriptions and section labels may use the selected language; preserve YAML keys, field IDs, validation rules and the absence of dispatch labels. Do not overwrite an existing user-authored form. It deliberately adds no dispatch label; a maintainer decides whether a submitted issue should be added to the board and labeled to start work. If No, do not create the form.
 
 ## 7. Check
 

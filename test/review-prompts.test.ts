@@ -114,9 +114,61 @@ test("onboarding derives mandatory lifecycle columns without credit budgets or i
   for (const phrase of [/autonomous planning before product edits/, /same session/, /Project control plane/, /Automated answers are not human approval/, /not a write barrier/, /self-grill/i, /never let a plan narrow acceptance criteria/]) assert.match(skill, phrase);
 });
 
+test("onboarding requires an explicit output-language choice even with recommended setup", () => {
+  const skill = readFileSync(join(root, "skills/symphony-onboard/SKILL.md"), "utf8");
+  for (const phrase of [
+    /Explicitly ask the user.*English \(`en`\).*Simplified Chinese \(`zh-CN`\)/,
+    /Do not infer it from the conversation or repository/,
+    /Require an explicit choice before generating files, even if the user accepts the recommended setup/,
+    /If the answer omits the language, ask only for that missing choice; do not auto-default it/,
+    /Always write top-level `language: en` or `language: zh-CN`/,
+    /Omission defaults to `en` only for older or hand-written workflows/,
+    /including `null`.*invalid/,
+    /Do not rename existing columns or rewrite existing user content/,
+  ]) assert.match(skill, phrase);
+  assert.doesNotMatch(skill, /Write prose in the language the user writes|Use the user's conversation language|localized to the user's language/);
+});
+
+test("onboarding preserves English prompt sources and localizes only selected documentation", () => {
+  const skill = readFileSync(join(root, "skills/symphony-onboard/SKILL.md"), "utf8");
+  for (const phrase of [
+    /single English prompt source/,
+    /WORKFLOW\.md body and REVIEW\.md stay in English in both modes, except configured column names/,
+    /runtime adds the output-language instruction; do not translate or duplicate these prompts/,
+    /New AGENTS\.md prose may use the selected language/,
+    /keep its existing content/,
+    /visible name, descriptions and section labels may use the selected language/,
+    /preserve YAML keys, field IDs, validation rules and the absence of dispatch labels/,
+    /Do not overwrite an existing user-authored form/,
+  ]) assert.match(skill, phrase);
+
+  const path = join(root, "examples/WORKFLOW.md");
+  const workflow = loadWorkflow(path);
+  assert.equal(workflow.config.language, "en");
+  assert.match(readFileSync(path, "utf8"), /language: en\s+# explicitly choose en \(English\) or zh-CN \(Simplified Chinese\) during onboarding/);
+  assert.doesNotMatch(workflow.promptTemplate, /\p{Script=Han}/u);
+  assert.doesNotMatch(readFileSync(join(root, "examples/REVIEW.md"), "utf8"), /\p{Script=Han}/u);
+});
+
 test("write-card starts only in the explicit start_state and does not ask users to enumerate edge cases", () => {
   const skill = readFileSync(join(root, "skills/symphony-write-card/SKILL.md"), "utf8");
   assert.match(skill, /Starting now means[\s\S]*tracker\.provider\.start_state/);
   assert.doesNotMatch(skill, /first active|starts in the first|intent, priorities, edge cases/);
   assert.match(skill, /Do not guess.*IDs/);
+});
+
+test("write-card uses configured language for title, headings and body rather than conversation", () => {
+  const skill = readFileSync(join(root, "skills/symphony-write-card/SKILL.md"), "utf8");
+  for (const phrase of [
+    /title, all section headings and body in the configured output language/,
+    /even when the conversation is in a different language/,
+    /Read top-level `language`: `en` means English; `zh-CN` means Simplified Chinese/,
+    /missing key in an older workflow defaults to `en`/,
+    /do not infer language from the conversation, issue text or column names/,
+    /Reject other values, including `null`/,
+    /write the entire body in Simplified Chinese/,
+    /`目标`, `验收标准`, `验证方式`, `范围之外` and `备注`/,
+    /Keep identifiers, commands, paths and quoted existing user content unchanged/,
+  ]) assert.match(skill, phrase);
+  assert.doesNotMatch(skill, /Write in the language the user writes to you/);
 });

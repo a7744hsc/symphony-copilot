@@ -5,6 +5,7 @@
 # This is a full-capability reference profile: independent AI review, conflict return,
 # a visible Blocked lane, and follow-up issues are all enabled. The symphony-onboard
 # skill asks which capabilities you want and derives a smaller set of columns when off.
+language: en                       # explicitly choose en (English) or zh-CN (Simplified Chinese) during onboarding
 tracker:
   kind: github_project
   provider:

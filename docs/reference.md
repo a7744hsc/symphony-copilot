@@ -74,6 +74,16 @@ Before upgrading from the old PID-file wrapper, stop all old runners, including 
 
 When a session ends, the log line `session usage` reports `premium_requests` and `ai_credits` for that session.
 
+## Output language
+
+Top-level `language` in WORKFLOW.md accepts only `en` (English) and `zh-CN` (Simplified Chinese). Omission defaults to `en` for compatibility; other values, including `null` or an empty YAML value, fail validation. `/symphony-onboard` must nevertheless ask for an explicit choice before generating files, even with “use the recommended setup”; neither the conversation nor repository language chooses it. `/symphony-write-card` reads this setting for the title, every heading and body, even when the conversation differs.
+
+The generated WORKFLOW.md body and REVIEW.md share one English prompt source in both modes. The runtime adds an English instruction naming the selected output language to both roles' first and continuation prompts and automated input replies, including custom prompts. This directs agent-written plans, progress/blocking comments, issue/PR titles and bodies, follow-up issues and reviews; it is instruction-based generation, not machine translation or a guarantee of model compliance.
+
+Host-authored issue/PR handoff and review headings, status explanations, usage footers, failures/blocking/conflict notices, follow-up attribution, screenshot-failure notices and new board/label descriptions use the selected language. Configured column names are used literally and may be localized during onboarding. New AGENTS prose and optional issue forms may also use the chosen language. Technical logs, CLI diagnostics and the bootstrap installation wizard before repository onboarding stay English. YAML keys, tool fields/enums, identifiers, paths, literal diagnostics and GitHub's `Closes` keyword are preserved; existing user content and already-published history are not translated or rewritten.
+
+Each started session keeps a language snapshot, so reloading WORKFLOW.md does not switch language midway through its turns, tools or usage footer. Subsequent sessions use the latest valid configuration. Accepted semantic handoffs save that language with the result so delayed publication and recovery after reload/restart stay consistent. Pending handoffs saved before language support retain the legacy English host headings, even if the current workflow selects Chinese. This does not introduce a durable usage-footer retry queue or rename existing board columns.
+
 ## GitHub Project adapter (`tracker.kind: github_project`)
 
 ### Settings under `tracker.provider`
@@ -165,7 +175,7 @@ Source-code fixes require restarting the service after active work is safely sto
 
 #### Reading complete feedback
 
-`tracker_get_issue` without arguments returns an overview: the latest five issue comments, PR reviews and PR comments, plus the first five review threads and the first five comments in each thread. No text is clipped at a character limit. Reviews expose the full Markdown after `**Blocking issues**` in `blocking_feedback`, independently of the full `body`; GitHub's `COMMENT` state is not treated as the AI verdict. An exact issue-comment copy of a review is omitted only when the full source review with the same author and URL is present in that response. Other comments, and mirrors whose source is on another page, remain available.
+`tracker_get_issue` without arguments returns an overview: the latest five issue comments, PR reviews and PR comments, plus the first five review threads and the first five comments in each thread. No text is clipped at a character limit. Reviews expose the full Markdown after the blocking-issues heading (`**Blocking issues**` or its Simplified Chinese counterpart) in `blocking_feedback`, independently of the full `body`; GitHub's `COMMENT` state is not treated as the AI verdict. An exact issue-comment copy of a review is omitted only when the full source review with the same author and URL is present in that response. Other comments, and mirrors whose source is on another page, remain available.
 
 Every connection includes `pagination` with `total_count`, `has_more` and `next`. Pass `next` directly as the arguments to `tracker_get_issue`. Sections are `issue_comments`, `reviews`, `pull_request_comments`, `review_threads`, and `thread_comments`; the latter also needs the returned `thread_id`. Comments and reviews page backwards to older history; threads and their comments page forwards. A thread is checked against this issue's open PR before its comments are returned. No arbitrary issue or PR ID can be supplied. Missing pagination metadata or a non-advancing cursor is an error, not an empty or complete history.
 
@@ -218,7 +228,7 @@ Implementers keep solving in-scope failures within current permissions. When ext
 
 Prompts are [Liquid](https://liquidjs.com/) templates. An unknown variable or filter fails the attempt, and `symphony check` reports it beforehand.
 
-After rendering, the runner prepends its role-specific [autonomous protocol](#implementation-and-review-method) without rendering the combined text again. Repository instructions and reviewer progress context are preserved. Later turns receive a short continuation reminder, not the full planning exercise. `attempt` is a retry number, not a planning phase: plan reuse/revision depends on issue history, current code and feedback.
+After rendering, the runner prepends its role-specific [autonomous protocol](#implementation-and-review-method) and [output-language directive](#output-language) without rendering the combined text again. Repository instructions and reviewer progress context are preserved. Later turns receive a short continuation reminder and language directive, not the full planning exercise. `attempt` is a retry number, not a planning phase: plan reuse/revision depends on issue history, current code and feedback.
 
 | Template | Variables |
 |---|---|
@@ -238,6 +248,7 @@ After rendering, the runner prepends its role-specific [autonomous protocol](#im
 |---|---|
 | The file parses, and every key is in [the schema](../schema/workflow.schema.json); a misspelled key gets a suggestion | Error |
 | Values are valid, as the orchestrator checks them at startup | Error |
+| `language`, when present, is exactly `en` or `zh-CN`; `null` is invalid | Error |
 | Required `start_state` and `working_state` are distinct implementer active columns; `blocked_state` is waiting, not terminal or in `merge_conflicts.states` | Error |
 | No agent-set, handoff, review-return or conflict-return state targets `start_state`; removed budget/review-cap keys are rejected | Error |
 | `handoff_state` is not a column the implementer works | Error |
@@ -271,7 +282,7 @@ Onboarding explicitly sets concurrency to 1 (the core spec default remains 10 if
 
 State ownership is a working agreement, not actor detection or a GitHub permission lock. People start in Todo and renew an existing card only from a waiting column to `start_state`; do not manually move into/out of In Progress, Rework or AI Review. Keep other board automation from returning existing cards to `start_state`. Renewal resets the session allowance and no-progress streak while preserving work, full issue history and cumulative usage. Automatic conflict return does not reset them. Terminal is a human merge/close, not AI approval; there is no separate terminal-reopen workflow.
 
-`agent.usage_comments` (default `true`) adds only a best-effort footer to the invocation's issue-result message: `用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx`. It uses observed session AI credits and actual model(s), with the session's fixed ordinal/limit, not cumulative cost or configured `auto`. Detailed metrics stay in logs. Missing/unreliable metrics, removed markers, deleted messages or update failures may omit the footer; no standalone usage comment, model retry or durable footer queue is created. Disabling it does not suppress necessary semantic failure reports.
+`agent.usage_comments` (default `true`) adds only a best-effort footer to the invocation's issue-result message in that session's selected language. It uses observed session AI credits and actual model(s), with the session's fixed ordinal/limit, not cumulative cost or configured `auto`. Detailed metrics stay in logs. Missing/unreliable metrics, removed markers, deleted messages or update failures may omit the footer; no standalone usage comment, model retry or durable footer queue is created. Disabling it does not suppress necessary semantic failure reports.
 
 ## Differences from the spec
 
