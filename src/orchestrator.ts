@@ -281,6 +281,7 @@ export class Orchestrator {
       return entry.done;
     });
     await Promise.allSettled(pending);
+    await this.queue;
   }
 
   snapshot() {

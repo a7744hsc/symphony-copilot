@@ -1,0 +1,269 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test, type TestContext } from "node:test";
+import { assertRunnerIdentity, canonicalPath, pathsOverlap, RunnerRegistry, runnerIdentity, validateId, workflowId, type RunnerRecord } from "../src/instances.ts";
+import { RunLedger } from "../src/ledger.ts";
+import { Orchestrator } from "../src/orchestrator.ts";
+import { requestRunner, serveRunner } from "../src/runner-control.ts";
+import { WorkflowStore } from "../src/workflow.ts";
+import { makeConfig, makeIssue, quietLog, workflowText } from "./helpers.ts";
+
+function fixture(t: TestContext) {
+  const dir = mkdtempSync(join(tmpdir(), "symphony-instances-"));
+  const cleanup: Array<() => void | Promise<void>> = [];
+  t.after(async () => {
+    try { for (const close of cleanup) await close(); }
+    finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  const registry = new RunnerRegistry(join(dir, "registry"));
+  const record = (id: string, patch: Partial<RunnerRecord> = {}): RunnerRecord => ({
+    id, workflow: join(dir, `${id}.md`), workspace: join(dir, "work", id),
+    directory: join(dir, "logs", id), project: `https://api.github.com/me/${id}`, scope: id,
+    run: { pid: process.pid, nonce: randomUUID(), socket: join(dir, `${id}.sock`) }, ...patch,
+  });
+  return { dir, registry, record, cleanup };
+}
+
+test("registry atomically admits independent workflows, retains stopped state and releases only its own run", async (t) => {
+  const { registry, record } = fixture(t);
+  const a = record("alpha"), b = record("beta");
+  await Promise.all([registry.claim(a), registry.claim(b)]);
+  assert.deepEqual(registry.list().map((r) => r.id).sort(), ["alpha", "beta"]);
+  await registry.release(a.id, "obsolete-nonce");
+  assert.ok(registry.list().find((r) => r.id === a.id)?.run);
+  await registry.release(a.id, a.run!.nonce);
+  assert.equal(registry.list().find((r) => r.id === a.id)?.run, null);
+  assert.ok(registry.list().find((r) => r.id === b.id)?.run);
+  await assert.rejects(registry.claim(record("third", { workspace: a.workspace })), /state path collision.*alpha/);
+  await registry.claim({ ...a, run: { ...a.run!, nonce: randomUUID() } });
+});
+
+test("concurrent same-project claims have exactly one winner, regardless of log directory", async (t) => {
+  const { registry, record } = fixture(t);
+  const results = await Promise.allSettled([
+    registry.claim(record("alpha", { project: "shared" })),
+    new RunnerRegistry(registry.root).claim(record("beta", { project: "shared" })),
+  ]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  const failure = results.find((r) => r.status === "rejected");
+  assert.ok(failure?.status === "rejected");
+  assert.match(String(failure.reason), /same project are not supported/);
+  assert.equal(registry.list().length, 1);
+});
+
+test("state protection covers ancestors, symlinks, hard-linked ledgers and cross-resource collisions", async (t) => {
+  const { dir, registry, record } = fixture(t);
+  const a = record("alpha");
+  mkdirSync(a.workspace, { recursive: true });
+  writeFileSync(join(a.workspace, ".symphony-ledger.json"), "{}");
+  await registry.claim(a);
+  for (const workspace of [a.workspace, join(a.workspace, "nested"), join(dir, "work")]) {
+    await assert.rejects(registry.claim(record("beta", { workspace })), /state path collision/);
+  }
+  symlinkSync(a.workspace, join(dir, "alias"));
+  await assert.rejects(registry.claim(record("beta", { workspace: join(dir, "alias", "not-created") })), /state path collision/);
+  await assert.rejects(registry.claim(record("beta", { directory: join(a.workspace, "logs") })), /state path collision/);
+  const beta = record("beta");
+  mkdirSync(beta.workspace, { recursive: true });
+  linkSync(join(a.workspace, ".symphony-ledger.json"), join(beta.workspace, ".symphony-ledger.json"));
+  await assert.rejects(registry.claim(beta), /state path collision/);
+  assert.equal(existsSync(beta.directory), false, "rejection must precede log creation");
+  assert.equal(pathsOverlap(join(dir, "work-a"), join(dir, "work-ab")), false);
+  await assert.rejects(registry.claim(record("gamma", { workspace: dir })), /shared registry/);
+  await assert.rejects(registry.claim(record("gamma", { workspace: join(dir, "logs") })), /must not overlap/);
+});
+
+test("existing log/ledger symlinks cannot overlap even within one runner", async (t) => {
+  const { dir, registry, record } = fixture(t);
+  const a = record("alpha");
+  mkdirSync(a.directory, { recursive: true });
+  mkdirSync(a.workspace, { recursive: true });
+  writeFileSync(join(a.directory, "orchestrator.log"), "");
+  symlinkSync(join(a.directory, "orchestrator.log"), join(a.workspace, ".symphony-ledger.json"));
+  await assert.rejects(registry.claim(a), /must not overlap/);
+  assert.equal(readFileSync(join(a.directory, "orchestrator.log"), "utf8"), "");
+  const b = record("beta");
+  mkdirSync(b.directory, { recursive: true });
+  writeFileSync(b.workflow, "prompt");
+  symlinkSync(b.workflow, join(b.directory, "orchestrator.log"));
+  await assert.rejects(registry.claim(b), /must not overlap/);
+  assert.equal(readFileSync(join(dir, "beta.md"), "utf8"), "prompt");
+});
+
+test("dangling symlinks reserve their eventual targets before state files exist", async (t) => {
+  const { dir, registry, record } = fixture(t);
+  const a = record("alpha"), b = record("beta");
+  mkdirSync(a.workspace, { recursive: true });
+  mkdirSync(b.directory, { recursive: true });
+  symlinkSync(join(a.workspace, ".symphony-ledger.json"), join(b.directory, "orchestrator.log"));
+  await registry.claim(a);
+  await assert.rejects(registry.claim(b), /state path collision/);
+  assert.equal(existsSync(join(a.workspace, ".symphony-ledger.json")), false);
+  symlinkSync(join(dir, "future-target"), join(dir, "future-alias"));
+  assert.equal(canonicalPath(join(dir, "future-alias", "child")), join(canonicalPath(dir), "future-target", "child"));
+});
+
+test("IDs bind canonical workflow paths; duplicate names and aliases cannot steal registrations", async (t) => {
+  const { dir, registry, record } = fixture(t);
+  const a = record("alpha");
+  writeFileSync(a.workflow, "workflow");
+  symlinkSync(a.workflow, join(dir, "alias.md"));
+  assert.equal(workflowId(a.workflow), workflowId(join(dir, "alias.md")));
+  assert.equal(validateId("Alpha"), "alpha");
+  assert.throws(() => validateId("../alpha"), /workflow ID/);
+  await registry.claim(a);
+  await assert.rejects(registry.claim(a), /already running/);
+  await assert.rejects(registry.claim(record("alpha", { workflow: join(dir, "other.md") })), /already belongs/);
+  await assert.rejects(registry.claim(record("alias", { workflow: canonicalPath(join(dir, "alias.md")) })), /registered as/);
+});
+
+test("dead process claims can restart, malformed registry is not silently overwritten", async (t) => {
+  const { registry, record } = fixture(t);
+  const a = record("alpha");
+  await registry.claim({ ...a, run: { ...a.run!, pid: 2147483647 } });
+  await registry.claim(a);
+  assert.equal(registry.list()[0]?.run?.pid, process.pid);
+  writeFileSync(registry.path, "not json");
+  await assert.rejects(registry.claim(record("beta")), /cannot read runner registry/);
+  assert.equal(readFileSync(registry.path, "utf8"), "not json");
+  assert.equal(existsSync(join(registry.root, "registry.lock")), false);
+});
+
+function config(dir: string, provider: Record<string, unknown> = {}) {
+  return makeConfig({
+    tracker: { kind: "github_project", provider: {
+      owner: "Me", project_number: 1, repo: "Me/App",
+      start_state: "Todo", working_state: "In Progress", blocked_state: "Blocked", ...provider,
+    } },
+    workspace: { root: join(dir, "work") },
+  });
+}
+
+test("project identity ignores repository filters, owner casing, default ports and endpoint suffixes", (t) => {
+  const { dir } = fixture(t);
+  const a = runnerIdentity(config(dir));
+  const b = runnerIdentity(config(dir, {
+    owner: "me", owner_type: "organization", repo: "Me/Other", project_number: "01",
+    endpoint: "https://API.GITHUB.COM:443/graphql/",
+  }));
+  assert.equal(a.project, b.project);
+  assert.equal(a.project, runnerIdentity(config(dir, { endpoint: "http://api.github.com/graphql" })).project);
+  assert.notEqual(a.scope, b.scope);
+  assert.notEqual(a.project, runnerIdentity(config(dir, { project_number: 2 })).project);
+  assert.notEqual(a.project, runnerIdentity(config(dir, { endpoint: "https://enterprise.example/api/graphql" })).project);
+});
+
+test("identity-changing reloads keep the old config, but prompt edits and recovery still work", (t) => {
+  const { dir } = fixture(t);
+  const path = join(dir, "WORKFLOW.md"), workspace = join(dir, "work");
+  const text = workflowText(workspace, 1);
+  writeFileSync(path, text);
+  let pinned: ReturnType<typeof runnerIdentity> | undefined;
+  const store = new WorkflowStore(path, quietLog, {}, (c) => { if (pinned) assertRunnerIdentity(pinned, c); });
+  pinned = runnerIdentity(store.workflow.config);
+  let time = 2_000_000_000;
+  const edit = (contents: string) => { writeFileSync(path, contents); utimesSync(path, ++time, time); return store.refresh(); };
+  for (const changed of [
+    workflowText(join(dir, "other"), 1), workflowText(workspace, 2),
+    text.replace("me/app-1", "me/other"), text.replace("owner: me", "owner: other"),
+  ]) {
+    assert.equal(edit(changed).definition.promptTemplate, "prompt-1");
+    assert.equal(store.workflow.config.workspace.root, workspace);
+    assert.match(store.reloadError!, /runner identity changed/);
+  }
+  assert.equal(edit(text.replace("prompt-1", "new prompt")).definition.promptTemplate, "new prompt");
+  assert.equal(store.reloadError, null);
+  store.close();
+});
+
+test("control targets a run nonce, never a possibly reused PID", async (t) => {
+  const { record } = fixture(t);
+  const a = record("alpha");
+  // Use a short socket path: macOS has a 104-byte Unix socket path limit.
+  a.run!.socket = join(tmpdir(), `sy-test-${randomUUID()}.sock`);
+  let stops = 0;
+  const server = await serveRunner(a.run!, () => stops ? "stopping" : "running", () => { stops++; });
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  await assert.rejects(requestRunner({ ...a, run: { ...a.run!, nonce: "old-run" } }, "stop"), /without a response/);
+  assert.equal(stops, 0);
+  assert.equal(await requestRunner(a, "status"), "running");
+  assert.equal(await requestRunner(a, "stop"), "stopping");
+  assert.equal(stops, 1);
+});
+
+test("independent stores, ledgers, trackers, prompts and worker shutdown remain isolated", async (t) => {
+  const { dir, cleanup } = fixture(t);
+  const instances = [1, 2].map((number) => {
+    const workspace = join(dir, `work-${number}`);
+    const path = join(dir, `${number}.md`);
+    writeFileSync(path, workflowText(workspace, number));
+    const store = new WorkflowStore(path, quietLog, {});
+    const ledger = new RunLedger(join(workspace, ".symphony-ledger.json"));
+    let issue = makeIssue({ nativeRef: { repository: `me/app-${number}`, issue_id: `issue-${number}` } });
+    let aborted = false;
+    let prompt: string | undefined;
+    const orchestrator = new Orchestrator({
+      log: quietLog, ledger, refreshWorkflow: () => store.refresh(), workflowError: () => store.reloadError,
+      createTracker: () => ({
+        kind: "github_project", agentTools: () => [], secretEnvironmentNames: () => [],
+        fetchIssuesByStates: async (states) => states.includes(issue.state) ? [issue] : [],
+        fetchIssuesByIds: async () => [issue],
+        moveIssue: async (_i, state) => { issue = { ...issue, state }; },
+      }),
+      removeWorkspace: async () => {},
+      runWorker: async (p) => {
+        prompt = p.workflow.definition.promptTemplate;
+        assert.equal(p.workflow.config.tracker.provider.repo, `me/app-${number}`);
+        mkdirSync(p.workflow.config.workspace.root, { recursive: true });
+        writeFileSync(join(p.workflow.config.workspace.root, "worker"), prompt);
+        await p.control.onSessionCreated(`session-${number}`);
+        await new Promise<void>((resolve) => p.signal.addEventListener("abort", () => { aborted = true; resolve(); }, { once: true }));
+      },
+    });
+    cleanup.push(async () => { await orchestrator.stop(); store.close(); });
+    return { orchestrator, ledger, workspace, prompt: () => prompt, aborted: () => aborted };
+  });
+  const [a, b] = instances;
+  await Promise.all(instances.map((i) => i.orchestrator.tick()));
+  assert.equal(a!.prompt(), "prompt-1");
+  assert.equal(b!.prompt(), "prompt-2");
+  assert.equal(a!.ledger.records()[0]?.sessions, 1);
+  assert.equal(b!.ledger.records()[0]?.sessions, 1);
+  assert.notEqual(a!.ledger.records()[0]?.key, b!.ledger.records()[0]?.key);
+  await a!.orchestrator.stop();
+  assert.equal(a!.aborted(), true);
+  assert.equal(b!.aborted(), false);
+  assert.equal(b!.orchestrator.snapshot().counts.running, 1);
+  assert.equal(readFileSync(join(b!.workspace, "worker"), "utf8"), "prompt-2");
+});
+
+test("shutdown waits for an in-flight tracker operation before releasing runner ownership", async (t) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let entered!: () => void;
+  const fetching = new Promise<void>((resolve) => { entered = resolve; });
+  const workflow = { definition: { config: {}, promptTemplate: "" }, config: makeConfig(), loadedAt: new Date() };
+  const orchestrator = new Orchestrator({
+    log: quietLog, refreshWorkflow: () => workflow, workflowError: () => null,
+    createTracker: () => ({
+      kind: "fake", agentTools: () => [], secretEnvironmentNames: () => [],
+      fetchIssuesByStates: async () => { entered(); await gate; return []; },
+      fetchIssuesByIds: async () => [],
+    }),
+    runWorker: async () => assert.fail("stopping runner must not dispatch"),
+    removeWorkspace: async () => {},
+  });
+  t.after(async () => { release(); await orchestrator.stop(); });
+  const poll = orchestrator.tick();
+  await fetching;
+  let stopped = false;
+  const stop = orchestrator.stop().then(() => { stopped = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  release();
+  await Promise.all([poll, stop]);
+  assert.equal(stopped, true);
+});
