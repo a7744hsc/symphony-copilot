@@ -116,7 +116,7 @@
       "description": "An independent reviewer agent that checks every submission in its own session and workspace before a person sees it.",
       "properties": {
         "states": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Columns worked by the reviewer; also listed in tracker.active_states. Make one of them tracker.provider.handoff_state." },
-        "prompt_file": { "type": "string", "description": "Reviewer prompt, a Liquid template relative to WORKFLOW.md. Variables: issue, attempt, review_round (sequence only, not a cap), implementer_workspace." },
+        "prompt_file": { "type": "string", "description": "Reviewer prompt, a Liquid template relative to WORKFLOW.md. Reserved as a workflow input: must not overlap writable state or another runner's resources. Contents are reread for each reviewer session; changing the path or enabling/disabling review requires a runner restart. Variables: issue, attempt, review_round (sequence only, not a cap), implementer_workspace." },
         "model": { "type": "string", "description": "Ideally a different model family from the implementer." },
         "reasoning_effort": { "enum": ["low", "medium", "high", "xhigh", "max"] },
         "pass_state": { "type": "string", "description": "Column for approved work, a human waiting column such as Human Review; not active, blocked or terminal." },
