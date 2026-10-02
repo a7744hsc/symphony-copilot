@@ -143,10 +143,13 @@ test("offline language validation agrees with runtime validation", () => {
   }
 });
 
-test("the example workflow has no errors", () => {
-  const result = checkWorkflow(join(import.meta.dirname, "../examples/WORKFLOW.md"), {});
-  assert.deepEqual(result.findings.filter((f) => f.level === "error"), []);
-});
+for (const [folder, language] of [["", "zh-CN"], ["examples", "en"]] as const) {
+  test(`the ${folder || "repository"} workflow has no errors and uses ${language}`, () => {
+    const result = checkWorkflow(join(import.meta.dirname, "..", folder, "WORKFLOW.md"), {});
+    assert.deepEqual(result.findings.filter((f) => f.level === "error"), []);
+    assert.equal(result.config?.language, language);
+  });
+}
 
 test("misspelled keys are errors with a suggestion", () => {
   const path = workflowFile(`${base}\nagent:\n  max_turn: 3\n  colour: red\n`.replace("project_number: 1", "project_nubmer: 1"));

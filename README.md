@@ -94,6 +94,8 @@ State ownership is an onboarding working agreement, not a GitHub permission lock
 
 `/symphony-onboard` explicitly asks you to choose English (`en`) or Simplified Chinese (`zh-CN`), even with the recommended setup, and writes top-level `language` in `WORKFLOW.md`. Cards, plans, issue/PR handoffs and reviews use that choice, not the conversation language. Generated WORKFLOW and REVIEW prompts remain English in both modes; column names, new AGENTS prose and the optional issue form may be localized.
 
+This repository's own [WORKFLOW.md](WORKFLOW.md) selects `language: zh-CN`, and its [task issue form](.github/ISSUE_TEMPLATE/agent-task.yml) uses Chinese. Its WORKFLOW and REVIEW prompts remain English, and existing board column names are unchanged. The reusable [example workflow](examples/WORKFLOW.md) stays `en`; choose your own language during onboarding.
+
 GitHub Project workflows are separate from `WORKFLOW.md` and may change card statuses automatically. `setup-board` cannot configure or enable them because GitHub's public API does not expose workflow configuration; you do not need to change them during onboarding. If a card changes status unexpectedly or skips a Symphony stage, inspect the enabled workflows on the project's **Workflows** page; one may be responsible.
 
 **3. Run it.**

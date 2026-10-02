@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { parseDocument } from "yaml";
 import { buildConfig } from "../src/config.ts";
-import { renderIssuePrompt, renderTemplate } from "../src/template.ts";
+import { composeAgentPrompt, renderIssuePrompt, renderTemplate } from "../src/template.ts";
 import { issueForTemplate } from "../src/types.ts";
 import { loadWorkflow } from "../src/workflow.ts";
 import { makeConfig, makeIssue } from "./helpers.ts";
@@ -12,6 +13,26 @@ const root = join(import.meta.dirname, "..");
 const issue = makeIssue({ description: "Maintain resource isolation." });
 
 for (const folder of ["", "examples"]) {
+  test(`${folder || "repository"} selects its output language without translating prompt sources`, () => {
+    const path = join(root, folder, "WORKFLOW.md");
+    const workflow = loadWorkflow(path);
+    const config = buildConfig(workflow.config, path, {});
+    const language = folder === "examples" ? "en" : "zh-CN";
+    assert.equal(workflow.config.language, language, "the language must be explicitly configured");
+    assert.equal(config.language, language);
+    assert.ok(config.review);
+    const templates = {
+      implement: workflow.promptTemplate,
+      review: readFileSync(config.review.promptFile, "utf8"),
+    };
+    for (const role of ["implement", "review"] as const) {
+      assert.doesNotMatch(templates[role], /\p{Script=Han}/u);
+      const prompt = composeAgentPrompt(templates[role], role, true, config.language);
+      assert.match(prompt, language === "en" ? /The workflow language is English \(en\)/ : /The workflow language is Simplified Chinese \(zh-CN\)/);
+      assert.ok(prompt.endsWith(templates[role]));
+    }
+  });
+
   test(`${folder || "repository"} implementation and review prompts preserve proactive verification and complete feedback`, () => {
     const workflow = loadWorkflow(join(root, folder, "WORKFLOW.md"));
     const implementation = renderIssuePrompt(workflow.promptTemplate, issue, 1);
@@ -84,6 +105,36 @@ for (const folder of ["", "examples"]) {
     assert.deepEqual(config.tracker.provider.agent_states, ["In Progress", "Blocked"]);
   });
 }
+
+test("the repository issue form uses Chinese without changing its protocol or dispatch behavior", () => {
+  const form = parseDocument(readFileSync(join(root, ".github/ISSUE_TEMPLATE/agent-task.yml"), "utf8"));
+  assert.deepEqual(form.errors, []);
+  assert.equal(form.get("name"), "Agent 任务");
+  assert.equal(form.has("labels"), false);
+  assert.equal(form.has("projects"), false);
+  const sections = [
+    ["goal", "目标", true],
+    ["acceptance", "验收标准", true],
+    ["verify", "验证方式", true],
+    ["out-of-scope", "范围之外", undefined],
+    ["notes", "备注", undefined],
+  ] as const;
+  for (const [index, [id, label, required]] of sections.entries()) {
+    assert.equal(form.getIn(["body", index, "type"]), "textarea");
+    assert.equal(form.getIn(["body", index, "id"]), id);
+    assert.equal(form.getIn(["body", index, "attributes", "label"]), label);
+    assert.equal(form.getIn(["body", index, "validations", "required"]), required);
+  }
+  assert.equal(form.getIn(["body", sections.length]), undefined);
+  assert.equal(form.getIn(["body", 1, "attributes", "value"]), "- [ ]\n");
+  for (const path of [["description"], ...sections.map((_, index) => ["body", index, "attributes", "description"])]) {
+    const description = form.getIn(path);
+    assert.ok(typeof description === "string");
+    assert.match(description, /\p{Script=Han}/u);
+  }
+  const example = readFileSync(join(root, "examples/ISSUE_TEMPLATE/agent-task.yml"), "utf8");
+  assert.doesNotMatch(example, /\p{Script=Han}/u);
+});
 
 test("default continuation prompts do not fall back to example-only repairs or first-defect review", () => {
   const config = makeConfig({

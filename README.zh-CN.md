@@ -96,6 +96,8 @@ symphony setup-board      # 按 WORKFLOW.md 新建看板，并把看板编号写
 
 `/symphony-onboard` 会明确请你选择 English（`en`）或简体中文（`zh-CN`），即使采用推荐配置也必须选择，然后写入 `WORKFLOW.md` 顶层的 `language`。卡片、计划、Issue／PR 交接与审核按此配置输出，不按聊天语言推断。两种模式生成的 WORKFLOW 正文和 REVIEW 提示词都保持英文；列名、新增 AGENTS 说明和可选 Issue 表单可以本地化。
 
+本仓库自用的 [WORKFLOW.md](WORKFLOW.md) 已选择 `language: zh-CN`，[任务 Issue 表单](.github/ISSUE_TEMPLATE/agent-task.yml) 也使用中文。WORKFLOW 正文和 REVIEW 提示词仍保持英文，现有看板列名不变。供其他仓库复用的[示例工作流](examples/WORKFLOW.md) 保持 `en`；接入时请选择自己的输出语言。
+
 GitHub Project workflows（项目工作流）独立于 `WORKFLOW.md`，也可能自动改变卡片状态。由于 GitHub 没有公开 API 可供 `setup-board` 配置或启用这些 workflow，上手时不需要修改它们。如果卡片状态意外变化或跳过了 Symphony 阶段，可以到项目网页的 **Workflows** 页面检查已启用的 workflow；它可能是原因之一。
 
 **3. 运行。**

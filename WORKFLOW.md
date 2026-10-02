@@ -1,5 +1,6 @@
 ---
 # symphony-copilot reads this file on every poll, so edits apply without a restart.
+language: zh-CN
 tracker:
   kind: github_project
   provider:
