@@ -96,6 +96,8 @@ symphony check            # ./WORKFLOW.md; or: symphony check path/to/WORKFLOW.m
 
 It reports misspelled keys, invalid values, columns that would send a card in circles, and prompts that use unknown variables ([all checks](reference.md#checking-a-workflow)). Leave `project_number` empty for now; the next step fills it in.
 
+上述 CLI 步骤面向人在 onboarding 时使用，不代表无人值守 agent 获得了执行权限。维护 symphony-copilot 本仓库时，实现者和审查者应按 [AGENTS.md](../AGENTS.md) 运行已允许的 `npm test`，其中包含根 workflow 和示例的同一离线 checker；不必扩大 shell allowlist。此等价步骤不覆盖在线检查，也不表示其他仓库的 `npm test` 自动包含 workflow 检查。详见[检查范围](reference.md#checking-a-workflow)。
+
 Commit and push the files. Agents work in fresh clones, so they only see what is on the default branch.
 
 ### Columns

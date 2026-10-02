@@ -27,8 +27,12 @@ npm test
 | What changed | Run at least |
 |---|---|
 | TypeScript source, tests, workflow schema, or runtime behavior | `npm run typecheck` and `npm test` |
-| `WORKFLOW.md` or onboarding examples | `bin/symphony check WORKFLOW.md` |
+| `WORKFLOW.md` or onboarding examples | `npm test` (includes offline workflow checks) |
 | Documentation only | Check links and commands against the current code; no automated command is required |
+
+For this repository's implementers and reviewers, `npm test` is the required equivalent of offline `symphony check`: `test/check.test.ts` calls the same `checkWorkflow` function for both `WORKFLOW.md` and `examples/WORKFLOW.md`, including their prompt templates, without a token or network access. The root workflow must have no findings; the example may only warn about its unset `project_number`. This does not verify the CLI wrapper or the live board. Other workflow files need explicit test coverage; do not assume `npm test` checks arbitrary paths.
+
+Direct `symphony`/`bin/symphony` commands are not allowlisted for unattended agents. Do not add them or broad interpreter permissions just to run this check. Human onboarding can still use the CLI as described in [docs/onboarding.md](docs/onboarding.md).
 
 Agents may only run commands listed in `copilot.shell_allow` in WORKFLOW.md; keep that list and this section in step.
 
