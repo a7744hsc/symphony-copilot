@@ -244,6 +244,8 @@ After rendering, the runner prepends its role-specific [autonomous protocol](#im
 
 `symphony check [WORKFLOW.md]` runs without network access and exits with 1 if it finds an error.
 
+**本仓库的无人值守验证**：实现者和审查者按 [AGENTS.md](../AGENTS.md) 运行已获准的 `npm test`，作为离线配置及模板检查的等价步骤。[test/check.test.ts](../test/check.test.ts) 使用与 CLI 相同的 `checkWorkflow`，在不提供 token 的情况下检查根 `WORKFLOW.md` 和 `examples/WORKFLOW.md`（包括引用的提示词）；根文件不得有任何 findings，示例仅允许未填 `project_number` 的预期警告。这不验证 CLI 包装器或真实看板，也不自动覆盖其他路径或其他仓库。无需为此把 `symphony`、`bin/symphony` 或通用解释器加入允许列表；命令前缀规则也不能保证只允许离线调用，因为可以追加 `--online`。下面的 CLI 用法仍适用于人在 onboarding 时执行检查。
+
 | Check | Level |
 |---|---|
 | The file parses, and every key is in [the schema](../schema/workflow.schema.json); a misspelled key gets a suggestion | Error |

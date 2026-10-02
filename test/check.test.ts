@@ -144,10 +144,14 @@ test("offline language validation agrees with runtime validation", () => {
 });
 
 for (const [folder, language] of [["", "zh-CN"], ["examples", "en"]] as const) {
-  test(`the ${folder || "repository"} workflow has no errors and uses ${language}`, () => {
+  test(`the ${folder || "repository"} workflow passes offline checks with only expected findings and uses ${language}`, () => {
     const result = checkWorkflow(join(import.meta.dirname, "..", folder, "WORKFLOW.md"), {});
-    assert.deepEqual(result.findings.filter((f) => f.level === "error"), []);
+    assert.deepEqual(result.findings, folder === "examples" ? [{
+      level: "warning",
+      message: "tracker.provider.project_number is not set: `symphony setup-board` creates the board and fills it in",
+    }] : []);
     assert.equal(result.config?.language, language);
+    assert.equal(result.tokenAvailable, false);
   });
 }
 

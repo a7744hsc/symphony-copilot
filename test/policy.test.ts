@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { PermissionRequest } from "@github/copilot-sdk";
-import { DEFAULT_SHELL_ALLOW, DEFAULT_SHELL_DENY } from "../src/config.ts";
+import { buildConfig, DEFAULT_SHELL_ALLOW, DEFAULT_SHELL_DENY } from "../src/config.ts";
 import { decide, ruleMatches, type PolicyOptions } from "../src/policy.ts";
+import { loadWorkflow } from "../src/workflow.ts";
 
 const ws = mkdtempSync(join(tmpdir(), "policy-ws-"));
 mkdirSync(join(ws, "src"));
@@ -59,6 +60,41 @@ test("allowed build and test commands run", () => {
   assert.equal(kind(shell("xcodebuild test -scheme App -derivedDataPath work/DD")), "approve-once");
   assert.equal(kind(shell("git add -A && git commit -m 'x'")), "approve-once");
   assert.equal(kind(shell("xcrun simctl list devices")), "approve-once");
+});
+
+test("repository verification instructions stay within the workflow's shell permissions", () => {
+  const path = join(import.meta.dirname, "..", "WORKFLOW.md");
+  const { copilot } = buildConfig(loadWorkflow(path).config, path, {});
+  const policy: PolicyOptions = {
+    workspace: ws,
+    shellAllow: copilot.shellAllow,
+    shellDeny: copilot.shellDeny,
+    readAllow: copilot.readAllow,
+    urlAllow: copilot.urlAllow,
+  };
+  const instructions = readFileSync(new URL("../AGENTS.md", import.meta.url), "utf8");
+  const table = instructions.match(/^\| What changed \| Run at least \|\n((?:\|.*\n)+)/m)?.[1];
+  assert.ok(table, "AGENTS.md must document the required verification commands");
+  const commands = table.split("\n").flatMap((row) =>
+    [...(row.split("|")[2] ?? "").matchAll(/`([^`]+)`/g)].map((match) => match[1]!));
+  assert.ok(commands.length > 0, "the verification table must contain commands");
+  for (const command of commands) {
+    const result = decide(shell(command), policy);
+    assert.equal(result.kind, "approve-once", `${command}: ${JSON.stringify(result)}`);
+  }
+
+  for (const executable of ["symphony", "bin/symphony", "./bin/symphony"]) {
+    for (const args of ["check WORKFLOW.md", "check WORKFLOW.md --online", "start", "stop", "setup-board WORKFLOW.md", "install-skills"]) {
+      const command = `${executable} ${args}`;
+      assert.equal(decide(shell(command), policy).kind, "reject", command);
+    }
+  }
+  for (const command of [
+    "node src/tools.ts check WORKFLOW.md", "bash bin/symphony check WORKFLOW.md", "sh bin/symphony check WORKFLOW.md",
+    "npm run start", "npm install", "git push origin HEAD", "gh auth token", "curl https://example.test",
+  ]) {
+    assert.equal(decide(shell(command), policy).kind, "reject", command);
+  }
 });
 
 test("pushing, gh, network tools and unlisted programs are rejected", () => {
