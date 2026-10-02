@@ -94,6 +94,10 @@ symphony setup-board      # 按 WORKFLOW.md 新建看板，并把看板编号写
 
 状态归属是接入时的工作约定，不是 GitHub 权限锁。人工只从等待列（Human Review／Blocked）移回 Todo 重新授权；其他看板自动化不得替人把已有卡片送回 Todo。
 
+`/symphony-onboard` 会明确请你选择 English（`en`）或简体中文（`zh-CN`），即使采用推荐配置也必须选择，然后写入 `WORKFLOW.md` 顶层的 `language`。卡片、计划、Issue／PR 交接与审核按此配置输出，不按聊天语言推断。两种模式生成的 WORKFLOW 正文和 REVIEW 提示词都保持英文；列名、新增 AGENTS 说明和可选 Issue 表单可以本地化。
+
+本仓库自用的 [WORKFLOW.md](WORKFLOW.md) 已选择 `language: zh-CN`，[任务 Issue 表单](.github/ISSUE_TEMPLATE/agent-task.yml) 也使用中文。WORKFLOW 正文和 REVIEW 提示词仍保持英文，现有看板列名不变。供其他仓库复用的[示例工作流](examples/WORKFLOW.md) 保持 `en`；接入时请选择自己的输出语言。
+
 GitHub Project workflows（项目工作流）独立于 `WORKFLOW.md`，也可能自动改变卡片状态。由于 GitHub 没有公开 API 可供 `setup-board` 配置或启用这些 workflow，上手时不需要修改它们。如果卡片状态意外变化或跳过了 Symphony 阶段，可以到项目网页的 **Workflows** 页面检查已启用的 workflow；它可能是原因之一。
 
 **3. 运行。**
@@ -152,11 +156,12 @@ symphony run --id app            # 改为前台运行（先停止后台实例）
 
 `WORKFLOW.md` 由 YAML front matter 和一个 [Liquid](https://liquidjs.com/) 提示词模板组成；未知的变量和过滤器都会报错。保存了无效的文件时，调度器记录错误，继续用上一份有效配置。所有键的说明在 [schema/workflow.schema.json](schema/workflow.schema.json)；`symphony check` 按它和 [docs/reference.md](docs/reference.md#checking-a-workflow) 里的规则检查文件。
 
-规范里的键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都不变，另外多了三个：
+规范里的键（`tracker`、`polling`、`workspace`、`hooks`、`agent`）含义和默认值都不变，扩展项包括：
 
+- `language`：`en`（英文）或 `zh-CN`（简体中文）。旧工作流省略时默认为 `en`，其他值（包括 `null`）均报错。它决定新增的面向用户输出，不翻译已有内容。运行中的会话保持原语言；有效修改用于后续会话，已接受的交接在发布重试／重启后仍保留原语言。覆盖范围与限制见[输出语言](docs/reference.md#output-language)（英文）。
 - `agent.continuation_prompt`：之后每一轮开头发送的消息，可用变量 `issue`、`turn`、`max_turns`。
 - `agent.max_sessions`：见[运行上限](#运行上限)。
-- `agent.usage_comments`（默认 `true`）：尽力在本次 Issue 结果消息末尾补一行，不另发纯用量评论：`用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx`。显示本会话 AI credits、已启动会话序号／上限和实际模型（可多个），不是配置中的 `auto` 或累计费用。指标缺失、更新失败时可以没有尾行，不做持久化补写队列。详细指标仍记入 `session summary` 日志；关闭尾行不影响必要的失败说明。
+- `agent.usage_comments`（默认 `true`）：尽力按本会话选定的语言在 Issue 结果消息末尾补一行，不另发纯用量评论。`zh-CN` 示例：`用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx`。显示本会话 AI credits、已启动会话序号／上限和实际模型（可多个），不是配置中的 `auto` 或累计费用。指标缺失、更新失败时可以没有尾行，不做持久化补写队列。详细指标仍记入 `session summary` 日志；关闭尾行不影响必要的失败说明。
 
 `copilot` 块是本实现特有的：
 
@@ -167,13 +172,15 @@ symphony run --id app            # 改为前台运行（先停止后台实例）
 | `shell_deny` | 内置列表 | 在内置列表之外额外禁止的命令；禁止优先 |
 | `read_allow` | 无 | 工作区之外允许 agent 读取的目录 |
 | `url_allow` | 无 | 允许 agent 访问的 URL 前缀 |
-| `user_input_reply` | 英文 | agent 提问时的自动回答 |
+| `user_input_reply` | 英文指令 | agent 提问时的自动回答；运行时同时追加选定输出语言的指令 |
 | `cli_path` | SDK 自带的运行时 | 指定 Copilot CLI 可执行文件 |
 | `startup_timeout_ms` | 60000 | 启动运行时、创建会话的超时 |
 | `turn_timeout_ms` | 3600000 | 一轮内两次会话事件之间的最长静默 |
 | `stall_timeout_ms` | 300000 | agent 静默超过这个时长，调度器就重启它；`<= 0` 关闭 |
 
 hook 用 `bash -lc` 在工作区里执行，环境变量里去掉了 tracker 令牌，并加上 `SYMPHONY_ISSUE_ID`、`SYMPHONY_ISSUE_IDENTIFIER`、`SYMPHONY_ISSUE_BRANCH`、`SYMPHONY_WORKSPACE`、`SYMPHONY_WORKSPACE_KEY`、`SYMPHONY_ROLE`（`implement` 或 `review`），审核者还有 `SYMPHONY_IMPLEMENTER_WORKSPACE`。
+
+技术日志、CLI 诊断和接入仓库前的安装向导仍使用英文。agent 通过运行时指令按所选语言写作，不使用机器翻译；标识符、工具／YAML 协议、原始诊断和 GitHub 的 `Closes` 关键字保持不变。
 
 GitHub Project 适配器的设置、agent 工具、错误分类，以及规范如何对应到 Copilot SDK，见 [docs/reference.md](docs/reference.md)（英文）。
 

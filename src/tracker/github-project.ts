@@ -5,6 +5,7 @@ import { resolveEnvRef } from "../config.ts";
 import { ExecError, run } from "../exec.ts";
 import { IMPLEMENTATION_HEAD_CHECK_LIMIT, IMPLEMENTATION_HEAD_RETRY_MS, validateReviewResult, type IssueMessageRef, type PendingHandoff } from "../iteration.ts";
 import { truncate, type Logger } from "../log.ts";
+import { localize, type Language } from "../language.ts";
 import { isInside } from "../policy.ts";
 import { normalizeState, type BlockerRef, type Issue } from "../types.ts";
 import { graphqlRequest, restRequest, type FetchLike, type GitHubApi } from "./github-api.ts";
@@ -303,15 +304,29 @@ const invocationMarker = (id: string) => `<!-- symphony-invocation:${id} -->`;
 const usageBlock = (id: string, footer = "") => `<!-- symphony-usage:${id}:start -->\n${footer ? `${footer}\n` : ""}<!-- symphony-usage:${id}:end -->`;
 const statusBlock = (p: PendingHandoff, text: string) => `<!-- symphony-handoff:${p.id}:start -->\n${text}\n<!-- symphony-handoff:${p.id}:end -->`;
 function resultBody(p: PendingHandoff): string {
+  const language = p.language ?? "en";
+  const l = (en: string, zh: string) => localize(language, en, zh);
   const r = p.result;
   const details = r.kind === "review" ? [
-    `**AI review · ${r.verdict}**`, `Reviewed HEAD: ${r.reviewedHead ?? "unavailable (no quality verdict)"}`,
-    r.summary, `**Progress: ${r.progress}**\n\n${r.progressReason}`,
-    r.nextAction ? `**Next action: ${r.nextAction}**\n\n${r.nextStep}` : "",
-    r.blockingIssues.length ? `**Blocking issues**\n\n${r.blockingIssues.map((b, i) => `${i + 1}. ${b}`).join("\n")}` : "",
-  ] : r.kind === "implement" ? [`**Implementation handoff: ${r.title}**`, `HEAD: ${r.head}`, r.summary] : ["**Blocked**", r.summary];
-  return [...details, p.haltReason ? `**Stop reason: ${p.haltReason}**${p.haltReason === "session_limit_unreviewed" ? " — latest implementation has not been reviewed." : ""}` : "",
+    `**${l("AI review", "AI 审查")} · ${resultLabel(language, r.verdict)}**`,
+    `${l("Reviewed HEAD", "已审查 HEAD")}: ${r.reviewedHead ?? l("unavailable (no quality verdict)", "无法获取（未作质量判定）")}`,
+    r.summary, `**${l("Progress", "进展")}: ${resultLabel(language, r.progress)}**\n\n${r.progressReason}`,
+    r.nextAction ? `**${l("Next action", "下一步行动")}: ${resultLabel(language, r.nextAction)}**\n\n${r.nextStep}` : "",
+    r.blockingIssues.length ? `**${l("Blocking issues", "阻塞问题")}**\n\n${r.blockingIssues.map((b, i) => `${i + 1}. ${b}`).join("\n")}` : "",
+  ] : r.kind === "implement" ? [`**${l("Implementation handoff", "实现交接")}: ${r.title}**`, `HEAD: ${r.head}`, r.summary] : [`**${l("Blocked", "已阻塞")}**`, r.summary];
+  return [...details, p.haltReason ? `**${l("Stop reason", "停止原因")}: ${resultLabel(language, p.haltReason)}**${p.haltReason === "session_limit_unreviewed" ? l(" — latest implementation has not been reviewed.", " — 最新实现尚未经过审查。") : ""}` : "",
     resultMarker(p), invocationMarker(p.invocationId)].filter(Boolean).join("\n\n");
+}
+
+function resultLabel(language: Language, code: string): string {
+  const labels: Record<string, string> = {
+    approve: "通过", request_changes: "需要修改", unable_to_verify: "无法验证",
+    initial: "首次审查", made_progress: "有进展", no_progress: "无进展",
+    not_assessed: "未评估", continue: "继续", human_required: "需要人工处理",
+    session_limit: "会话额度已用尽", session_limit_unreviewed: "会话额度已用尽且实现尚未审查",
+    head_mismatch: "提交与 PR 的 HEAD 不一致",
+  };
+  return language === "zh-CN" && labels[code] ? `${labels[code]} (${code})` : code;
 }
 
 interface OpenPullRequest { id: string; number: number; url: string; headRefOid: string; body: string }
@@ -335,15 +350,18 @@ export class GitHubProjectTracker implements TrackerAdapter {
   private readonly log: Logger;
   private readonly fetchImpl: FetchLike;
   private readonly publicationEligible: (issue: Issue) => boolean;
+  private readonly language: Language;
   private meta: Promise<ProjectMeta> | null = null;
   private repoMeta: Promise<{ id: string; defaultBranch: string }> | null = null;
 
   constructor(provider: Record<string, unknown>, env: NodeJS.ProcessEnv, log: Logger, fetchImpl: FetchLike = fetch,
-    publicationEligible: (issue: Issue) => boolean = (issue) => issue.dispatchable) {
+    publicationEligible: (issue: Issue) => boolean = (issue) => issue.dispatchable,
+    language: Language = "en") {
     this.settings = parseSettings(provider, env);
     this.log = log;
     this.fetchImpl = fetchImpl;
     this.publicationEligible = publicationEligible;
+    this.language = language;
   }
 
   secretEnvironmentNames(): string[] {
@@ -621,7 +639,9 @@ export class GitHubProjectTracker implements TrackerAdapter {
     }
     const source = context.issue.nativeRef?.issue_number;
     const role = context.review ? "reviewer" : "implementer";
-    const body = `${args.body.trim()}\n\n---\n_Filed by symphony-copilot's ${role} while working on #${source}._`;
+    const attribution = localize(this.language, `Filed by symphony-copilot's ${role} while working on #${source}.`,
+      `由 symphony-copilot 的${context.review ? "审查" : "实现"} agent 在处理 #${source} 时创建。`);
+    const body = `${args.body.trim()}\n\n---\n_${attribution}_`;
     context.control?.assertActive();
     const created: any = await this.graphql(
       `mutation($repo: ID!, $title: String!, $body: String!, $labels: [ID!]) { createIssue(input: { repositoryId: $repo, title: $title, body: $body, labelIds: $labels }) { issue { id number url } } }`,
@@ -675,7 +695,7 @@ export class GitHubProjectTracker implements TrackerAdapter {
       return `${summary}\n\n${images}`;
     } catch (error) {
       context.log.warn("attachment upload failed", { error: (error as Error).message });
-      return `${summary}\n\n_Screenshots could not be attached: ${truncate((error as Error).message, 300)}_`;
+      return `${summary}\n\n_${localize(this.language, "Screenshots could not be attached", "无法附加截图")}: ${truncate((error as Error).message, 300)}_`;
     }
   }
 
@@ -859,7 +879,10 @@ export class GitHubProjectTracker implements TrackerAdapter {
   }
 
   private issueResultBody(p: PendingHandoff): string {
-    return `${resultBody(p)}\n\n${statusBlock(p, p.stale ? "Stale result: source evidence only; no target state or progress applied." : `Publication pending; target: ${p.targetState}. This is not yet a completed handoff.`)}\n\n${usageBlock(p.invocationId)}`;
+    const text = p.stale
+      ? localize(p.language ?? "en", "Stale result: source evidence only; no target state or progress applied.", "结果已过期：仅保留原始证据，未应用目标状态或进展。")
+      : localize(p.language ?? "en", `Publication pending; target: ${p.targetState}. This is not yet a completed handoff.`, `正在发布；目标状态：${p.targetState}。交接尚未完成。`);
+    return `${resultBody(p)}\n\n${statusBlock(p, text)}\n\n${usageBlock(p.invocationId)}`;
   }
 
   private async handoffIssue(issue: Issue, p: PendingHandoff): Promise<Issue | null> {
@@ -915,10 +938,12 @@ export class GitHubProjectTracker implements TrackerAdapter {
     const current = await this.ensureIssueResult(issue, p, checkpoint, assertActive);
     if (!current) return false;
     const start = `<!-- symphony-handoff:${p.id}:start -->`, end = `<!-- symphony-handoff:${p.id}:end -->`;
+    const l = (en: string, zh: string) => localize(p.language ?? "en", en, zh);
     const text = p.haltReason === "head_mismatch" && p.result.kind === "implement" && p.headMismatch
-      ? `Handoff blocked: ${p.targetState}. Stop reason: head_mismatch after ${p.headMismatch.attempts} host checks; expected HEAD: ${p.result.head}; actual PR HEAD: ${p.headMismatch.actualHead}. Latest implementation has not been reviewed. Check the branch/PR, then return the card to "${this.settings.startState}" to reauthorize.`
-      : p.stale ? "Stale result: source evidence only; no target state or progress applied."
-      : `Handoff completed: ${p.targetState}.${p.pr ? ` [PR #${p.pr.number}](${p.pr.url})` : ""}`;
+      ? l(`Handoff blocked: ${p.targetState}. Stop reason: head_mismatch after ${p.headMismatch.attempts} host checks; expected HEAD: ${p.result.head}; actual PR HEAD: ${p.headMismatch.actualHead}. Latest implementation has not been reviewed. Check the branch/PR, then return the card to "${this.settings.startState}" to reauthorize.`,
+        `交接已阻塞：${p.targetState}。停止原因：${p.headMismatch.attempts} 次系统检查后 HEAD 仍不一致 (head_mismatch)；预期 HEAD：${p.result.head}；实际 PR HEAD：${p.headMismatch.actualHead}。最新实现尚未经过审查。请检查分支／PR，再将卡片移至 "${this.settings.startState}" 以重新授权。`)
+      : p.stale ? l("Stale result: source evidence only; no target state or progress applied.", "结果已过期：仅保留原始证据，未应用目标状态或进展。")
+      : `${l(`Handoff completed: ${p.targetState}.`, `交接已完成：${p.targetState}。`)}${p.pr ? ` [PR #${p.pr.number}](${p.pr.url})` : ""}`;
     const body = replaceMarkedBlock(current.body, start, end, statusBlock(p, text));
     if (body === null) throw new TrackerError("tracker_response", "canonical issue result has no unambiguous host status block");
     if (body === current.body) return true;

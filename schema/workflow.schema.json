@@ -7,6 +7,7 @@
   "additionalProperties": false,
   "required": ["tracker"],
   "properties": {
+    "language": { "enum": ["en", "zh-CN"], "default": "en", "description": "Language of agent output and Symphony issue/PR messages. Onboarding explicitly asks for English or Simplified Chinese. Prompt templates remain English. Omitted in older workflows means en. Reload applies to new sessions; accepted handoffs retain their saved language through publication recovery. Identifiers, configured states, protocol values and raw diagnostics are preserved." },
     "tracker": {
       "type": "object",
       "additionalProperties": false,

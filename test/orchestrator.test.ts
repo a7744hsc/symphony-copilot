@@ -131,7 +131,7 @@ function setup(t: TestContext, raw: Record<string, any> = {}, dryRun = false, le
     await flush();
   };
   const ids = () => calls.map((c) => c.params.issue.id);
-  return { orchestrator, tracker, calls, removed, removedIssues, lines, tick, advance, ids, ledger, config };
+  return { orchestrator, tracker, calls, removed, removedIssues, lines, tick, advance, ids, ledger, config, workflow };
 }
 
 function authorize(ledger: RunLedger, card: Issue, limit = 20) {
@@ -146,6 +146,7 @@ async function submit(s: ReturnType<typeof setup>, index: number, result: AgentR
   control.finish(outcome.stale);
   call.resolve();
   await flush();
+  return pending;
 }
 
 const implementation: AgentResult = { kind: "implement", title: "Implementation", summary: "Complete evidence", head: "abc" };
@@ -559,7 +560,7 @@ test("final metrics edit only the owned issue result footer, with detailed metri
   await submit(s, 0, implementation);
   assert.deepEqual(s.tracker.comments, []);
   assert.equal(s.tracker.footers.length, 1);
-  assert.match(s.tracker.footers[0]!, /用量（本轮）：54\.38 · 轮次 1\/20 · 模型：claude-opus-5\.5$/);
+  assert.match(s.tracker.footers[0]!, /Usage \(this session\): 54\.38 · Sessions 1\/20 · Models: claude-opus-5\.5$/);
   assert.ok(s.lines.some((l) => l.includes("session summary") && l.includes("models=claude-opus-5.5:21")));
 });
 
@@ -600,7 +601,7 @@ test("usage_comments=false suppresses only footers, never meaningful failure rep
   await flush();
   assert.equal(s.tracker.comments.length, 1);
   assert.match(s.tracker.comments[0]!, /session failed.*first send failed.*remaining allowance/s);
-  assert.doesNotMatch(s.tracker.comments[0]!, /用量/);
+  assert.doesNotMatch(s.tracker.comments[0]!, /Usage|用量/);
 });
 
 test("a retry firing while a poll is in flight never exceeds the concurrency limit", async (t) => {
@@ -1436,7 +1437,53 @@ test("footer requires reliable usage and actual models, preserves zero, deduplic
   assert.equal(formatUsageFooter({ ...summary, models: [] }, 1, 20), null);
   assert.equal(formatUsageFooter({ ...summary, models: [{ model: "auto", requests: 1, aiCredits: 1 }] }, 1, 20), null);
   const models = ["model-a", "model-b", "model-a"].map((model) => ({ model, requests: 1, aiCredits: 0 }));
-  assert.equal(formatUsageFooter({ ...summary, aiCredits: 0, models }, 20, 20), "用量（本轮）：0.00 · 轮次 20/20 · 模型：model-a, model-b");
+  assert.equal(formatUsageFooter({ ...summary, aiCredits: 0, models }, 20, 20), "Usage (this session): 0.00 · Sessions 20/20 · Models: model-a, model-b");
+  assert.equal(formatUsageFooter({ ...summary, aiCredits: 0, models }, 20, 20, "zh-CN"), "用量（本轮）：0.00 · 轮次 20/20 · 模型：model-a, model-b");
+  assert.equal(formatUsageFooter({ ...summary, usageComplete: false }, 1, 20, "zh-CN"), null);
+});
+
+test("language reload affects new sessions but not the active session's saved result and footer", async (t) => {
+  const s = setup(t, { language: "zh-CN" });
+  s.tracker.add(issue("A"));
+  await s.tick();
+  s.workflow.config = { ...s.config, language: "en" };
+  await s.tick();
+  s.calls[0]!.params.onUpdate({ event: "session_usage", timestamp: new Date(), summary });
+  const accepted = await submit(s, 0, implementation);
+  assert.equal(accepted.language, "zh-CN");
+  assert.match(s.tracker.footers[0]!, /用量（本轮）：54\.38/);
+  s.tracker.add(issue("B"));
+  await s.tick();
+  assert.equal(s.calls[1]!.params.workflow.config.language, "en");
+  s.calls[1]!.params.onUpdate({ event: "session_usage", timestamp: new Date(), summary });
+  await submit(s, 1, implementation);
+  assert.match(s.tracker.footers[1]!, /Usage \(this session\): 54\.38/);
+});
+
+test("Chinese failures and exhausted-session pauses keep raw diagnostics and disable only usage when requested", async (t) => {
+  const s = setup(t, { language: "zh-CN", agent: { max_sessions: 1, usage_comments: false } });
+  s.tracker.add(issue("A"));
+  await s.tick();
+  s.calls[0]!.reject(new Error("raw SDK error"));
+  await flush();
+  assert.match(s.tracker.comments[0]!, /会话失败.*raw SDK error.*剩余额度/s);
+  assert.doesNotMatch(s.tracker.comments[0]!, /Usage|用量/);
+  await s.advance(10_000);
+  assert.match(s.tracker.comments.at(-1)!, /已停止处理.*1 次会话.*已全部用尽.*"Todo"/s);
+  assert.equal(s.tracker.issues.get("A")!.state, "Blocked");
+});
+
+test("Chinese conflict returns localize guidance without changing branch, label or state names", async (t) => {
+  const ledger = new RunLedger();
+  const s = setup(t, { ...conflictConfig, language: "zh-CN" }, false, ledger);
+  const c = authorize(ledger, issue("A", { state: "Human Review" }));
+  c.waitingState = "Human Review";
+  ledger.checkpoint(c);
+  s.tracker.add(issue("A", { state: "Human Review" }));
+  s.tracker.conflicts.set("A", 22);
+  await s.tick();
+  assert.match(s.tracker.comments[0]!, /与 `main` 存在合并冲突.*"Human Review".*"Rework".*"agent"/s);
+  assert.equal(s.calls[0]!.params.issue.state, "Rework");
 });
 
 test("footer write failure never adds a replacement usage comment or reruns a completed session", async (t) => {

@@ -1,5 +1,6 @@
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isLanguage, type Language } from "./language.ts";
 import { normalizeState, type Issue } from "./types.ts";
 
 export interface HooksConfig {
@@ -39,6 +40,7 @@ export interface CopilotConfig {
 }
 
 export interface ServiceConfig {
+  language: Language;
   workflowPath: string;
   workflowDir: string;
   tracker: {
@@ -176,6 +178,8 @@ function stringList(value: unknown, fallback: string[], name: string, problems: 
 
 export function buildConfig(raw: Record<string, unknown>, workflowPath: string, env: NodeJS.ProcessEnv = process.env): ServiceConfig {
   const problems: string[] = [];
+  const language = raw.language === undefined ? "en" : raw.language;
+  if (!isLanguage(language)) problems.push('language must be "en" or "zh-CN"');
   const workflowDir = dirname(resolve(workflowPath));
   const tracker = section(raw, "tracker", problems);
   const polling = section(raw, "polling", problems);
@@ -229,6 +233,7 @@ export function buildConfig(raw: Record<string, unknown>, workflowPath: string, 
   const reviewConfig = review ? buildReview(review, activeStates, workflowDir, env, problems) : null;
 
   const config: ServiceConfig = {
+    language: isLanguage(language) ? language : "en",
     workflowPath: resolve(workflowPath),
     workflowDir,
     tracker: {

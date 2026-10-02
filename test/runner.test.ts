@@ -154,6 +154,26 @@ async function permission(config: SessionConfig, request: PermissionRequest) {
 const hasCode = (code: RunErrorCode) => (error: unknown) => error instanceof RunError && error.code === code;
 
 for (const role of ["implement", "review"] as const) {
+  for (const language of ["en", "zh-CN"] as const) {
+    test(`${role} propagates ${language} to first/custom continuation prompts and automated replies`, async (t) => {
+      const s = setup(t, role);
+      s.config.language = language;
+      s.config.agent.maxTurns = 2;
+      s.config.agent.continuationPrompt = "Custom continuation {{ turn }}";
+      if (s.config.review) s.config.review.continuationPrompt = "Custom continuation {{ turn }}";
+      s.config.copilot.userInputReply = "Custom automated reply; never human approval.";
+      s.params.tracker.fetchIssuesByIds = async () => [s.params.issue];
+      await runAgentAttempt(s.params);
+      const expected = language === "en" ? "The workflow language is English (en)." : "The workflow language is Simplified Chinese (zh-CN).";
+      assert.equal(s.prompts.length, 2);
+      for (const prompt of s.prompts) assert.ok(prompt.includes(expected));
+      assert.ok(s.prompts[1]!.endsWith("Custom continuation 2"));
+      const reply = await s.sessions[0]!.onUserInputRequest!({ question: "Which language?" }, { sessionId: "test" });
+      assert.ok(reply.answer.includes(expected));
+      assert.ok(reply.answer.startsWith(s.config.copilot.userInputReply));
+      assert.equal(reply.wasFreeform, true);
+    });
+  }
   test(`${role} receives autonomous policy even with a minimal custom prompt, in one SDK session`, async (t) => {
     const s = setup(t, role);
     s.config.agent.maxTurns = 2;

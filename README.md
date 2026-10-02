@@ -92,6 +92,10 @@ Commit the files, so the prompt is versioned with your code. The board gets thes
 
 State ownership is an onboarding working agreement, not a GitHub permission lock. People renew authorization only by moving a waiting card (Human Review/Blocked) to Todo; other board automation must not do this for existing cards.
 
+`/symphony-onboard` explicitly asks you to choose English (`en`) or Simplified Chinese (`zh-CN`), even with the recommended setup, and writes top-level `language` in `WORKFLOW.md`. Cards, plans, issue/PR handoffs and reviews use that choice, not the conversation language. Generated WORKFLOW and REVIEW prompts remain English in both modes; column names, new AGENTS prose and the optional issue form may be localized.
+
+This repository's own [WORKFLOW.md](WORKFLOW.md) selects `language: zh-CN`, and its [task issue form](.github/ISSUE_TEMPLATE/agent-task.yml) uses Chinese. Its WORKFLOW and REVIEW prompts remain English, and existing board column names are unchanged. The reusable [example workflow](examples/WORKFLOW.md) stays `en`; choose your own language during onboarding.
+
 GitHub Project workflows are separate from `WORKFLOW.md` and may change card statuses automatically. `setup-board` cannot configure or enable them because GitHub's public API does not expose workflow configuration; you do not need to change them during onboarding. If a card changes status unexpectedly or skips a Symphony stage, inspect the enabled workflows on the project's **Workflows** page; one may be responsible.
 
 **3. Run it.**
@@ -150,11 +154,12 @@ Workspace ownership includes the configured root's link entries and intermediate
 
 `WORKFLOW.md` has YAML front matter followed by a [Liquid](https://liquidjs.com/) prompt template. Unknown variables and filters are errors. If you save an invalid file, the orchestrator logs the error and keeps using the last valid version. Every key is described in [schema/workflow.schema.json](schema/workflow.schema.json), and `symphony check` validates a file against it and the rules in [docs/reference.md](docs/reference.md#checking-a-workflow).
 
-The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their meaning and defaults. There are three additions:
+The spec's keys (`tracker`, `polling`, `workspace`, `hooks`, `agent`) keep their meaning and defaults. Additions include:
 
+- `language`: `en` (English) or `zh-CN` (Simplified Chinese). Omitted means `en` for older workflows; other values, including `null`, are errors. It selects new user-facing output, not a translation of existing content. Running sessions keep their language; valid edits apply to subsequent sessions, and accepted handoffs retain their language across publication retries/restarts. See [output language](docs/reference.md#output-language) for coverage and limits.
 - `agent.continuation_prompt`: the message sent at the start of each later turn (variables `issue`, `turn` and `max_turns`).
 - `agent.max_sessions`: see [Run limits](#run-limits).
-- `agent.usage_comments` (default `true`): best-effort usage footer on the session's issue result, not a separate usage-only comment: `用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx`. It shows this session's AI credits, started-session ordinal/limit and actual model(s), not configured `auto` or cumulative cost. Missing metrics or a failed update may omit it; there is no durable footer retry queue. Detailed metrics remain in `session summary` logs; disabling the footer does not suppress necessary failure reports.
+- `agent.usage_comments` (default `true`): best-effort usage footer on the session's issue result in its selected language, not a separate usage-only comment. It shows this session's AI credits, started-session ordinal/limit and actual model(s), not configured `auto` or cumulative cost. Missing metrics or a failed update may omit it; there is no durable footer retry queue. Detailed metrics remain in `session summary` logs; disabling the footer does not suppress necessary failure reports.
 
 The `copilot` block is specific to this implementation:
 
@@ -165,13 +170,15 @@ The `copilot` block is specific to this implementation:
 | `shell_deny` | Built-in list | Commands to deny in addition to the built-in list. Deny always wins. |
 | `read_allow` | None | Directories outside the workspace that the agent may read |
 | `url_allow` | None | URL prefixes the agent may fetch |
-| `user_input_reply` | English | Automatic answer when the agent asks a question |
+| `user_input_reply` | English instructions | Automatic answer when the agent asks a question; the runtime also adds the selected output-language directive |
 | `cli_path` | Runtime bundled with the SDK | Use a specific Copilot CLI binary |
 | `startup_timeout_ms` | 60000 | Timeout for starting the runtime and creating the session |
 | `turn_timeout_ms` | 3600000 | Longest silence between session events within a turn |
 | `stall_timeout_ms` | 300000 | The orchestrator restarts an agent that has been silent this long; `<= 0` disables it |
 
 Hooks run with `bash -lc` inside the workspace. Tracker tokens are removed from their environment, and these variables are added: `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_ISSUE_BRANCH`, `SYMPHONY_WORKSPACE`, `SYMPHONY_WORKSPACE_KEY`, `SYMPHONY_ROLE` (`implement` or `review`), and for the reviewer `SYMPHONY_IMPLEMENTER_WORKSPACE`.
+
+Technical logs, CLI diagnostics and the installation wizard before repository onboarding remain English. Agent prose follows runtime instructions, not a machine translator; identifiers, tool/YAML protocol, literal diagnostics and the GitHub `Closes` keyword stay unchanged.
 
 See [docs/reference.md](docs/reference.md) for the GitHub Project adapter settings, the agent tools, error categories and how the spec maps onto the Copilot SDK.
 

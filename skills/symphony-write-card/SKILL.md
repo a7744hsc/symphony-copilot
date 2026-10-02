@@ -7,11 +7,12 @@ description: Write a task card for symphony-copilot agents. Turns a request into
 
 # Write a card for symphony-copilot
 
-An agent works from the issue alone, so the card has to say what done means and how to prove it. Write in the language the user writes to you.
+An agent works from the issue alone, so the card has to say what done means and how to prove it. Write the title, all section headings and body in the configured output language, even when the conversation is in a different language. Keep identifiers, commands, paths and quoted existing user content unchanged.
 
 ## 1. Read the setup
 
 - `WORKFLOW.md` at the repository root: `tracker.provider.owner`, `project_number`, `repo`, `status_field`, `priority_field`, `tracker.provider.start_state` (the explicit start column) and `tracker.required_labels` (the dispatch label). If `project_number` or `start_state` is empty, stop and fix onboarding; do not infer a start column from active-state order.
+- Read top-level `language`: `en` means English; `zh-CN` means Simplified Chinese. A missing key in an older workflow defaults to `en`; do not infer language from the conversation, issue text or column names. Reject other values, including `null`, and fix configuration before drafting.
 - AGENTS.md, "Build and verify": the commands the card can refer to.
 
 ## 2. Understand the request
@@ -24,7 +25,7 @@ One card is one pull request that a person can review in one sitting. If the req
 
 ## 4. Draft
 
-Title: imperative and specific, under 70 characters. Body, with the sections of the issue form:
+Title: imperative and specific, under 70 characters, in the configured language. Use the English scaffold below for `en`; for `zh-CN`, write the entire body in Simplified Chinese and use the headings `目标`, `验收标准`, `验证方式`, `范围之外` and `备注` respectively. Do not leave English headings or placeholder prose in a Chinese card.
 
 ```markdown
 ### Goal
@@ -50,7 +51,7 @@ Links, files to start from, constraints.
 
 ## 5. Confirm
 
-Show the draft and a priority (P1 is highest, P4 lowest), then ask: create and start now, create without starting, or change something.
+In the configured language, show the draft and a priority (P1 is highest, P4 lowest), then ask: create and start now, create without starting, or change something.
 
 ## 6. Create
 
@@ -67,6 +68,6 @@ Starting now means `tracker.provider.start_state` and the dispatch label. Otherw
 
 ## 7. Report
 
-The issue URL, its column and labels, and whether an agent picks it up at the next poll.
+In the configured language, report the issue URL, its exact configured column and labels, and whether an agent picks it up at the next poll.
 
 Never put secrets in an issue; in a public repository anyone can read it.

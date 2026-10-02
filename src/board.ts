@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { isMap as isYamlMap, isScalar, parseDocument } from "yaml";
 import { checkWorkflow, type CheckResult, type Finding } from "./check.ts";
 import type { ServiceConfig } from "./config.ts";
+import { localize } from "./language.ts";
 import { graphqlRequest, restRequest, type FetchLike, type GitHubApi } from "./tracker/github-api.ts";
 import type { GitHubProjectSettings } from "./tracker/github-project.ts";
 import { normalizeState } from "./types.ts";
@@ -81,14 +82,15 @@ export function boardStates(config: ServiceConfig, settings: GitHubProjectSettin
 
 export function desiredBoard(config: ServiceConfig, settings: GitHubProjectSettings): DesiredBoard {
   const label = config.tracker.requiredLabels[0];
+  const l = (en: string, zh: string) => localize(config.language, en, zh);
   const describe: Record<StateRole, string> = {
-    other: "Not worked on by agents",
-    start: `Human start or reauthorization entry${label ? `; requires label "${label}"` : ""}`,
-    implement: `Scheduler-managed implementation${label ? `; requires label "${label}"` : ""}; do not move cards manually`,
-    review: "Scheduler-managed independent review; do not move cards manually",
-    waiting: `Waiting for a person; move to "${settings.startState}" to reauthorize`,
-    blocked: `Stopped; a person resolves the blocker, then moves to "${settings.startState}"`,
-    terminal: "Finished",
+    other: l("Not worked on by agents", "不由 agent 处理"),
+    start: l(`Human start or reauthorization entry${label ? `; requires label "${label}"` : ""}`, `人工开始或重新授权入口${label ? `；需要 "${label}" 标签` : ""}`),
+    implement: l(`Scheduler-managed implementation${label ? `; requires label "${label}"` : ""}; do not move cards manually`, `调度器管理的实现阶段${label ? `；需要 "${label}" 标签` : ""}；请勿手动移动卡片`),
+    review: l("Scheduler-managed independent review; do not move cards manually", "调度器管理的独立审查；请勿手动移动卡片"),
+    waiting: l(`Waiting for a person; move to "${settings.startState}" to reauthorize`, `等待人工处理；移至 "${settings.startState}" 以重新授权`),
+    blocked: l(`Stopped; a person resolves the blocker, then moves to "${settings.startState}"`, `已停止；请人工解决阻塞，再移至 "${settings.startState}"`),
+    terminal: l("Finished", "已完成"),
   };
   const states = boardStates(config, settings);
   const firstTerminal = states.find((s) => s.role === "terminal");
@@ -100,10 +102,10 @@ export function desiredBoard(config: ServiceConfig, settings: GitHubProjectSetti
   const priorities = ["P1", "P2", "P3", "P4"];
   const followupPriority = settings.followups?.priority;
   if (followupPriority && !priorities.some((p) => p.toLowerCase() === followupPriority.toLowerCase())) priorities.push(followupPriority);
-  const priorityOptions = priorities.map((name, i) => ({ name, color: PRIORITY_COLORS[i] ?? "GRAY", description: i === 0 ? "Runs first" : "" }));
-  const labels: Option[] = config.tracker.requiredLabels.map((name) => ({ name, color: "0E8A16", description: "symphony-copilot works on issues with this label" }));
+  const priorityOptions = priorities.map((name, i) => ({ name, color: PRIORITY_COLORS[i] ?? "GRAY", description: i === 0 ? l("Runs first", "优先处理") : "" }));
+  const labels: Option[] = config.tracker.requiredLabels.map((name) => ({ name, color: "0E8A16", description: l("symphony-copilot works on issues with this label", "symphony-copilot 处理带此标签的 issue") }));
   for (const name of settings.followups?.labels ?? []) {
-    if (!labels.some((l) => l.name.toLowerCase() === name.toLowerCase())) labels.push({ name, color: "C5DEF5", description: "Filed by an agent; a person decides when to work on it" });
+    if (!labels.some((l) => l.name.toLowerCase() === name.toLowerCase())) labels.push({ name, color: "C5DEF5", description: l("Filed by an agent; a person decides when to work on it", "由 agent 创建；何时处理由人工决定") });
   }
   return { statusOptions, priorityOptions, labels };
 }

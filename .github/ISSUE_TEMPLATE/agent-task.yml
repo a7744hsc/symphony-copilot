@@ -1,20 +1,20 @@
 # This form deliberately adds no labels. A maintainer adds the dispatch label after review,
 # so creating an issue does not start an agent.
-name: Agent task
-description: A change small enough for one pull request, written so an agent can do it and prove it.
+name: Agent 任务
+description: 描述一个可在单个 PR 中完成的改动，让 agent 能够实现并验证结果。
 body:
   - type: textarea
     id: goal
     attributes:
-      label: Goal
-      description: What should be different when this is done, and why.
+      label: 目标
+      description: 完成后应有哪些变化，以及为什么需要这些变化。
     validations:
       required: true
   - type: textarea
     id: acceptance
     attributes:
-      label: Acceptance criteria
-      description: Observable results, one per line, each checkable by running or looking at something.
+      label: 验收标准
+      description: 每行列出一项可观察的结果，每项都能通过运行或检查来验证。
       value: |
         - [ ]
     validations:
@@ -22,17 +22,17 @@ body:
   - type: textarea
     id: verify
     attributes:
-      label: How to verify
-      description: Commands to run, screens to look at, and what only a person can check.
+      label: 验证方式
+      description: 需要运行的命令、查看的界面，以及只能由人工确认的事项。
     validations:
       required: true
   - type: textarea
     id: out-of-scope
     attributes:
-      label: Out of scope
-      description: What not to change, even if it looks related.
+      label: 范围之外
+      description: 即使看起来相关，也不应修改的内容。
   - type: textarea
     id: notes
     attributes:
-      label: Notes
-      description: Links, related issues, constraints, where to start.
+      label: 备注
+      description: 链接、相关 Issue、约束条件和建议的切入点。

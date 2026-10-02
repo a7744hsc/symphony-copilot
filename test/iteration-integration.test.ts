@@ -8,6 +8,7 @@ import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { CopilotClient, type CopilotSession, type SessionConfig, type SessionEvent } from "@github/copilot-sdk";
 import { isRoutable, type Role } from "../src/config.ts";
+import type { Language } from "../src/language.ts";
 import type { PendingHandoff } from "../src/iteration.ts";
 import { RunLedger } from "../src/ledger.ts";
 import { Orchestrator, type WorkerParams } from "../src/orchestrator.ts";
@@ -180,12 +181,13 @@ interface Plan {
   issuePlan?: { body: string; product: string; loseResponse?: boolean };
 }
 
-function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime>>, plans: Plan[]) {
+function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime>>, plans: Plan[], language: Language = "en") {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "iteration-integration-")));
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.parse("2026-09-30T00:00:00Z") });
   const promptFile = join(root, "REVIEW.md");
   writeFileSync(promptFile, "Review {{ issue.identifier }}; review sequence {{ review_round }}.");
   const config = makeConfig({
+    language,
     tracker: { kind: "github_project", provider, active_states: states.slice(0, 4), terminal_states: ["Done"], required_labels: ["agent"] },
     polling: { interval_ms: 3_600_000 }, workspace: { root: join(root, "workspaces") },
     agent: { max_concurrent_agents: 1, max_turns: 1, max_sessions: 20, usage_comments: true },
@@ -195,7 +197,7 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
   const api = publicationFetch(), { log, lines } = captureLog();
   const ledger = new RunLedger(join(root, "ledger.json"));
   const tracker = new runtime.GitHubProjectTracker(provider, { SYMPHONY_GITHUB_TOKEN: "offline-not-a-secret" }, log, api.impl,
-    (issue) => isRoutable(config, issue));
+    (issue) => isRoutable(config, issue), config.language);
   const workspaces = new WorkspaceManager(log, {});
   const prepared = new Set<string>(), hooks: string[] = [], gitCalls: GitCall[] = [], errors: unknown[] = [];
   const workers: Array<{ params: WorkerParams; done: Promise<void> }> = [];
@@ -378,7 +380,7 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
           api.state.localHead = step.role === "implement" ? step.head : api.state.remoteHead;
           if (step.publicationFailureAfterAcceptance) failNextPush = true;
           const result = step.role === "implement"
-            ? await tool("tracker_submit_for_review", { title: `Implementation ${step.index + 1}`, summary: step.summary })
+            ? await tool("tracker_submit_for_review", { title: `${language === "zh-CN" ? "实现" : "Implementation"} ${step.index + 1}`, summary: step.summary })
             : await tool("tracker_submit_review", {
               verdict: "request_changes", reviewed_head: api.state.remoteHead, progress: step.progress,
               progress_reason: step.reason, next_action: "continue", next_step: step.nextStep,
@@ -389,7 +391,7 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
             assert.equal(result.stale, false);
           }
           assert.equal(workers[step.index]!.params.control.accepted(), true);
-          assert.doesNotMatch(api.issueMessages().at(-1)!.body, /用量（本轮）/, "footer waits for final runner metrics");
+          assert.doesNotMatch(api.issueMessages().at(-1)!.body, /Usage \(this session\)|用量（本轮）/, "footer waits for final runner metrics");
           emit("assistant.usage", { model: step.model, inputTokens: 100, outputTokens: 10, copilotUsage: { totalNanoAiu: 125_000_000 } });
           if (step.pendingHeadMismatch || step.publicationFailureAfterAcceptance) emit("session.error", { message: "offline turn ended after accepted publication error" });
           else emit("session.idle");
@@ -458,6 +460,34 @@ function setup(t: TestContext, runtime: Awaited<ReturnType<typeof offlineRuntime
 
 test("offline iteration integration: real scheduler, runner, ledger and GitHub tracker", { timeout: 15_000 }, async (t) => {
   const runtime = await offlineRuntime(t);
+  await t.test("Chinese implementation and review share prompt language, published headings and usage through the real lifecycle", async (t) => {
+    const s = setup(t, runtime, [{ role: "implement" }, { role: "review", progress: "initial" }], "zh-CN");
+    for (const step of s.steps) {
+      step.summary = "已核对验收标准和证据。";
+      step.reason = "独立复现了问题。";
+      step.nextStep = "修复失败场景。";
+      step.blocker = "预期行为与实际行为不符。";
+    }
+    await s.orchestrator.start();
+    await s.orchestrator.tick();
+    await s.finish(0);
+    t.mock.timers.tick(1_000);
+    await s.orchestrator.tick();
+    await s.finish(1);
+    const bodies = s.api.issueMessages().map((m) => m.body);
+    assert.match(bodies[0]!, /实现交接: 实现 1.*交接已完成：AI Review.*用量（本轮）：1\.25 · 轮次 1\/20/s);
+    assert.match(bodies[1]!, /AI 审查.*阻塞问题.*交接已完成：Rework.*用量（本轮）：2\.25 · 轮次 2\/20/s);
+    assert.match(s.api.state.pr!.body, /实现交接: 实现 1.*Closes #12/s);
+    assert.match(s.api.reviews[0]!.body, /AI 审查.*需要修改.*独立复现了问题。/s);
+    for (const step of s.steps) assert.match(step.prompt, /The workflow language is Simplified Chinese \(zh-CN\)/);
+    for (const body of bodies) assert.doesNotMatch(body, /Usage \(this session\)|AI review|Implementation handoff|Handoff completed/);
+    assert.equal(s.api.issueMessages().length, 2);
+    assert.equal(s.ledger.get(controlKey)!.sessions, 2);
+    assert.equal(s.ledger.get(controlKey)!.reviewRounds, 1);
+    assert.equal(s.api.state.status, "Rework");
+    assert.deepEqual(s.errors, []);
+  });
+
   await t.test("scripted plan publication/reuse, independent review and revision share the existing session allowance", async (t) => {
     const plan = "## Implementation plan\n\n"
       + "Goal: preserve fixture work across implementation/review handoffs; no new role or board lane.\n"
@@ -505,15 +535,15 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
       const record = s.api.issueMessages().at(-1)!;
       assert.ok(record.body.includes(step.summary), "the complete final handoff stays on the issue");
       assert.ok(record.body.includes(`<!-- symphony-result:${allocation.resultId} -->`));
-      assert.deepEqual(record.body.match(/^用量（本轮）：.*$/gm), [
-        `用量（本轮）：${step.credits.toFixed(2)} · 轮次 ${i + 1}/20 · 模型：${step.model}`,
+      assert.deepEqual(record.body.match(/^Usage \(this session\):.*$/gm), [
+        `Usage (this session): ${step.credits.toFixed(2)} · Sessions ${i + 1}/20 · Models: ${step.model}`,
       ]);
       if (step.issuePlan) {
         const comments = s.api.issueMessages().filter((m) => m.body.startsWith(`${step.issuePlan!.body}\n\n`));
         assert.equal(comments.length, 1, "the scripted reread/reuse does not duplicate a persisted plan");
         const message = comments[0]!;
         assert.ok(message.body.includes(`<!-- symphony-invocation:${step.session!.sessionId} -->`));
-        assert.doesNotMatch(message.body, /symphony-result:|用量（本轮）/, "formal handoff, not the earlier plan, receives final usage");
+        assert.doesNotMatch(message.body, /symphony-result:|Usage \(this session\)/, "formal handoff, not the earlier plan, receives final usage");
         preservedPlans.push(structuredClone(message));
         assert.deepEqual(step.actions, [
           "tracker_get_issue", "tracker_get_issue", "tracker_comment",
@@ -536,7 +566,7 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
     assert.deepEqual(s.api.transitions, ["In Progress", ...targets]);
     assert.equal(s.api.issueMessages().length, 6, "two plans plus four full results; no extra usage-only comments");
     assert.equal(s.api.calls.filter((c) => c.query.includes("addComment") && c.variables.id === issueId && c.variables.body.startsWith("## Implementation plan")).length, 2);
-    assert.equal(s.api.calls.filter((c) => c.query.includes("updateIssueComment") && c.variables.body.includes("用量（本轮）")).length, 4);
+    assert.equal(s.api.calls.filter((c) => c.query.includes("updateIssueComment") && c.variables.body.includes("Usage (this session)")).length, 4);
     assert.equal(s.gitCalls.filter((c) => c.args[0] === "push").length, 2);
     assert.equal(s.api.reviews.length, 2);
     assert.equal(s.ledger.get(controlKey)!.aiCredits, 11);
@@ -586,8 +616,8 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
       const allocation = cycle.allocations[step.session!.sessionId!]!;
       assert.ok(record.body.includes(`<!-- symphony-result:${allocation.resultId} -->`));
       assert.ok(record.body.includes(`<!-- symphony-invocation:${step.session!.sessionId} -->`));
-      const footer = `用量（本轮）：${step.credits.toFixed(2)} · 轮次 ${i + 1}/20 · 模型：${step.model}`;
-      assert.deepEqual(record.body.match(/^用量（本轮）：.*$/gm), [footer]);
+      const footer = `Usage (this session): ${step.credits.toFixed(2)} · Sessions ${i + 1}/20 · Models: ${step.model}`;
+      assert.deepEqual(record.body.match(/^Usage \(this session\):.*$/gm), [footer]);
       assert.ok(record.body.replace(/<!--.*?-->/g, "").trimEnd().endsWith(footer));
       if (step.role === "review") {
         for (const text of [step.reason, step.nextStep, step.blocker, `**Progress: ${step.progress}**`]) assert.ok(record.body.includes(text));
@@ -609,7 +639,7 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
     assert.equal(s.api.reviews.length, 3);
     assert.equal(s.api.prComments.length, 2);
     assert.equal(s.api.calls.filter((c) => c.query.includes("createPullRequest")).length, 1);
-    assert.equal(s.api.calls.filter((c) => c.query.includes("updateIssueComment") && c.variables.body.includes("用量（本轮）")).length, 6);
+    assert.equal(s.api.calls.filter((c) => c.query.includes("updateIssueComment") && c.variables.body.includes("Usage (this session)")).length, 6);
     assert.equal(s.gitCalls.filter((c) => c.args[0] === "push").length, 3);
     assert.equal(s.gitCalls.filter((c) => c.args[0] === "merge-tree").length, 3);
     assert.deepEqual(s.orchestrator.snapshot().counts, { running: 0, retrying: 0 });
@@ -677,7 +707,7 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
     const writes = structuredClone(mutations()), record = structuredClone(s.api.issueMessages()[0]!);
     assert.equal(writes.length, 2, "only initial takeover and the pre-withdrawal issue record may write");
     assert.equal(record.id, pending.issueMessage!.id); assert.ok(record.body.includes(step.summary));
-    assert.match(record.body, /Publication pending/); assert.doesNotMatch(record.body, /用量（本轮）|Stale result/);
+    assert.match(record.body, /Publication pending/); assert.doesNotMatch(record.body, /Usage \(this session\)|Stale result/);
     const saved = structuredClone(cycle), gitCount = s.gitCalls.length;
     const expectedCounts = { start: 1, create: 1, created: 1, send: 1, metrics: 1, disconnect: 1, stop: 1, forceStop: 0, abort: 1 };
     const suspended = (ledger: RunLedger) => {
@@ -737,7 +767,7 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
     const body = s.api.issueMessages()[0]!.body;
     for (const text of [step.summary, `HEAD: ${step.head}`, `<!-- symphony-result:${pending.id} -->`, `<!-- symphony-invocation:${pending.invocationId} -->`]) assert.ok(body.includes(text));
     assert.match(body, /Handoff completed: AI Review/); assert.doesNotMatch(body, /Publication pending|Stale result/);
-    assert.doesNotMatch(body, /用量（本轮）/, "withdrawn-label footer was skipped; cosmetic usage has no durable retry queue");
+    assert.doesNotMatch(body, /Usage \(this session\)/, "withdrawn-label footer was skipped; cosmetic usage has no durable retry queue");
     assert.deepEqual(new RunLedger(s.ledger.path!).get(controlKey), completed);
     assert.equal(noWorker.mock.callCount(), 0); assert.deepEqual(s.counts, expectedCounts);
     assert.deepEqual(step.actions, ["tracker_get_issue", "tracker_submit_for_review"]);
@@ -769,7 +799,7 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
     assert.deepEqual(s.orchestrator.snapshot().counts, { running: 0, retrying: 0 });
     assert.ok(s.lines.some((line) => line.includes("turn ended after result acceptance")), "runner drains an errored accepted turn without model continuation");
     const record = s.api.messages.get(ref.id)!;
-    const footer = `用量（本轮）：${s.steps[0]!.credits.toFixed(2)} · 轮次 1/20 · 模型：${s.steps[0]!.model}`;
+    const footer = `Usage (this session): ${s.steps[0]!.credits.toFixed(2)} · Sessions 1/20 · Models: ${s.steps[0]!.model}`;
     assert.ok(record.body.includes(s.steps[0]!.summary)); assert.ok(record.body.includes(footer));
     assert.match(record.body, /Publication pending/); assert.doesNotMatch(record.body, /Stale result/);
     const headReads = s.api.headReads.length, gitCalls = s.gitCalls.length;
@@ -851,7 +881,7 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
     for (const text of ["Blocked", s.steps[0]!.head, oldHead, "3"]) assert.ok(status.includes(text), `missing host diagnostic: ${text}`);
     assert.match(status, /expected/i); assert.match(status, /actual/i); assert.match(status, /attempt|check/i);
     assert.doesNotMatch(record.body, /Stale result|\*\*Progress:|Reviewed HEAD:/);
-    assert.deepEqual(record.body.match(/^用量（本轮）：.*$/gm), [`用量（本轮）：1.25 · 轮次 1/20 · 模型：${s.steps[0]!.model}`]);
+    assert.deepEqual(record.body.match(/^Usage \(this session\):.*$/gm), [`Usage (this session): 1.25 · Sessions 1/20 · Models: ${s.steps[0]!.model}`]);
     const finalReads = s.api.headReads.length;
     t.mock.timers.tick(60_000);
     await s.orchestrator.tick();
@@ -885,7 +915,7 @@ test("offline iteration integration: real scheduler, runner, ledger and GitHub t
     assert.deepEqual(new RunLedger(s.ledger.path!).get(controlKey), cycle);
     assert.equal(s.api.issueMessages().length, 1);
     assert.match(s.api.issueMessages()[0]!.body, /session_create[\s\S]*offline createSession rejection[\s\S]*0 session\(s\)/);
-    assert.doesNotMatch(s.api.issueMessages()[0]!.body, /用量（本轮）/);
+    assert.doesNotMatch(s.api.issueMessages()[0]!.body, /Usage \(this session\)/);
     t.mock.timers.tick(1_000);
     await s.orchestrator.tick();
     await s.orchestrator.stop();

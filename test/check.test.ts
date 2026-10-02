@@ -36,6 +36,7 @@ function tracked(value: Record<string, unknown>, seen: Set<string>, prefix = "")
 }
 
 const everyKey = {
+  language: "en",
   tracker: {
     kind: "github_project",
     provider: {
@@ -131,10 +132,24 @@ test("a sound workflow has no findings", () => {
   assert.deepEqual(messages(workflowFile(base)), []);
 });
 
-test("the example workflow has no errors", () => {
-  const result = checkWorkflow(join(import.meta.dirname, "../examples/WORKFLOW.md"), {});
-  assert.deepEqual(result.findings.filter((f) => f.level === "error"), []);
+test("offline language validation agrees with runtime validation", () => {
+  for (const language of ["en", "zh-CN"]) {
+    const path = workflowFile(`language: ${language}\n${base}`);
+    assert.deepEqual(messages(path), []);
+    assert.equal(checkWorkflow(path).config?.language, language);
+  }
+  for (const language of ["fr", "null", "false", "[]", '""']) {
+    assert.match(messages(workflowFile(`language: ${language}\n${base}`)).join("\n"), /language must be "en" or "zh-CN"/);
+  }
 });
+
+for (const [folder, language] of [["", "zh-CN"], ["examples", "en"]] as const) {
+  test(`the ${folder || "repository"} workflow has no errors and uses ${language}`, () => {
+    const result = checkWorkflow(join(import.meta.dirname, "..", folder, "WORKFLOW.md"), {});
+    assert.deepEqual(result.findings.filter((f) => f.level === "error"), []);
+    assert.equal(result.config?.language, language);
+  });
+}
 
 test("misspelled keys are errors with a suggestion", () => {
   const path = workflowFile(`${base}\nagent:\n  max_turn: 3\n  colour: red\n`.replace("project_number: 1", "project_nubmer: 1"));

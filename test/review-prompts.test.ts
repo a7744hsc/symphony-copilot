@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { parseDocument } from "yaml";
 import { buildConfig } from "../src/config.ts";
-import { renderIssuePrompt, renderTemplate } from "../src/template.ts";
+import { composeAgentPrompt, renderIssuePrompt, renderTemplate } from "../src/template.ts";
 import { issueForTemplate } from "../src/types.ts";
 import { loadWorkflow } from "../src/workflow.ts";
 import { makeConfig, makeIssue } from "./helpers.ts";
@@ -12,6 +13,26 @@ const root = join(import.meta.dirname, "..");
 const issue = makeIssue({ description: "Maintain resource isolation." });
 
 for (const folder of ["", "examples"]) {
+  test(`${folder || "repository"} selects its output language without translating prompt sources`, () => {
+    const path = join(root, folder, "WORKFLOW.md");
+    const workflow = loadWorkflow(path);
+    const config = buildConfig(workflow.config, path, {});
+    const language = folder === "examples" ? "en" : "zh-CN";
+    assert.equal(workflow.config.language, language, "the language must be explicitly configured");
+    assert.equal(config.language, language);
+    assert.ok(config.review);
+    const templates = {
+      implement: workflow.promptTemplate,
+      review: readFileSync(config.review.promptFile, "utf8"),
+    };
+    for (const role of ["implement", "review"] as const) {
+      assert.doesNotMatch(templates[role], /\p{Script=Han}/u);
+      const prompt = composeAgentPrompt(templates[role], role, true, config.language);
+      assert.match(prompt, language === "en" ? /The workflow language is English \(en\)/ : /The workflow language is Simplified Chinese \(zh-CN\)/);
+      assert.ok(prompt.endsWith(templates[role]));
+    }
+  });
+
   test(`${folder || "repository"} implementation and review prompts preserve proactive verification and complete feedback`, () => {
     const workflow = loadWorkflow(join(root, folder, "WORKFLOW.md"));
     const implementation = renderIssuePrompt(workflow.promptTemplate, issue, 1);
@@ -85,6 +106,36 @@ for (const folder of ["", "examples"]) {
   });
 }
 
+test("the repository issue form uses Chinese without changing its protocol or dispatch behavior", () => {
+  const form = parseDocument(readFileSync(join(root, ".github/ISSUE_TEMPLATE/agent-task.yml"), "utf8"));
+  assert.deepEqual(form.errors, []);
+  assert.equal(form.get("name"), "Agent 任务");
+  assert.equal(form.has("labels"), false);
+  assert.equal(form.has("projects"), false);
+  const sections = [
+    ["goal", "目标", true],
+    ["acceptance", "验收标准", true],
+    ["verify", "验证方式", true],
+    ["out-of-scope", "范围之外", undefined],
+    ["notes", "备注", undefined],
+  ] as const;
+  for (const [index, [id, label, required]] of sections.entries()) {
+    assert.equal(form.getIn(["body", index, "type"]), "textarea");
+    assert.equal(form.getIn(["body", index, "id"]), id);
+    assert.equal(form.getIn(["body", index, "attributes", "label"]), label);
+    assert.equal(form.getIn(["body", index, "validations", "required"]), required);
+  }
+  assert.equal(form.getIn(["body", sections.length]), undefined);
+  assert.equal(form.getIn(["body", 1, "attributes", "value"]), "- [ ]\n");
+  for (const path of [["description"], ...sections.map((_, index) => ["body", index, "attributes", "description"])]) {
+    const description = form.getIn(path);
+    assert.ok(typeof description === "string");
+    assert.match(description, /\p{Script=Han}/u);
+  }
+  const example = readFileSync(join(root, "examples/ISSUE_TEMPLATE/agent-task.yml"), "utf8");
+  assert.doesNotMatch(example, /\p{Script=Han}/u);
+});
+
 test("default continuation prompts do not fall back to example-only repairs or first-defect review", () => {
   const config = makeConfig({
     tracker: { active_states: ["Todo", "In Progress", "Rework", "AI Review"], provider: { handoff_state: "AI Review" } },
@@ -114,9 +165,61 @@ test("onboarding derives mandatory lifecycle columns without credit budgets or i
   for (const phrase of [/autonomous planning before product edits/, /same session/, /Project control plane/, /Automated answers are not human approval/, /not a write barrier/, /self-grill/i, /never let a plan narrow acceptance criteria/]) assert.match(skill, phrase);
 });
 
+test("onboarding requires an explicit output-language choice even with recommended setup", () => {
+  const skill = readFileSync(join(root, "skills/symphony-onboard/SKILL.md"), "utf8");
+  for (const phrase of [
+    /Explicitly ask the user.*English \(`en`\).*Simplified Chinese \(`zh-CN`\)/,
+    /Do not infer it from the conversation or repository/,
+    /Require an explicit choice before generating files, even if the user accepts the recommended setup/,
+    /If the answer omits the language, ask only for that missing choice; do not auto-default it/,
+    /Always write top-level `language: en` or `language: zh-CN`/,
+    /Omission defaults to `en` only for older or hand-written workflows/,
+    /including `null`.*invalid/,
+    /Do not rename existing columns or rewrite existing user content/,
+  ]) assert.match(skill, phrase);
+  assert.doesNotMatch(skill, /Write prose in the language the user writes|Use the user's conversation language|localized to the user's language/);
+});
+
+test("onboarding preserves English prompt sources and localizes only selected documentation", () => {
+  const skill = readFileSync(join(root, "skills/symphony-onboard/SKILL.md"), "utf8");
+  for (const phrase of [
+    /single English prompt source/,
+    /WORKFLOW\.md body and REVIEW\.md stay in English in both modes, except configured column names/,
+    /runtime adds the output-language instruction; do not translate or duplicate these prompts/,
+    /New AGENTS\.md prose may use the selected language/,
+    /keep its existing content/,
+    /visible name, descriptions and section labels may use the selected language/,
+    /preserve YAML keys, field IDs, validation rules and the absence of dispatch labels/,
+    /Do not overwrite an existing user-authored form/,
+  ]) assert.match(skill, phrase);
+
+  const path = join(root, "examples/WORKFLOW.md");
+  const workflow = loadWorkflow(path);
+  assert.equal(workflow.config.language, "en");
+  assert.match(readFileSync(path, "utf8"), /language: en\s+# explicitly choose en \(English\) or zh-CN \(Simplified Chinese\) during onboarding/);
+  assert.doesNotMatch(workflow.promptTemplate, /\p{Script=Han}/u);
+  assert.doesNotMatch(readFileSync(join(root, "examples/REVIEW.md"), "utf8"), /\p{Script=Han}/u);
+});
+
 test("write-card starts only in the explicit start_state and does not ask users to enumerate edge cases", () => {
   const skill = readFileSync(join(root, "skills/symphony-write-card/SKILL.md"), "utf8");
   assert.match(skill, /Starting now means[\s\S]*tracker\.provider\.start_state/);
   assert.doesNotMatch(skill, /first active|starts in the first|intent, priorities, edge cases/);
   assert.match(skill, /Do not guess.*IDs/);
+});
+
+test("write-card uses configured language for title, headings and body rather than conversation", () => {
+  const skill = readFileSync(join(root, "skills/symphony-write-card/SKILL.md"), "utf8");
+  for (const phrase of [
+    /title, all section headings and body in the configured output language/,
+    /even when the conversation is in a different language/,
+    /Read top-level `language`: `en` means English; `zh-CN` means Simplified Chinese/,
+    /missing key in an older workflow defaults to `en`/,
+    /do not infer language from the conversation, issue text or column names/,
+    /Reject other values, including `null`/,
+    /write the entire body in Simplified Chinese/,
+    /`目标`, `验收标准`, `验证方式`, `范围之外` and `备注`/,
+    /Keep identifiers, commands, paths and quoted existing user content unchanged/,
+  ]) assert.match(skill, phrase);
+  assert.doesNotMatch(skill, /Write in the language the user writes to you/);
 });

@@ -78,7 +78,7 @@ function review(raw: any) {
   const body = text(raw.body);
   // Old Symphony reviews put blockers after a long summary. Keep that section independently visible,
   // as full Markdown, as well as the original body; never try to infer a verdict from GitHub COMMENT.
-  const marker = body?.match(/^\*\*Blocking issues\*\*[\t ]*\r?$/m);
+  const marker = body?.match(/^\*\*(?:Blocking issues|阻塞问题)\*\*[\t ]*\r?$/m);
   return {
     id: raw.id, url: raw.url, author: raw.author?.login ?? null, at: raw.submittedAt,
     state: raw.state, commit: raw.commit?.oid ?? null,

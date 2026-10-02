@@ -14,6 +14,7 @@ const reviewed = {
 
 test("defaults apply when optional values are missing", () => {
   const c = buildConfig(minimal, "/repo/WORKFLOW.md", {});
+  assert.equal(c.language, "en");
   assert.equal(c.polling.intervalMs, 30_000);
   assert.equal(c.workspace.root, join(tmpdir(), "symphony_workspaces"));
   assert.equal(c.hooks.timeoutMs, 60_000);
@@ -33,6 +34,15 @@ test("defaults apply when optional values are missing", () => {
   assert.equal(c.tracker.workingState, "In Progress");
   assert.equal(c.tracker.blockedState, "Blocked");
   assert.equal(c.tracker.handoffState, "Human Review");
+});
+
+test("language accepts only the two explicit workflow choices", () => {
+  for (const language of ["en", "zh-CN"]) {
+    assert.equal(buildConfig({ ...minimal, language }, "/repo/WORKFLOW.md", {}).language, language);
+  }
+  for (const language of [null, "", "zh", "ZH-CN", "en-US", "fr", " en ", 1, false, [], {}]) {
+    assert.throws(() => buildConfig({ ...minimal, language }, "/repo/WORKFLOW.md", {}), /language must be "en" or "zh-CN"/);
+  }
 });
 
 test("max_sessions is the single positive-integer authorization limit", () => {

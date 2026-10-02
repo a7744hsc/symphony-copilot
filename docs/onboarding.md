@@ -47,6 +47,8 @@ GitHub CLI and Copilot CLI authentication are handled together in the setup sign
 
 After it finishes, run `symphony install-skills` in this checkout. Then open the target repository in Copilot and run `/symphony-onboard`.
 
+This bootstrap installation wizard remains English: the repository's output-language choice happens during onboarding below.
+
 ## 1. Install the skills
 
 ```sh
@@ -66,14 +68,16 @@ Unattended planning is built into the runner; no personal planning skill install
 
 ## 2. Write WORKFLOW.md, AGENTS.md and REVIEW.md
 
-Open the repository in VS Code (or start `copilot` in it) and run `/symphony-onboard`. You do not need to know or preselect board columns. The skill first inspects the repository, then asks which operating capabilities you want:
+Open the repository in VS Code (or start `copilot` in it) and run `/symphony-onboard`. You do not need to know or preselect board columns. The skill first inspects the repository, then explicitly asks you to choose the output language—English (`en`) or Simplified Chinese (`zh-CN`)—alongside the operating capabilities:
 
 1. Whether an independent AI reviewer should check each submission before it reaches you (human approval before merge is always retained).
 2. Whether to automatically detect merge conflicts on PRs waiting for a person and send them back to the implementer.
 3. Whether agents may file low-priority follow-up issues without the dispatch label for unrelated problems.
 4. Whether to add the optional structured GitHub issue form for human-written agent tasks.
 
-It asks once, recommends defaults, and explains cost/behavior tradeoffs. Onboarding defaults to concurrency 1, implementer/reviewer models `auto`, and 20 total successfully started sessions per issue authorization, shared by both roles—not 20 pairs. Fixed model IDs must be supplied by you or verified for your account; no guessed model list. Costs are recorded, not capped, so there is no credit-budget question. Blocked is mandatory, not an optional capability. The skill infers board owner, language, build/test commands and default branch where possible, then derives and previews columns rather than asking you to invent a state machine. AI review adds AI Review and Rework; without it submissions go directly to Human Review. Rework remains if conflict recovery is enabled. The skill writes the selected files and runs `symphony check` until there are no errors.
+It collects choices in one batch, recommends capability defaults, and explains cost/behavior tradeoffs. “Use the recommended setup” does not choose a language: the skill must obtain your explicit language choice before generating files, never infer it from the conversation or repository. Onboarding defaults to concurrency 1, implementer/reviewer models `auto`, and 20 total successfully started sessions per issue authorization, shared by both roles—not 20 pairs. Fixed model IDs must be supplied by you or verified for your account; no guessed model list. Costs are recorded, not capped, so there is no credit-budget question. Blocked is mandatory, not an optional capability. The skill infers board owner, build/test commands and default branch where possible, then derives and previews columns rather than asking you to invent a state machine. AI review adds AI Review and Rework; without it submissions go directly to Human Review. Rework remains if conflict recovery is enabled. The skill writes the selected files and runs `symphony check` until there are no errors.
+
+The choice is written as top-level `language: en` or `language: zh-CN` in `WORKFLOW.md`. Its generated prompt body and REVIEW.md remain English in both modes, apart from configured names and repository-specific references; there is no second translated prompt set. New AGENTS.md prose and the optional issue form may use the selected language. Existing user content is not rewritten. The runtime instructs both agents to write plans, cards, issue/PR handoffs and reviews in the configured language. Host-generated status/failure messages and usage footers follow it too; technical logs and CLI diagnostics remain English. See [output language](reference.md#output-language) for reload and recovery behavior.
 
 | File | Purpose | Template |
 |---|---|---|
@@ -84,7 +88,7 @@ It asks once, recommends defaults, and explains cost/behavior tradeoffs. Onboard
 
 The optional issue form only guides people writing issues. It does not create an issue, put it on the project, add the dispatch label, or start an agent. Agent-generated follow-up issues are a separate capability. A maintainer still chooses which submitted issue should be dispatched.
 
-To write them by hand, copy the templates and fill them in. Every key of `WORKFLOW.md` is described in [schema/workflow.schema.json](../schema/workflow.schema.json). Check the result:
+To write them by hand, copy the templates and fill them in, including your chosen `language`. Older or hand-written workflows that omit the key default to `en`; any other value, including `null`, is rejected. This compatibility default does not replace the onboarding question. Every key of `WORKFLOW.md` is described in [schema/workflow.schema.json](../schema/workflow.schema.json). Check the result:
 
 ```sh
 symphony check            # ./WORKFLOW.md; or: symphony check path/to/WORKFLOW.md
@@ -96,7 +100,7 @@ Commit and push the files. Agents work in fresh clones, so they only see what is
 
 ### Columns
 
-Each column has a role derived from the selected behavior. The names are localized to your conversation language by default; you can ask to rename them, but do not need to design the workflow yourself:
+Each column has a role derived from the selected behavior. New names may be localized to your explicitly selected output language, not your conversation language; you can ask to rename them, but do not need to design the workflow yourself. Changing `language` later does not rename existing columns:
 
 | Column | Listed in | Who works on it |
 |---|---|---|
@@ -131,6 +135,8 @@ symphony setup-board      # ./WORKFLOW.md
 
 As soon as the project exists, it writes the number into `tracker.provider.project_number` and says so. Only that line changes; commit it.
 
+New board and label descriptions use the configured `language`; identifiers and explicitly configured names stay unchanged. This does not translate an existing board.
+
 If `project_number` already points to a board, `setup-board` shows its name and card count and offers to delete it and start over, or to exit (the default). Deleting needs the board number typed in; the issues stay, but every card's status and fields are lost. It never edits an existing board.
 
 GitHub Project workflows are separate from `WORKFLOW.md` and can change card statuses automatically. GitHub's public API does not let `setup-board` configure or enable these workflows, and onboarding does not require you to change them. If a card changes status unexpectedly or skips a Symphony stage, inspect the enabled workflows in the browser at the project's **Workflows** page; one may be responsible.
@@ -145,7 +151,7 @@ The `symphony` wrapper gets its token from `gh auth token`. Before running the d
 
 ## 4. Write the first card and run
 
-Run `/symphony-write-card` and describe the task. The skill drafts an issue with a goal, acceptance criteria, how to verify it, and what is out of scope, asks for confirmation, then creates it and adds it to the board. It only adds the dispatch label and moves the card to `tracker.provider.start_state` if you want to start now, never by guessing the first active column or option IDs. Pick something small the first time.
+Run `/symphony-write-card` and describe the task. The skill uses `WORKFLOW.md`'s `language` for the title, all headings and the body even if you chat in another language (missing means `en`). It drafts an issue with a goal, acceptance criteria, how to verify it, and what is out of scope, asks for confirmation, then creates it and adds it to the board. It only adds the dispatch label and moves the card to `tracker.provider.start_state` if you want to start now, never by guessing the first active column or option IDs. Pick something small the first time.
 
 See what the orchestrator would do, then start it:
 
@@ -155,7 +161,7 @@ symphony start WORKFLOW.md                                       # in the backgr
 symphony logs
 ```
 
-Implementation, review and blocking handoffs retain full records on the issue, including relevant human PR feedback and constraints, not just PR links. Usage is a best-effort footer on that result: `用量（本轮）：12.34 · 轮次 6/20 · 模型：xxxx`, using this session's credits and actual model(s). Detailed metrics stay in logs; missing metrics or a failed update may leave no footer. There is no separate usage-only comment or durable footer retry queue.
+Implementation, review and blocking handoffs retain full records on the issue, including relevant human PR feedback and constraints, not just PR links. Usage is a best-effort footer in the session's selected language on that result, using this session's credits and actual model(s). Detailed metrics stay in logs; missing metrics or a failed update may leave no footer. There is no separate usage-only comment or durable footer retry queue.
 
 After submission, independent review (if enabled) precedes Human Review. Merge the PR or close the issue to finish; to request more work, leave feedback and move the waiting card to Todo, not Rework.
 

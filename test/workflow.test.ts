@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -75,4 +75,23 @@ test("store applies valid edits and keeps the last good config on invalid ones",
   bump(VALID, 2_000_000_200);
   assert.equal(store.refresh().config.polling.intervalMs, 5000);
   assert.equal(store.reloadError, null);
+});
+
+test("language reload replaces the config without mutating running snapshots and rejects unsupported languages", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "wf-language-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "WORKFLOW.md");
+  const { log } = captureLog();
+  writeFileSync(path, VALID);
+  const store = new WorkflowStore(path, log, {});
+  const original = store.workflow;
+  writeFileSync(path, VALID.replace("tracker:", "language: zh-CN\ntracker:"));
+  utimesSync(path, 2_000_000_000, 2_000_000_000);
+  assert.equal(store.refresh().config.language, "zh-CN");
+  assert.equal(original.config.language, "en");
+  assert.equal(store.reloadError, null);
+  writeFileSync(path, VALID.replace("tracker:", "language: fr\ntracker:"));
+  utimesSync(path, 2_000_000_100, 2_000_000_100);
+  assert.equal(store.refresh().config.language, "zh-CN");
+  assert.match(store.reloadError!, /language must be "en" or "zh-CN"/);
 });

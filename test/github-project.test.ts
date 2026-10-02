@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { run } from "../src/exec.ts";
 import { isRoutable } from "../src/config.ts";
+import type { Language } from "../src/language.ts";
 import { GitHubProjectTracker, MAX_ATTACHMENT_BYTES, conflictingFiles, normalizeItem, parseSettings, readAttachments, type RawItem } from "../src/tracker/github-project.ts";
 import { createTracker, TrackerError } from "../src/tracker/index.ts";
 import type { AgentResult, IssueMessageRef, PendingHandoff } from "../src/iteration.ts";
@@ -311,14 +312,14 @@ function publicationFetch() {
   return { impl, calls, comments, prComments, reviews, state };
 }
 
-function fakeControl(sourceState = "AI Review", targetState = "返工", initialReview = true) {
+function fakeControl(sourceState = "AI Review", targetState = "返工", initialReview = true, language?: Language) {
   const saved = { pending: null as PendingHandoff | null, accepted: false, finishes: [] as boolean[], refs: [] as IssueMessageRef[], checkpoints: 0, active: true };
   const control: AgentControl = {
     id: "invocation-1", initialReview, async onSessionCreated() { return 1; },
     assertActive() { if (!saved.active) throw new Error("inactive invocation"); }, accepted: () => saved.accepted,
     async accept(result: AgentResult, workspacePath: string) {
       control.assertActive(); assert.equal(saved.accepted, false); saved.accepted = true;
-      return saved.pending = { id: "result-1", invocationId: control.id, sourceState, targetState, workspacePath, result: structuredClone(result),
+      return saved.pending = { language, id: "result-1", invocationId: control.id, sourceState, targetState, workspacePath, result: structuredClone(result),
         issueMessage: null, pr: null, prPublished: false, pushed: false, statusApplied: false, stale: false,
         haltReason: targetState === "受阻" ? "human_required" : null, nextNoProgress: 0, reworkId: null, waitingState: null };
     },
@@ -328,13 +329,13 @@ function fakeControl(sourceState = "AI Review", targetState = "返工", initialR
   return { control, saved };
 }
 
-function publicationSetup(options: { review?: boolean; initialReview?: boolean; target?: string; round?: number; workspacePath?: string; localHead?: string | Error; requiredLabels?: string[] } = {}) {
+function publicationSetup(options: { language?: Language; review?: boolean; initialReview?: boolean; target?: string; round?: number; workspacePath?: string; localHead?: string | Error; requiredLabels?: string[] } = {}) {
   const api = publicationFetch();
   const review = options.review !== false;
   api.state.status = review ? "AI Review" : "进行中";
-  const host = fakeControl(api.state.status, options.target ?? "返工", options.initialReview ?? true);
+  const host = fakeControl(api.state.status, options.target ?? "返工", options.initialReview ?? true, options.language);
   const eligibility = makeConfig({ tracker: { required_labels: options.requiredLabels ?? ["agent"] } });
-  const tracker = new GitHubProjectTracker({ ...provider, agent_states: ["进行中", "受阻"], handoff_state: "AI Review" }, env, quietLog, api.impl, (issue) => isRoutable(eligibility, issue));
+  const tracker = new GitHubProjectTracker({ ...provider, agent_states: ["进行中", "受阻"], handoff_state: "AI Review" }, env, quietLog, api.impl, (issue) => isRoutable(eligibility, issue), options.language);
   const workspacePath = options.workspacePath ?? "/nonexistent/review-checkout";
   if (review) {
     const localHead = options.localHead ?? "head1";
@@ -356,6 +357,46 @@ function publicationSetup(options: { review?: boolean; initialReview?: boolean; 
 
 const changes = { verdict: "request_changes", reviewed_head: "head1", progress: "initial", progress_reason: "Initial independent verification.", next_action: "continue", next_step: "Reproduce and fix the counterexample.", summary: "Checked A01-A03.", blocking_issues: ["Full blocker and evidence."] };
 const approval = { ...changes, verdict: "approve", blocking_issues: [], next_action: null, next_step: null };
+
+test("Chinese review language survives lost publication and restart with an English adapter", async () => {
+  const s = publicationSetup({ language: "zh-CN" });
+  s.state.lose = "addComment";
+  await s.call("tracker_submit_review", { ...changes, summary: "已验证。", progress_reason: "独立复现。", next_step: "修复问题。", blocking_issues: ["阻塞证据。"] });
+  const p = structuredClone(s.saved.pending!);
+  assert.match([...s.comments.values()][0]!.body, /AI 审查.*需要修改.*已审查 HEAD.*进展.*下一步行动.*阻塞问题.*正在发布/s);
+  const restarted = new GitHubProjectTracker(provider, env, quietLog, s.impl, undefined, "en");
+  await restarted.publishHandoff(s.issue, p, () => {}, () => {});
+  assert.equal(s.comments.size, 2, "resume reconciles the original result, not a new translated copy");
+  const body = s.comments.get(p.issueMessage!.id)!.body;
+  assert.match(body, /交接已完成：返工/);
+  assert.doesNotMatch(body, /Handoff completed|AI review|Progress:|Blocking issues/);
+  assert.match(body, /<!-- symphony-result:result-1 -->/);
+  assert.match(body, /<!-- symphony-invocation:invocation-1 -->/);
+  assert.match(s.comments.get(s.reviews[0]!)!.body, /AI 审查.*已验证。/s);
+  assert.equal(s.comments.get(s.reviews[0]!)!.commit?.oid, "head1");
+});
+
+test("legacy pending records without language retain English on a Chinese adapter", async () => {
+  const s = publicationSetup();
+  s.state.lose = "addComment";
+  await s.call("tracker_submit_review", changes);
+  const p = structuredClone(s.saved.pending!);
+  delete p.language;
+  await new GitHubProjectTracker(provider, env, quietLog, s.impl, undefined, "zh-CN").publishHandoff(s.issue, p, () => {}, () => {});
+  assert.match(s.comments.get(p.issueMessage!.id)!.body, /Handoff completed: 返工/);
+  assert.match(s.comments.get(s.reviews[0]!)!.body, /AI review/);
+});
+
+test("Chinese blocked handoff and unavailable review preserve protocol and diagnostic evidence", async () => {
+  const s = publicationSetup({ language: "zh-CN", target: "受阻", review: false });
+  await s.call("tracker_comment", { body: "需要凭据。Error: denied", blocking: true });
+  assert.equal((await s.call("tracker_set_status", { status: "受阻" })).status, "受阻");
+  assert.match(s.comments.get(s.saved.pending!.issueMessage!.id)!.body, /已阻塞.*Error: denied.*停止原因.*需要人工处理.*交接已完成/s);
+  const review = publicationSetup({ language: "zh-CN", target: "受阻" });
+  await review.call("tracker_submit_review", { ...changes, verdict: "unable_to_verify", reviewed_head: null, progress: "not_assessed", next_action: "human_required", summary: "缺少设备。" });
+  assert.match(review.comments.get(review.saved.pending!.issueMessage!.id)!.body, /无法验证.*无法获取（未作质量判定）.*未评估.*需要人工处理/s);
+  assert.equal(review.reviews.length, 0);
+});
 
 test("review protocol publishes the complete issue record FIRST and binds the mirrored review to its checked SHA", async () => {
   const s = publicationSetup();
@@ -990,9 +1031,9 @@ test("existing-PR comment response loss is reconciled by marker, not mirrored a 
   assert.equal(s.prComments.length, 1); assert.equal(s.comments.size, 2);
 });
 
-async function delayedImplementation(t: TestContext) {
+async function delayedImplementation(t: TestContext, language?: Language) {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-09-30T00:00:00Z") });
-  const s = publicationSetup({ review: false, target: "AI Review" });
+  const s = publicationSetup({ review: false, target: "AI Review", language });
   const result: AgentResult = { kind: "implement", title: "Repair", head: "head1",
     summary: `Full implementation criteria, checks and human constraints.\n${"Complete evidence. ".repeat(400)}\nEND IMPLEMENTATION EVIDENCE` };
   await s.control.accept(result, "/nonexistent/implementation-checkout");
@@ -1121,6 +1162,22 @@ test("three separated implementation head checks survive new adapters and halt i
   assert.doesNotMatch(record.body, /Stale result|\*\*Progress:|Reviewed HEAD:/);
 });
 
+test("Chinese head-mismatch recovery retains its language, SHAs and stop reason after adapter restart", async (t) => {
+  const s = await delayedImplementation(t, "zh-CN");
+  await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+  for (let attempt = 2; attempt <= 3; attempt++) {
+    s.restart();
+    t.mock.timers.tick(60_000);
+    if (attempt === 2) await assert.rejects(s.resume(), mismatchError("head1", "head0"));
+    else assert.deepEqual(await s.resume(), { stale: false });
+  }
+  const body = s.comments.get(s.pending.issueMessage!.id)!.body;
+  assert.match(handoffStatus(body, s.pending), /交接已阻塞：受阻.*3 次系统检查.*head_mismatch.*预期 HEAD：head1.*实际 PR HEAD：head0.*尚未经过审查.*"待开始"/s);
+  assert.doesNotMatch(body, /Handoff blocked|Publication pending|Implementation handoff/);
+  assert.equal(s.pending.language, "zh-CN");
+  assert.equal(s.reviews.length, 0);
+});
+
 test("closing an issue during a head retry prevents both review handoff and the fallback Blocked mutation", async (t) => {
   const s = await delayedImplementation(t);
   await assert.rejects(s.resume(), mismatchError("head1", "head0"));
@@ -1243,6 +1300,18 @@ test("uploaded attachments are persisted in the result before core publication r
   assert.match(s.comments.get(s.saved.pending!.issueMessage!.id)!.body, /!\[evidence.png\]/);
 });
 
+test("Chinese attachment failure is explicit and retains the raw error in saved and mirrored evidence", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "language-image-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, "evidence.png"), "image");
+  const s = publicationSetup({ workspacePath: root, language: "zh-CN" });
+  t.mock.method(s.tracker, "uploadEvidence", async () => { throw new Error("raw upload error"); });
+  await s.call("tracker_submit_review", { ...changes, summary: "已验证。", attachments: ["evidence.png"] });
+  assert.match(s.saved.pending!.result.summary, /无法附加截图: raw upload error/);
+  assert.match(s.comments.get(s.reviews[0]!)!.body, /无法附加截图: raw upload error/);
+  assert.match(s.comments.get(s.saved.pending!.issueMessage!.id)!.body, /无法附加截图: raw upload error/);
+});
+
 test("usage footer updates only its typed invocation-owned issue block and preserves manual edits", async () => {
   const s = publicationSetup(); await s.call("tracker_submit_review", changes);
   const p = s.saved.pending!, ref = p.issueMessage!, node = s.comments.get(ref.id)!;
@@ -1306,8 +1375,8 @@ function followupFetch(openTitles: string[] = []) {
 
 const followups = { labels: ["tech-debt"], state: "待开始", priority: "P4", max_per_session: 2 };
 
-function followupTool(impl: any, extra: Record<string, unknown> = {}, review = false) {
-  const tracker = new GitHubProjectTracker({ ...provider, followups, ...extra }, env, quietLog, impl);
+function followupTool(impl: any, extra: Record<string, unknown> = {}, review = false, language: Language = "en") {
+  const tracker = new GitHubProjectTracker({ ...provider, followups, ...extra }, env, quietLog, impl, undefined, language);
   const issue = (normalizeItem(item(), settings) as { issue: any }).issue;
   const tools = tracker.agentTools({
     issue, workspacePath: "/tmp", log: quietLog,
@@ -1328,6 +1397,17 @@ test("follow-ups become low-priority board issues without the agent label", asyn
   assert.deepEqual(updates, [["F_status", "o-todo"], ["F_prio", "o-p4"]]);
 });
 
+test("Chinese follow-up attribution uses the selected language for both roles, preserving submitted content", async () => {
+  for (const review of [true, false]) {
+    const { impl, calls } = followupFetch();
+    await followupTool(impl, {}, review, "zh-CN").call({ title: "修复遮挡", body: "证据：raw diagnostic" });
+    const create = calls.find((c) => c.query.includes("createIssue"))!;
+    assert.equal(create.variables.title, "修复遮挡");
+    assert.ok(create.variables.body.startsWith("证据：raw diagnostic"));
+    assert.ok(create.variables.body.includes(`由 symphony-copilot 的${review ? "审查" : "实现"} agent 在处理 #12 时创建。`));
+  }
+});
+
 test("follow-ups reuse an open issue with the same title and are capped per session", async () => {
   const dup = followupFetch(["bubbles cover the floor sign"]);
   const result = await followupTool(dup.impl).call({ title: "Bubbles cover the floor sign", body: "x" });
@@ -1340,6 +1420,22 @@ test("follow-ups reuse an open issue with the same title and are capped per sess
   await call({ title: "Two", body: "x" });
   const third = await call({ title: "Three", body: "x" });
   assert.match(String(third.textResultForLlm), /already filed 2 issues/);
+});
+
+test("tracker factory propagates the workflow language to direct issue tools", async (t) => {
+  const api = followupFetch();
+  t.mock.method(globalThis, "fetch", api.impl);
+  const config = makeConfig({ language: "zh-CN", tracker: {
+    kind: "github_project", provider: { ...provider, followups }, active_states: ["待开始", "进行中"], required_labels: ["agent"],
+  } });
+  const tracker = createTracker(config, env, quietLog);
+  const normalized = normalizeItem(item(), settings);
+  assert.ok(normalized.kind === "issue");
+  const tool = tracker.agentTools({ issue: normalized.issue, workspacePath: "/tmp", log: quietLog })
+    .find((t) => t.name === "tracker_create_followup")!;
+  const args = { title: "记录问题", body: "问题证据。" };
+  await tool.handler!(args, { sessionId: "session", toolCallId: "call", toolName: tool.name, arguments: args });
+  assert.match(api.calls.find((c) => c.query.includes("createIssue"))!.variables.body, /由 symphony-copilot 的实现 agent/);
 });
 
 test("the follow-up tool is offered to both roles only when configured", () => {
